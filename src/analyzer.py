@@ -8,7 +8,9 @@ import json
 import re
 from typing import Any
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from .analysis_errors import ModelResponseError, ProviderConfigurationError
+from .llm_providers import claude_completion, get_provider, provider_environment_key, validate_provider_model
 
 
 class EventExtraction(BaseModel):
@@ -33,6 +35,30 @@ class AnalysisResult(BaseModel):
     impacts: list[ImpactItem]
     summary: str = Field(description="整體結論，分析師口吻")
     overall_confidence: float = Field(ge=0.0, le=1.0)
+
+
+def parse_analysis_response(response) -> AnalysisResult:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ModelResponseError("empty_content")
+    choice = choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        raise ModelResponseError("truncated")
+    raw = getattr(getattr(choice, "message", None), "content", None)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise ModelResponseError("empty_content")
+    if not isinstance(raw, str):
+        raise ModelResponseError("invalid_shape")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ModelResponseError("invalid_json") from None
+    if not isinstance(data, dict):
+        raise ModelResponseError("invalid_shape")
+    try:
+        return AnalysisResult(**data)
+    except ValidationError:
+        raise ModelResponseError("invalid_schema") from None
 
 
 # 擴展的實體 → 標的映射（中英都覆蓋，可持續擴展）
@@ -125,20 +151,35 @@ def post_process_impacts(result: AnalysisResult, *, universe_path=None) -> Analy
     return result
 
 
-def get_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+def get_client(*, api_key: str | None = None, base_url: str | None = None) -> OpenAI:
+    # A web session passes its own credentials without changing process-wide
+    # environment variables shared by other visitors and command-line jobs.
+    api_key = (os.getenv("OPENAI_API_KEY", "") if api_key is None else api_key).strip()
+    base_url = base_url if base_url is not None else os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
     if not api_key:
         raise RuntimeError("請設定環境變數 OPENAI_API_KEY")
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
-def analyze_news(news_text: str, model: str = None, *, universe_path=None) -> AnalysisResult:
+def analyze_news(news_text: str, model: str = None, *, universe_path=None,
+                 api_key: str | None = None, base_url: str | None = None,
+                 provider: str | None = None) -> AnalysisResult:
     """
     對一則新聞做分析師水平的結構化分析。
     """
-    model = model or os.getenv("LLM_MODEL", "deepseek-v4-pro")
-    client = get_client()
+    if provider is None:
+        # Keep manual CLI/custom endpoint behavior for existing callers.
+        model = model or os.getenv("LLM_MODEL", "deepseek-v4-pro")
+        client = get_client(api_key=api_key, base_url=base_url)
+    else:
+        selected = get_provider(provider)
+        model = validate_provider_model(provider, model or selected.models[0])
+        api_key = provider_environment_key(provider) if api_key is None else api_key.strip()
+        if not api_key:
+            raise ProviderConfigurationError("missing_key")
+        # A selection always uses that provider's official endpoint, regardless
+        # of legacy OPENAI_BASE_URL or a caller-supplied endpoint override.
+        client = None if provider == "anthropic" else get_client(api_key=api_key, base_url=selected.base_url)
 
     system = """你是一位經驗豐富的金融分析師。
 請對給定新聞做深度分析，輸出可解釋的結構化結論。
@@ -181,26 +222,27 @@ JSON Schema:
 
     user = f"新聞內容：\n{news_text.strip()}"
 
-    # DeepSeek V4 Pro 默認會走 thinking，這裡關掉以保證 JSON 輸出穩定
-    extra = {}
-    if "deepseek" in model.lower():
-        extra["thinking"] = {"type": "disabled"}
+    if provider == "anthropic":
+        resp = claude_completion(model=model, api_key=api_key, system=system, user=user)
+    else:
+        request = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "response_format": {"type": "json_object"},
+        }
+        if provider == "openai":
+            # Reasoning models reject the old max_tokens / temperature options.
+            request["max_completion_tokens"] = 8192
+        else:
+            request["temperature"] = 0.2
+            request["max_tokens"] = 8192 if provider == "gemini" else 2000
+        if provider == "deepseek" or (provider is None and "deepseek" in model.lower()):
+            request["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif provider is None:
+            request["extra_body"] = None
+        resp = client.chat.completions.create(**request)
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-        max_tokens=2000,
-        response_format={"type": "json_object"},
-        extra_body=extra if extra else None,
-    )
-
-    raw = resp.choices[0].message.content
-    data = json.loads(raw)
-    result = AnalysisResult(**data)
+    result = parse_analysis_response(resp)
     return post_process_impacts(result, universe_path=universe_path)
 
 
