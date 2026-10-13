@@ -179,6 +179,107 @@ class NewsStoreTests(unittest.TestCase):
             self.store.ingest([article(), article(url="not-a-url")])
         self.assertEqual(self.store.stats()["total"], 0)
 
+    def test_investat_id_deduplicates_without_inventing_article_url(self):
+        research = article(source_id="investat", source_name="Investat", source_kind="research",
+                           external_id="research_123", url=None, content_scope="fragment")
+        self.assertEqual(self.store.ingest([research])["added"], 1)
+        saved = self.store.pending()[0]
+        self.assertEqual(saved["canonical_url"], "investat:research_123")
+        self.assertIsNone(saved["url"])
+        self.assertIsNone(saved["sources"][0]["raw_metadata"]["url"])
+        self.store.mark_analyzed(saved["id"], {"summary": "Completed research analysis"})
+        self.assertEqual(self.store.ingest([research])["duplicates"], 1)
+        self.assertEqual(self.store.pending(), [])
+        with NewsStore(self.path) as reopened:
+            same = reopened.export_articles()[0]
+            self.assertEqual(same["id"], saved["id"])
+            self.assertEqual(same["external_id"], "research_123")
+            self.assertEqual(reopened.stats()["total"], 1)
+
+    def test_investat_url_changes_keep_id_and_retained_text(self):
+        research = article(source_id="investat", source_name="Investat", source_kind="research",
+                           external_id="research_123", url=None, content="Provider body. " * 100,
+                           content_scope="fragment")
+        self.store.ingest([research])
+        saved = self.store.pending()[0]
+        self.store.mark_analyzed(saved["id"], {"summary": "Already analyzed"})
+        for url in ("https://investat.ai/research/research_123",
+                    "https://investat.ai/research/new-path?utm_source=mail"):
+            with self.subTest(url=url):
+                omitted_text = dict(research, url=url, summary="", content=None,
+                                    content_scope="title_only")
+                self.assertEqual(self.store.ingest([omitted_text])["duplicates"], 1)
+                current = self.store.export_articles()[0]
+                self.assertEqual(current["id"], saved["id"])
+                self.assertEqual(current["canonical_url"], "investat:research_123")
+                self.assertEqual(current["url"], url)
+                self.assertEqual(current["content"], research["content"])
+                self.assertEqual(current["content_scope"], "fragment")
+                self.assertEqual(current["sources"][0]["raw_metadata"]["url"], url)
+                self.assertEqual(self.store.pending(), [])
+        omitted_url = dict(research, url=None, content=None, summary="", content_scope="title_only")
+        self.assertEqual(self.store.ingest([omitted_url])["duplicates"], 1)
+        retained = self.store.export_articles()[0]
+        self.assertEqual(retained["url"], url)
+        self.assertIsNone(retained["sources"][0]["raw_metadata"]["url"])
+        self.assertEqual(retained["content"], research["content"])
+        self.assertEqual(self.store.pending(), [])
+        corrected = dict(research, url="https://investat.ai/research/new-path",
+                         title="A corrected research headline")
+        self.assertEqual(self.store.ingest([corrected])["updated"], 1)
+        current = self.store.pending()[0]
+        self.assertEqual(current["id"], saved["id"])
+        self.assertEqual(current["url"], corrected["url"])
+        self.assertIsNone(current["analysis"])
+        self.assertEqual(self.store.stats()["total"], 1)
+
+    def test_investat_shorter_prefix_keeps_richer_analysis_but_changed_text_requeues(self):
+        research = article(source_id="investat", source_name="Investat", source_kind="research",
+                           external_id="research_123", url=None, content="Provider text. " * 100,
+                           content_scope="provider_text")
+        self.store.ingest([research])
+        saved = self.store.pending()[0]
+        self.store.mark_analyzed(saved["id"], {"summary": "Rich text analysis"})
+        prefix = dict(research, content=research["content"][:100], content_scope="partial_text")
+        self.assertEqual(self.store.ingest([prefix])["duplicates"], 1)
+        retained = self.store.export_articles()[0]
+        self.assertEqual(retained["content"], research["content"])
+        self.assertEqual(retained["content_scope"], "provider_text")
+        self.assertEqual(retained["analysis"], {"summary": "Rich text analysis"})
+        self.assertEqual(self.store.pending(), [])
+        changed = dict(prefix, content="A correction contradicts the earlier report.")
+        self.assertEqual(self.store.ingest([changed])["updated"], 1)
+        pending = self.store.pending()[0]
+        self.assertEqual(pending["id"], saved["id"])
+        self.assertEqual(pending["content"], changed["content"])
+        self.assertEqual(pending["content_scope"], "partial_text")
+        self.assertIsNone(pending["analysis"])
+
+    def test_investat_requires_safe_stable_id_and_valid_real_url_when_supplied(self):
+        for identifier in (None, "", "../article", "article?token=value", "a" * 129):
+            with self.subTest(identifier=identifier), self.assertRaises(ValueError):
+                self.store.ingest([article(source_id="investat", external_id=identifier, url=None)])
+        for url in ("not-a-url", "javascript:alert(1)", "https://token@example.org/article"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                self.store.ingest([article(source_id="investat", external_id="research_123", url=url)])
+        self.assertEqual(self.store.stats()["total"], 0)
+        with self.assertRaises(ValueError):
+            self.store.ingest([article(source_id="public", url=None)])
+
+    def test_distinct_investat_ids_do_not_merge_identical_research_text(self):
+        first = article(source_id="investat", source_name="Investat", source_kind="research",
+                        external_id="research_123", url=None)
+        second = dict(first, external_id="research_456")
+        self.assertEqual(self.store.ingest([first, second]),
+                         {"added": 2, "updated": 0, "duplicates": 0})
+        saved = self.store.export_articles()
+        self.assertEqual({row["canonical_url"] for row in saved},
+                         {"investat:research_123", "investat:research_456"})
+        self.assertEqual(len({row["id"] for row in saved}), 2)
+        self.assertEqual(self.store.ingest([second, first])["duplicates"], 2)
+        self.assertEqual(self.store.stats()["total"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

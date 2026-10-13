@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .feeds import DEFAULT_SOURCES, FeedFetchError, fetch_source, load_sources
 from .news_store import DEFAULT_DB_PATH, NewsStore
+from .investat_pipeline import collect_investat
 from .sec_universe import (DEFAULT_UNIVERSE, SecConfigError, collect_sec_filings,
                            load_universe, refresh_universe)
 
@@ -102,8 +103,8 @@ def analyze_pending(store, *, limit=10, analyzer=None, universe_path=None):
             f"{s['source_name']} ({s['source_kind']})" for s in article["sources"]))
         text = (f"來源：{source_names}\n來源類型：{article['source_kind']}\n"
                 f"發布時間：{article.get('published_at') or '未提供'}\n"
-                f"原文連結：{article['url']}\n"
-                f"資料範圍：{article['content_scope']}（僅來源 feed 提供的內容，可能不是全文）\n"
+                f"原文連結：{article.get('url') or '未提供'}\n"
+                f"資料範圍：{article['content_scope']}（僅來源實際提供的內容；摘要或片段不等於全文）\n"
                 f"標題：{article['title']}\n\n{body}")
         try:
             result = analyzer(text)
@@ -147,6 +148,9 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sec", action="store_true", help="另抓標普 500＋納斯達克 100 的 SEC 公告")
     parser.add_argument("--sec-only", action="store_true", help="只抓 SEC 公告")
+    parser.add_argument("--investat", action="store_true", help="另抓 Investat；需要 INVESTAT_MCP_TOKEN，不呼叫 AI")
+    parser.add_argument("--investat-only", action="store_true", help="只抓 Investat 到共用新聞庫")
+    parser.add_argument("--investat-limit", type=int, default=20, help="Investat 單次文章上限（1–50）")
     parser.add_argument("--sec-max-pages", type=int, default=10, help="每種申報最多頁數，1–100")
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--refresh-sec-universe", action="store_true", help="刷新指數名單及官方 SEC CIK 對照後退出")
@@ -156,10 +160,13 @@ def main(argv=None):
     parser.add_argument("--export", type=Path, help="將新聞庫匯出為 UTF-8 JSONL")
     args = parser.parse_args(argv)
     if (args.limit_per_source < 1 or args.max_age_days < 0 or args.timeout <= 0
-            or args.workers < 1 or args.analysis_limit < 1 or not 1 <= args.sec_max_pages <= 100):
+            or args.workers < 1 or args.analysis_limit < 1 or not 1 <= args.sec_max_pages <= 100
+            or not 1 <= args.investat_limit <= 50):
         parser.error("數量及逾時需為正數，max-age-days 不可為負數")
-    if args.analysis_only and (args.sec or args.sec_only):
-        parser.error("analysis-only 不能同時抓取 SEC")
+    if args.analysis_only and (args.sec or args.sec_only or args.investat or args.investat_only):
+        parser.error("analysis-only 不能同時抓取來源")
+    if args.investat_only and (args.sec or args.sec_only or args.source):
+        parser.error("investat-only 不能同時指定其他來源")
     if args.refresh_sec_universe:
         try:
             universe = refresh_universe(args.universe, timeout=args.timeout)
@@ -169,28 +176,39 @@ def main(argv=None):
         print(json.dumps({"status": "ok", "counts": universe["counts"],
                           "sources": universe["sources"]}, ensure_ascii=False, indent=2))
         return 0
-    try:
-        sources = load_sources(args.config)
-    except ValueError as exc:
-        parser.error(str(exc))
+    sources = []
+    if not args.investat_only:
+        try:
+            sources = load_sources(args.config)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.source:
         unknown = set(args.source) - {source.id for source in sources}
         if unknown:
             parser.error("未知來源 ID：" + ", ".join(sorted(unknown)))
         sources = [source for source in sources if source.id in args.source]
     if args.list_sources:
-        print(json.dumps([{"id": s.id, "name": s.name, "kind": s.kind,
-                           "format": s.format, "enabled": s.enabled} for s in sources],
-                         ensure_ascii=False, indent=2))
+        source_info = [{"id": s.id, "name": s.name, "kind": s.kind,
+                        "format": s.format, "enabled": s.enabled} for s in sources]
+        if args.investat or args.investat_only:
+            source_info.append({"id": "investat", "name": "Investat", "kind": "research",
+                                "format": "mcp", "enabled": True})
+        print(json.dumps(source_info, ensure_ascii=False, indent=2))
         return 0
-    if not args.analysis_only and not args.sec_only and not any(source.enabled for source in sources):
+    if not args.analysis_only and not args.sec_only and not args.investat_only and not any(source.enabled for source in sources):
         parser.error("沒有啟用的來源")
     with NewsStore(args.db) as store:
         report = {"sources": [], "failed_sources": 0, "added": 0, "updated": 0, "duplicates": 0}
-        if not args.analysis_only and not args.sec_only:
+        if not args.analysis_only and not args.sec_only and not args.investat_only:
             report = collect_sources(sources, store, limit_per_source=args.limit_per_source,
                                      max_age_days=args.max_age_days, timeout=args.timeout,
                                      workers=args.workers)
+        if args.investat or args.investat_only:
+            report["investat"] = collect_investat(store, limit=args.investat_limit, timeout=args.timeout)
+            for key in ("added", "updated", "duplicates"):
+                report[key] += report["investat"][key]
+            report["sources"].extend(report["investat"]["sources"])
+            report["failed_sources"] += report["investat"]["failed_sources"]
         if args.sec or args.sec_only:
             report["sec"] = collect_sec(store, universe_path=args.universe,
                                          max_pages=args.sec_max_pages, timeout=args.timeout)
@@ -221,3 +239,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

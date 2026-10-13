@@ -18,6 +18,8 @@ with patch("dotenv.load_dotenv"):
 APP = Path(__file__).resolve().parents[1] / "app.py"
 SESSION_KEY = "synthetic-session-credential"
 SERVER_KEY = "synthetic-server-credential"
+INVESTAT_TOKEN = "synthetic-investat-session-token"
+SERVER_INVESTAT_TOKEN = "synthetic-investat-server-token"
 SERVER_URL = "https://synthetic-provider.example/v1"
 RSS_BUTTON = "AI 分析待處理新聞（最多 5 則）"
 PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini")
@@ -34,6 +36,7 @@ class ApiKeyUiTests(unittest.TestCase):
             **{name: "" for name in PROVIDER_KEY_VARIABLES},
             "OPENAI_BASE_URL": SERVER_URL, "LLM_PROVIDER": "deepseek",
             "LLM_MODEL": "synthetic-other-provider-model",
+            "INVESTAT_MCP_TOKEN": "",
         }))
         self.result = AnalysisResult(
             extraction=EventExtraction(
@@ -64,6 +67,10 @@ class ApiKeyUiTests(unittest.TestCase):
         self.pending = self.start_patch(patch("src.rss_pipeline.analyze_pending", wraps=run_pending))
         self.collect = self.start_patch(patch("src.rss_pipeline.collect_sources", return_value={
             "added": 0, "updated": 0, "duplicates": 0, "sources": [],
+        }))
+        self.investat = self.start_patch(patch("src.investat_pipeline.collect_investat", return_value={
+            "added": 0, "updated": 0, "duplicates": 0, "failed_sources": 0,
+            "sources": [{"id": "investat", "name": "Investat", "status": "empty"}],
         }))
         self.start_patch(patch("src.rss_pipeline.collect_sec"))
         self.start_patch(patch("src.sec_universe.refresh_universe"))
@@ -306,6 +313,105 @@ class ApiKeyUiTests(unittest.TestCase):
         self.analyze.assert_not_called()
         self.save.assert_not_called()
 
+    def test_investat_is_password_protected_and_opt_in(self):
+        app = self.app()
+        field = app.sidebar.text_input(key="investat_token")
+        self.assertEqual(field.label, "Investat MCP token")
+        self.assertEqual(field.proto.type, TextInput.PASSWORD)
+        self.assertEqual(field.value, "")
+        self.assertEqual(app.multiselect(key="news_sources").value, ["test"])
+        self.assertTrue(app.number_input[0].disabled)
+        self.button(app, "抓取最新新聞").click().run()
+        self.collect.assert_called_once()
+        self.investat.assert_not_called()
+        self.analyze.assert_not_called()
+
+    def test_investat_collection_uses_its_token_and_limit_and_merges_source_outcomes(self):
+        self.collect.return_value = {
+            "added": 1, "updated": 1, "duplicates": 2,
+            "sources": [{"id": "test", "name": "Synthetic feed", "status": "error",
+                         "error": "HTTP 403"}],
+        }
+        self.investat.return_value = {
+            "added": 2, "updated": 3, "duplicates": 4, "failed_sources": 0,
+            "sources": [{"id": "investat", "name": "Investat", "status": "partial",
+                         "error": "Only provider fragments were available"}],
+        }
+        app = self.app()
+        app.sidebar.text_input(key="investat_token").input("  " + INVESTAT_TOKEN + "  ").run()
+        app.multiselect(key="news_sources").set_value(["test", "investat"]).run()
+        self.assertFalse(app.number_input[0].disabled)
+        app.number_input[0].set_value(7).run()
+        self.assert_analysis_disabled(app)
+        self.button(app, "抓取最新新聞").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.collect.assert_called_once()
+        self.assertEqual([s.id for s in self.collect.call_args.args[0]], ["test"])
+        self.assertIs(self.collect.call_args.args[1], self.store)
+        self.investat.assert_called_once_with(self.store, token=INVESTAT_TOKEN, limit=7)
+        self.assertIn("新增 3 則，更新 4 則，重複 6 則", self.rendered_text(app))
+        self.assertIn("Synthetic feed：HTTP 403", self.rendered_text(app))
+        self.assertIn("Investat：Only provider fragments were available", self.rendered_text(app))
+        self.assertNotIn(INVESTAT_TOKEN, self.rendered_text(app))
+        self.analyze.assert_not_called()
+        self.pending.assert_not_called()
+        self.assertEqual(os.environ["INVESTAT_MCP_TOKEN"], "")
+        for name in PROVIDER_KEY_VARIABLES:
+            self.assertEqual(os.environ[name], "")
+
+    def test_investat_token_is_separate_from_llm_credentials_and_provider_changes(self):
+        app = self.app()
+        app.sidebar.text_input(key="investat_token").input(INVESTAT_TOKEN).run()
+        self.assert_analysis_disabled(app)
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        self.select_provider(app, "openai")
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assertEqual(app.sidebar.text_input(key="investat_token").value, INVESTAT_TOKEN)
+        self.assert_analysis_disabled(app)
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        self.button(app, "清除輸入的 Investat token").click().run()
+        self.assertEqual(app.sidebar.text_input(key="investat_token").value, "")
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, SESSION_KEY)
+        app.multiselect(key="news_sources").set_value(["investat"]).run()
+        self.button(app, "抓取最新新聞").click().run()
+        self.investat.assert_called_once_with(self.store, token="", limit=20)
+        self.analyze.assert_not_called()
+
+    def test_investat_sessions_are_isolated_and_clear_restores_hidden_environment_fallback(self):
+        os.environ["INVESTAT_MCP_TOKEN"] = SERVER_INVESTAT_TOKEN
+        first = self.app()
+        first.sidebar.text_input(key="investat_token").input(INVESTAT_TOKEN).run()
+        second = self.app()
+        self.assertEqual(second.sidebar.text_input(key="investat_token").value, "")
+        first.run()
+        self.assertEqual(first.sidebar.text_input(key="investat_token").value, INVESTAT_TOKEN)
+        first.multiselect(key="news_sources").set_value(["investat"]).run()
+        self.button(first, "抓取最新新聞").click().run()
+        self.investat.assert_called_once_with(self.store, token=INVESTAT_TOKEN, limit=20)
+        self.investat.reset_mock()
+        self.button(first, "清除輸入的 Investat token").click().run()
+        self.assertEqual(first.session_state["investat_token"], "")
+        self.button(first, "抓取最新新聞").click().run()
+        self.investat.assert_called_once_with(self.store, token=SERVER_INVESTAT_TOKEN, limit=20)
+        self.assertNotIn(SERVER_INVESTAT_TOKEN, self.rendered_text(first))
+        self.assertNotIn(INVESTAT_TOKEN, self.rendered_text(first))
+        self.assert_analysis_disabled(first)
+        self.assertEqual(os.environ["INVESTAT_MCP_TOKEN"], SERVER_INVESTAT_TOKEN)
+
+    def test_investat_without_article_url_links_only_to_provider_homepage(self):
+        self.store.export_articles.return_value = [{
+            "title": "Institutional research", "source_id": "investat",
+            "external_id": "research_1", "url": None, "published_at": None,
+            "summary": "A provider supplied excerpt.", "content": "",
+            "content_scope": "fragment", "sources": [{"source_name": "Investat"}],
+        }]
+        app = self.app()
+        links = [(link.label, link.url) for link in app.get("link_button")]
+        self.assertIn(("前往 Investat", "https://investat.ai/"), links)
+        self.assertFalse(any(label == "閱讀原文" for label, _ in links))
+        self.assertIn("research_1（接口未提供文章連結）", self.rendered_text(app))
+
 
 if __name__ == "__main__":
     unittest.main()
+
