@@ -15,6 +15,10 @@ cp .env.example .env
 
 Windows PowerShell 可使用 `Copy-Item .env.example .env`。真實密鑰和 SEC 聯絡資料只填入本機 `.env`；它與 `data/` 已被 Git 忽略。`.gitignore` 不能撤回已公開的內容，也不能阻止強制加入檔案，提交前仍應檢查 diff。
 
+Windows 安裝依賴後，雙擊專案根目錄的 **`Start-News.cmd`** 即可啟動最新版網頁並開啟 `http://127.0.0.1:8502/`。啟動器優先使用專案的 `.venv`／`venv`，其次使用已安裝的 Python；缺少依賴時會提示安裝命令。服務在背景運行，重複啟動會沿用現有服務。電腦重啟後需再次雙擊；啟動紀錄保存在被 Git 忽略的 `data/`，不包含 token 設定。
+
+`main` 是目前維護的版本，已包含公開新聞來源、多家 AI 服務商及 Investat 整合。更新程式不會覆蓋本機 `.env` 或 `data/`；工作階段中輸入的密鑰在網頁或服務重啟後需重新填入。
+
 ## 抓取新聞
 
 ```bash
@@ -121,7 +125,33 @@ python -m src.report
 
 更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。測試使用模擬回應驗證五家服務商的請求及解析，未用真實 key 驗證帳戶權限或產生付費分析。
 
-Investat 原有批次流程仍需 `INVESTAT_MCP_TOKEN` 和 LLM key。原有手動／Investat 分析保存在 `data/events.jsonl`；日報會一起讀取已完成的 RSS 分析。日報目前仍按全部已保存分析的置信度篩選，沒有按當日日期限制；港股／A 股標的映射也尚未完整覆蓋。
+### 在網頁抓取 Investat
+
+1. 登入 [Investat 帳號設定](https://investat.ai/account)，取得個人 MCP token。帳號電郵／密碼不能代替 token；存取權限依 Investat 帳號及訂閱狀態決定。
+2. 在左側「Investat 設定」貼上 token，按 Enter 套用。也可在本機 `.env` 設定 `INVESTAT_MCP_TOKEN`。
+3. 在「新聞來源」勾選「Investat／機構研究」，選擇單次文章數（預設 20，最多 50），按「抓取最新新聞」。Investat 預設不勾選；僅打開或重新整理網頁不會呼叫它。
+4. 文章會與其他來源一起保存在 `data/news.sqlite3`、顯示在新聞列表。按「AI 分析待處理新聞」才使用所選模型和 AI key；完成的分析也會進入現有日報。
+
+頁面 token 只保留於目前工作階段，優先於本機環境設定，僅送往固定的 Investat MCP 端點。不寫入檔案、新聞資料庫或 Git，也不改動其他工作階段或 AI 服務商設定。按「清除輸入的 Investat token」會清空頁面輸入；若本機仍有環境 token，後續抓取會使用該設定。切換 AI 服務商不會清除 Investat token。
+
+收集會取得最新文章摘要及接口提供的內文，按明確的內文游標繼續讀取；每篇最多 5 段。只有摘要、部分內文及接口提供的文字分別標示為 `summary`、`partial_text`、`provided_text`，不因收到文字就宣稱已取得全文。單篇詳情失敗仍會保存可用摘要，並提示部分抓取；驗證、訂閱或限流失敗不會影響其他新聞來源。
+
+以 Investat 文章 ID 去重；重複抓取不會新增相同文章。機構名稱保留於來源標籤，不將機構研究當成官方公告。接口沒有提供文章連結時，頁面顯示文章 ID 及「前往 Investat」，不組合未經確認的文章網址。單次抓取上限只涵蓋當次接口回傳的最新文章，沒有歷史回補或背景排程。
+
+命令列也可使用同一新聞庫，token 只從環境設定讀取：
+
+```bash
+# 只抓 Investat，不呼叫 AI
+python -m src.rss_pipeline --investat-only --investat-limit 20
+
+# 與已設定的公開新聞來源一起抓取
+python -m src.rss_pipeline --investat
+
+# 明確啟動分析；需要另外設定 LLM key，會產生 API 用量
+python -m src.rss_pipeline --investat-only --analyze --analysis-limit 5
+```
+
+舊的 `python -m src.pipeline` 仍是直接抓取並分析的相容入口，需 `INVESTAT_MCP_TOKEN` 和 LLM key，結果保存於 `data/events.jsonl`。新網頁／命令列收集使用共用 SQLite 庫，既有手動及舊 Investat 結果保留。日報一起讀取這兩種已完成分析；目前仍按全部已保存分析的置信度篩選，沒有按當日日期限制；港股／A 股標的映射也尚未完整覆蓋。
 
 `data/feed_status.json` 保存新聞來源抓取狀態，SEC 單獨執行時使用 `data/sec_status.json`。新增收集流程的錯誤紀錄只保留安全分類，不保存 LLM 回應中的原始錯誤文字或密鑰。
 
@@ -153,3 +183,4 @@ python -m unittest discover -s tests -v
 ```
 
 單元測試使用固定資料和模擬請求，不呼叫付費模型，也不依賴新聞網站即時可用。
+

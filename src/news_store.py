@@ -44,6 +44,18 @@ def canonicalize_url(url: str) -> str:
     return urlunsplit((scheme, host, parts.path or "/", urlencode(query), ""))
 
 
+def _article_identity(article: dict) -> str:
+    """Investat IDs remain stable even when a detail has no public article URL."""
+    if article.get("source_id") == "investat":
+        external_id = str(article.get("external_id") or "").strip()
+        if not external_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", external_id):
+            raise ValueError("Investat articles require a stable external_id")
+        if article.get("url"):
+            canonicalize_url(str(article["url"]))
+        return "investat:" + external_id
+    return canonicalize_url(str(article.get("url") or ""))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -81,6 +93,15 @@ def _signature(article: dict) -> str:
 
 def _retain_missing_text(article: dict, previous: dict) -> None:
     """Retain the richest already supplied text if a feed temporarily omits it."""
+    if article.get("source_id") == "investat":
+        if not article.get("url"):
+            article["url"] = previous.get("url")
+        incoming = str(article.get("content") or "")
+        stored = str(previous.get("content") or "")
+        if (article.get("content_scope") == "partial_text" and incoming
+                and len(stored) > len(incoming) and stored.startswith(incoming)):
+            article["content"] = stored
+            article["content_scope"] = previous.get("content_scope")
     if (not article.get("content") and previous.get("content")) or (
         not article.get("content") and not article.get("summary") and previous.get("summary")
     ):
@@ -170,7 +191,7 @@ class NewsStore:
                 article = {field: raw.get(field) for field in _ARTICLE_FIELDS}
                 if not article["source_id"] or not str(article["title"] or "").strip():
                     raise ValueError("Each article requires source_id and title")
-                canonical = canonicalize_url(str(article["url"] or ""))
+                canonical = _article_identity(article)
                 source = self.connection.execute(
                     "SELECT * FROM article_sources WHERE source_id = ? AND canonical_url = ?",
                     (article["source_id"], canonical),
@@ -187,7 +208,7 @@ class NewsStore:
                     _retain_missing_text(article, json.loads(existing["metadata_json"]))
                     signature = _signature(article)
                     fingerprint = _fingerprint(article)
-                if existing is None and fingerprint:
+                if existing is None and fingerprint and article["source_id"] != "investat":
                     existing = self.connection.execute(
                         "SELECT * FROM articles WHERE fingerprint = ? ORDER BY first_seen, id LIMIT 1",
                         (fingerprint,),
@@ -221,7 +242,15 @@ class NewsStore:
                         )
                         counts["updated"] += 1
                     else:
-                        self.connection.execute("UPDATE articles SET last_seen = ? WHERE id = ?", (now, article_id))
+                        if (source is not None and article["source_id"] == "investat"
+                                and json.loads(existing["metadata_json"]).get("source_id") == "investat"):
+                            # Link/attribution changes do not invalidate unchanged analysis.
+                            self.connection.execute(
+                                "UPDATE articles SET metadata_json = ?, last_seen = ? WHERE id = ?",
+                                (_json(article), now, article_id),
+                            )
+                        else:
+                            self.connection.execute("UPDATE articles SET last_seen = ? WHERE id = ?", (now, article_id))
                         counts["duplicates"] += 1
                 self.connection.execute(
                     "INSERT INTO article_sources (source_id, canonical_url, article_id, metadata_json, "
@@ -324,3 +353,4 @@ class NewsStore:
             result["total"] += row["count"]
         result["attributions"] = self.connection.execute("SELECT COUNT(*) FROM article_sources").fetchone()[0]
         return result
+

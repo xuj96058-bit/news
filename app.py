@@ -16,12 +16,17 @@ from src.feeds import load_sources
 from src.news_store import NewsStore
 from src.rss_pipeline import collect_sources, collect_sec, analyze_pending
 from src.sec_universe import FeedFetchError, SecConfigError, refresh_universe
+from src.investat_pipeline import collect_investat
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
 
 def clear_api_key():
     st.session_state["ai_api_key"] = ""
+
+
+def clear_investat_token():
+    st.session_state["investat_token"] = ""
 
 
 def change_provider():
@@ -77,6 +82,22 @@ with st.sidebar:
         st.info("請先輸入 API key 才能分析；抓取新聞不需要 key。")
     st.caption("模型是否可用取決於你的 API 帳戶權限；選單不會發出付費請求。")
 
+    st.subheader("Investat 設定")
+    entered_investat_token = st.text_input(
+        "Investat MCP token", type="password", key="investat_token",
+        placeholder="貼上 Investat 帳號內產生的 MCP token",
+        help="只保留於目前工作階段，僅送往 Investat；不寫入檔案。輸入後按 Enter 套用。",
+    ).strip()
+    st.button("清除輸入的 Investat token", on_click=clear_investat_token,
+              disabled=not entered_investat_token)
+    environment_investat_token = os.getenv("INVESTAT_MCP_TOKEN", "").strip()
+    effective_investat_token = entered_investat_token or environment_investat_token
+    if effective_investat_token:
+        st.caption("已設定 Investat token；勾選 Investat 後抓取，以確認可用。")
+    else:
+        st.caption("Investat 需獨立 MCP token；AI API key 不適用。")
+    st.link_button("開啟 Investat 帳號設定", "https://investat.ai/account")
+
 effective_api_key = entered_api_key or environment_api_key
 analysis_available = bool(effective_api_key) and model_available
 
@@ -123,18 +144,35 @@ with tab2:
 
 with tab3:
     st.subheader("全球財經新聞")
-    st.caption("抓取公開 RSS／Atom 和金管局公告，先存本機。內容可能僅有摘要；抓取不使用 LLM 額度。")
+    st.caption("抓取公開 RSS／Atom、金管局公告及勾選的 Investat，先存本機。內容可能僅有摘要或片段；抓取不使用 LLM 額度。")
     available = [source for source in load_sources() if source.enabled]
     labels = {source.id: source.name for source in available}
-    selected = st.multiselect("新聞來源", list(labels), default=list(labels),
-                              format_func=lambda identifier: labels[identifier])
+    public_defaults = list(labels)
+    labels["investat"] = "Investat／機構研究"
+    selected = st.multiselect("新聞來源", list(labels), default=public_defaults,
+                              format_func=lambda identifier: labels[identifier], key="news_sources")
+    if "investat" in selected and not effective_investat_token:
+        st.info("請在左側填入 Investat MCP token；其餘來源仍可抓取。")
+    investat_limit = st.number_input("每次抓取 Investat 文章數", min_value=1, max_value=50,
+                                     value=20, step=1, disabled="investat" not in selected)
     if st.button("抓取最新新聞", disabled=not selected):
         with st.spinner("抓取新聞中…"), NewsStore() as inbox:
             outcome = collect_sources([s for s in available if s.id in selected], inbox)
-            st.success(f"新增 {outcome['added']} 則，更新 {outcome['updated']} 則，重複 {outcome['duplicates']} 則")
+            if "investat" in selected:
+                investat_outcome = collect_investat(inbox, token=effective_investat_token,
+                                                    limit=int(investat_limit))
+                for counter in ("added", "updated", "duplicates"):
+                    outcome[counter] += investat_outcome[counter]
+                outcome["sources"].extend(investat_outcome["sources"])
+            if outcome["sources"] and all(item["status"] == "error" for item in outcome["sources"]):
+                st.warning("未取得新聞；請查看下方來源錯誤。")
+            else:
+                st.success(f"新增 {outcome['added']} 則，更新 {outcome['updated']} 則，重複 {outcome['duplicates']} 則")
             for item in outcome["sources"]:
-                if item["status"] == "error":
-                    st.warning(f"{item['name']}：{item['error']}")
+                if item["status"] in {"error", "partial"}:
+                    st.warning(f"{item['name']}：{item.get('error') or '部分文章僅取得摘要或片段；可重新抓取。'}")
+                elif item["id"] == "investat":
+                    st.caption("Investat 抓取完成。" if item["status"] == "ok" else "Investat 暫無可取得的文章。")
     if st.button("AI 分析待處理新聞（最多 5 則）", disabled=not analysis_available):
         with st.spinner("分析中，將使用你設定的 LLM API…"), NewsStore() as inbox:
             outcome = analyze_pending(inbox, limit=5, analyzer=analyze_for_session)
@@ -158,9 +196,16 @@ with tab3:
         counts = inbox.stats()
         articles = inbox.export_articles()[:50]
     st.caption(f"新聞庫 {counts['total']} 則，已分析 {counts['analyzed']} 則。顯示最新 50 則。")
+    scope_labels = {"summary": "摘要", "provided_text": "來源提供的內文（未確認是否全文）",
+                    "partial_text": "部分內文", "title_only": "僅標題", "filing_notice": "申報通知"}
     for item in articles:
         with st.expander(item["title"]):
             st.write("來源：" + "、".join(dict.fromkeys(s["source_name"] for s in item["sources"])))
-            st.caption(f"{item.get('published_at') or '未提供發布時間'} · {item['content_scope']}")
+            st.caption(f"{item.get('published_at') or '未提供發布時間'} · {scope_labels.get(item['content_scope'], item['content_scope'])}")
             st.write(item.get("content") or item.get("summary") or "來源只提供標題，請閱讀原文。")
-            st.link_button("閱讀原文", item["url"])
+            if item.get("url"):
+                st.link_button("閱讀原文", item["url"])
+            elif item.get("source_id") == "investat":
+                st.caption(f"Investat 文章 ID：{item['external_id']}（接口未提供文章連結）")
+                st.link_button("前往 Investat", "https://investat.ai/")
+
