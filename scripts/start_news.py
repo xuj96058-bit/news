@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import socket
@@ -51,10 +52,10 @@ def matching_server() -> bool:
                                 capture_output=True, text=True, timeout=10,
                                 creationflags=subprocess.CREATE_NO_WINDOW, check=True)
         owner = json.loads(result.stdout)
-        command = owner.get("command", "").casefold()
+        command = (owner.get("command") or "").casefold()
         return ("-m streamlit run" in command
                 and str(ROOT / "app.py").casefold() in command
-                and Path(owner.get("executable", "")).name.casefold() in {"python.exe", "pythonw.exe"})
+                and Path(owner.get("executable") or "").name.casefold() in {"python.exe", "pythonw.exe"})
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
@@ -75,7 +76,12 @@ def main(argv=None) -> int:
             print("Port 8502 is occupied by another service. Close that service before starting News.")
             return 1
         modules = ("openai", "pydantic", "streamlit", "requests", "dotenv", "feedparser", "tzdata")
-        if sys.version_info < (3, 10) or any(importlib.util.find_spec(name) is None for name in modules):
+        try:
+            pydantic_major = int(version("pydantic").split(".", 1)[0])
+        except (PackageNotFoundError, ValueError):
+            pydantic_major = 0
+        if (sys.version_info < (3, 10) or pydantic_major < 2
+                or any(importlib.util.find_spec(name) is None for name in modules)):
             print("Python 3.10+ with the project dependencies is required.")
             print(f'Run: "{sys.executable}" -m pip install -r "{ROOT / "requirements.txt"}"')
             return 1
