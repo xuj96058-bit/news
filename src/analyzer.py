@@ -5,6 +5,7 @@
 
 import os
 import json
+import re
 from typing import Any
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -34,40 +35,108 @@ class AnalysisResult(BaseModel):
     overall_confidence: float = Field(ge=0.0, le=1.0)
 
 
-# 常見實體 → 標的映射（可持續擴展）
+# 擴展的實體 → 標的映射（中英都覆蓋，可持續擴展）
 ENTITY_TO_TICKER = {
-    "NVIDIA": "NVDA",
-    "英伟达": "NVDA",
-    "英偉達": "NVDA",
-    "Apple": "AAPL",
-    "蘋果": "AAPL",
-    "Microsoft": "MSFT",
-    "微软": "MSFT",
-    "Amazon": "AMZN",
-    "亞馬遜": "AMZN",
-    "Tesla": "TSLA",
-    "特斯拉": "TSLA",
-    "Meta": "META",
-    "徵象": "META",
-    "Google": "GOOGL",
-    "Alphabet": "GOOGL",
-    "谷歌": "GOOGL",
-    "Cisco": "CSCO",
-    "思科": "CSCO",
-    "TSMC": "TSM",
-    "台積電": "TSM",
-    "Fed": "TLT",
-    "聯邦儲備": "TLT",
-    "美聯儲": "TLT",
-    "QQQ": "QQQ",
-    "Nasdaq": "QQQ",
-    "納指": "QQQ",
+    # Tech giants
+    "NVIDIA": "NVDA", "英伟达": "NVDA", "英偉達": "NVDA", "英偉达": "NVDA",
+    "Apple": "AAPL", "蘋果": "AAPL", "苹果": "AAPL",
+    "Microsoft": "MSFT", "微软": "MSFT",
+    "Amazon": "AMZN", "亞馬遜": "AMZN", "亚马逊": "AMZN",
+    "Tesla": "TSLA", "特斯拉": "TSLA",
+    "Meta": "META", "徵象": "META", "Facebook": "META",
+    "Google": "GOOGL", "Alphabet": "GOOGL", "谷歌": "GOOGL", "谷歌": "GOOGL",
+    "Cisco": "CSCO", "思科": "CSCO",
+    "TSMC": "TSM", "台積電": "TSM", "台积电": "TSM",
+    "Broadcom": "AVGO", "博通": "AVGO",
+    "AMD": "AMD", "超微": "AMD",
+    "Intel": "INTC", "英特爾": "INTC",
+    # Indices & Macro
+    "QQQ": "QQQ", "Nasdaq": "QQQ", "納指": "QQQ", "纳指": "QQQ",
+    "SPY": "SPY", "S&P 500": "SPY", "標普": "SPY",
+    "Fed": "TLT", "聯邦儲備": "TLT", "美聯儲": "TLT", "美联储": "TLT",
+    "Treasury": "TLT", "美債": "TLT",
+    # Others common
+    "Berkshire": "BRK.B", "伯克希爾": "BRK.B",
+    "JPMorgan": "JPM", "摩根大通": "JPM",
+    "Goldman": "GS", "高盛": "GS",
 }
+
+# 已知合法標的集合（用於校驗，可再擴充）
+KNOWN_TICKERS = {
+    "NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "GOOGL", "GOOG",
+    "CSCO", "TSM", "AVGO", "AMD", "INTC", "QQQ", "SPY", "TLT",
+    "BRK.B", "JPM", "GS", "XLF", "XLK", "SMH",
+}
+
+
+def normalize_entity(name: str) -> str:
+    """簡單正規化：去空白、轉大寫。"""
+    return re.sub(r"\s+", "", name).strip()
+
+
+def map_entities_to_tickers(entities: list[str]) -> dict[str, str]:
+    """從實體列表映射出可靠的 ticker。回傳 {normalized_entity: ticker}"""
+    mapping = {}
+    for ent in entities:
+        norm = normalize_entity(ent)
+        # 直接匹配
+        if norm in ENTITY_TO_TICKER:
+            mapping[norm] = ENTITY_TO_TICKER[norm]
+            continue
+        # 不區分大小寫匹配
+        for key, ticker in ENTITY_TO_TICKER.items():
+            if key.lower() == norm.lower() or key.lower() in norm.lower() or norm.lower() in key.lower():
+                mapping[norm] = ticker
+                break
+    return mapping
+
+
+def post_process_impacts(result: AnalysisResult) -> AnalysisResult:
+    """
+    後處理與校驗：
+    1. 從 entities 映射出可靠 tickers
+    2. 覆蓋 / 過濾 LLM 輸出的 impacts，避免亂編標的
+    3. 未知標的且無法映射的移除
+    """
+    entity_map = map_entities_to_tickers(result.extraction.entities)
+    trusted_tickers = set(entity_map.values())
+
+    validated_impacts = []
+    seen = set()
+
+    # 優先用實體映射結果生成基礎 impact（如果 LLM 沒給）
+    for ticker in trusted_tickers:
+        if ticker not in seen:
+            # 找看 LLM 是否已有說明，否則用默認
+            existing = next((imp for imp in result.impacts if imp.ticker.upper() == ticker), None)
+            if existing:
+                validated_impacts.append(existing)
+            else:
+                validated_impacts.append(ImpactItem(
+                    ticker=ticker,
+                    direction=result.extraction.direction if result.extraction.direction in {"positive", "negative", "neutral"} else "neutral",
+                    strength="medium",
+                    path="直接",
+                    reason=f"來自實體映射：{', '.join(k for k, v in entity_map.items() if v == ticker)}",
+                ))
+            seen.add(ticker)
+
+    # 再處理 LLM 給的，但只保留已知或可映射的
+    for imp in result.impacts:
+        t = imp.ticker.upper().replace(".", "")
+        if t in KNOWN_TICKERS or imp.ticker.upper() in trusted_tickers:
+            if imp.ticker.upper() not in seen:
+                validated_impacts.append(imp)
+                seen.add(imp.ticker.upper())
+        # else: 丟棄未知標的
+
+    result.impacts = validated_impacts
+    return result
 
 
 def get_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL")  # 可選，兼容 Grok / 其他 endpoint
+    base_url = os.getenv("OPENAI_BASE_URL")
     if not api_key:
         raise RuntimeError("請設定環境變數 OPENAI_API_KEY")
     return OpenAI(api_key=api_key, base_url=base_url)
@@ -112,6 +181,7 @@ JSON Schema:
 - 傳導路徑要具體：直接影響公司本身 / 供應鏈 / 板塊輪動 / 宏觀
 - 每個結論都要有清楚理由，不能只給分數
 - 置信度要實事求是，不確定的事件要調低
+- entities 請尽量保留原始名稱（中文或英文）
 """
 
     user = f"新聞內容：\n{news_text.strip()}"
@@ -128,7 +198,8 @@ JSON Schema:
 
     raw = resp.choices[0].message.content
     data = json.loads(raw)
-    return AnalysisResult(**data)
+    result = AnalysisResult(**data)
+    return post_process_impacts(result)
 
 
 def format_result(result: AnalysisResult) -> str:
