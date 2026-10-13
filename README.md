@@ -105,6 +105,22 @@ python -m src.report
 
 網頁的「新聞來源」分頁可選來源、抓新聞、刷新 SEC 名單、抓 SEC 通知及明確啟動 AI 分析。
 
+左側「AI 設定」依序選擇 **AI 服務商 → AI 模型 → API key**。key 欄位以密碼方式顯示；貼上後按 Enter，再點「分析」或「AI 分析待處理新聞」。選單另有「自訂模型 ID」，可填入所選服務商的其他文字模型 ID；模型必須支援目前的文字／JSON 分析介面，是否可用仍取決於帳戶權限。
+
+| 服務商 | 選單模型範例 | 本機環境變數 | 官方介面 |
+| --- | --- | --- | --- |
+| DeepSeek | `deepseek-v4-pro`、`deepseek-flash` | `DEEPSEEK_API_KEY` | [相容 API](https://api-docs.deepseek.com/quick_start/pricing/) |
+| OpenAI | `gpt-6.1-sol`、`gpt-6-sol`、`gpt-6-luna` | `OPENAI_API_KEY` | [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) |
+| xAI / Grok | `grok-4.7` | `XAI_API_KEY` | [JSON 輸出](https://docs.x.ai/developers/model-capabilities/text/structured-outputs) |
+| Anthropic / Claude | `claude-sonnet-5`、`claude-opus-5-5`、`claude-haiku-4-5` | `ANTHROPIC_API_KEY` | [原生 Messages API](https://platform.claude.com/docs/en/api/messages/create) |
+| Google / Gemini | `gemini-3.8-flash` | `GEMINI_API_KEY` | [相容 API](https://ai.google.dev/gemini-api/docs/openai) |
+
+頁面輸入的 key 只保留在目前工作階段，優先於所選服務商的本機設定，僅送往該服務商的官方 API。不寫入 `.env`、新聞資料庫或 Git，也不修改其他使用者的環境設定。**切換服務商會清除輸入的 key 並重設模型**；可隨時按「清除輸入的 key」。清除或未輸入時，只會使用所選服務商對應的本機 key；兩者皆未設定時停用分析按鈕，抓取新聞仍可使用。關閉或重新載入頁面後可能需要重新輸入。
+
+`LLM_PROVIDER` 可設定網頁預設服務商：`deepseek`（預設）、`openai`、`xai`、`anthropic`、`gemini`。舊版把 DeepSeek key 放在 `OPENAI_API_KEY` 的設定，只有在 `OPENAI_BASE_URL` 指向 DeepSeek，或未設定端點且明確指定 `LLM_PROVIDER=deepseek` 時，網頁才會將它用於 DeepSeek；同一環境 key 不會同時提供給 OpenAI 和 DeepSeek。命令列既有流程仍使用 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 與 `LLM_MODEL` 的相容 API 設定。
+
+更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。測試使用模擬回應驗證五家服務商的請求及解析，未用真實 key 驗證帳戶權限或產生付費分析。
+
 Investat 原有批次流程仍需 `INVESTAT_MCP_TOKEN` 和 LLM key。原有手動／Investat 分析保存在 `data/events.jsonl`；日報會一起讀取已完成的 RSS 分析。日報目前仍按全部已保存分析的置信度篩選，沒有按當日日期限制；港股／A 股標的映射也尚未完整覆蓋。
 
 `data/feed_status.json` 保存新聞來源抓取狀態，SEC 單獨執行時使用 `data/sec_status.json`。新增收集流程的錯誤紀錄只保留安全分類，不保存 LLM 回應中的原始錯誤文字或密鑰。
