@@ -37,53 +37,45 @@ class AnalysisResult(BaseModel):
 
 # 擴展的實體 → 標的映射（中英都覆蓋，可持續擴展）
 ENTITY_TO_TICKER = {
-    # Tech giants
     "NVIDIA": "NVDA", "英伟达": "NVDA", "英偉達": "NVDA", "英偉达": "NVDA",
     "Apple": "AAPL", "蘋果": "AAPL", "苹果": "AAPL",
     "Microsoft": "MSFT", "微软": "MSFT",
     "Amazon": "AMZN", "亞馬遜": "AMZN", "亚马逊": "AMZN",
     "Tesla": "TSLA", "特斯拉": "TSLA",
     "Meta": "META", "徵象": "META", "Facebook": "META",
-    "Google": "GOOGL", "Alphabet": "GOOGL", "谷歌": "GOOGL", "谷歌": "GOOGL",
+    "Google": "GOOGL", "Alphabet": "GOOGL", "谷歌": "GOOGL",
     "Cisco": "CSCO", "思科": "CSCO",
     "TSMC": "TSM", "台積電": "TSM", "台积电": "TSM",
     "Broadcom": "AVGO", "博通": "AVGO",
     "AMD": "AMD", "超微": "AMD",
     "Intel": "INTC", "英特爾": "INTC",
-    # Indices & Macro
     "QQQ": "QQQ", "Nasdaq": "QQQ", "納指": "QQQ", "纳指": "QQQ",
     "SPY": "SPY", "S&P 500": "SPY", "標普": "SPY",
     "Fed": "TLT", "聯邦儲備": "TLT", "美聯儲": "TLT", "美联储": "TLT",
     "Treasury": "TLT", "美債": "TLT",
-    # Others common
     "Berkshire": "BRK.B", "伯克希爾": "BRK.B",
     "JPMorgan": "JPM", "摩根大通": "JPM",
     "Goldman": "GS", "高盛": "GS",
 }
 
-# 已知合法標的集合（用於校驗，可再擴充）
 KNOWN_TICKERS = {
     "NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "GOOGL", "GOOG",
     "CSCO", "TSM", "AVGO", "AMD", "INTC", "QQQ", "SPY", "TLT",
-    "BRK.B", "JPM", "GS", "XLF", "XLK", "SMH",
+    "BRK.B", "JPM", "GS", "XLF", "XLK", "SMH", "MRVL", "VRT", "CEG", "ETN", "NEE",
 }
 
 
 def normalize_entity(name: str) -> str:
-    """簡單正規化：去空白、轉大寫。"""
     return re.sub(r"\s+", "", name).strip()
 
 
 def map_entities_to_tickers(entities: list[str]) -> dict[str, str]:
-    """從實體列表映射出可靠的 ticker。回傳 {normalized_entity: ticker}"""
     mapping = {}
     for ent in entities:
         norm = normalize_entity(ent)
-        # 直接匹配
         if norm in ENTITY_TO_TICKER:
             mapping[norm] = ENTITY_TO_TICKER[norm]
             continue
-        # 不區分大小寫匹配
         for key, ticker in ENTITY_TO_TICKER.items():
             if key.lower() == norm.lower() or key.lower() in norm.lower() or norm.lower() in key.lower():
                 mapping[norm] = ticker
@@ -92,22 +84,13 @@ def map_entities_to_tickers(entities: list[str]) -> dict[str, str]:
 
 
 def post_process_impacts(result: AnalysisResult) -> AnalysisResult:
-    """
-    後處理與校驗：
-    1. 從 entities 映射出可靠 tickers
-    2. 覆蓋 / 過濾 LLM 輸出的 impacts，避免亂編標的
-    3. 未知標的且無法映射的移除
-    """
     entity_map = map_entities_to_tickers(result.extraction.entities)
     trusted_tickers = set(entity_map.values())
-
     validated_impacts = []
     seen = set()
 
-    # 優先用實體映射結果生成基礎 impact（如果 LLM 沒給）
     for ticker in trusted_tickers:
         if ticker not in seen:
-            # 找看 LLM 是否已有說明，否則用默認
             existing = next((imp for imp in result.impacts if imp.ticker.upper() == ticker), None)
             if existing:
                 validated_impacts.append(existing)
@@ -121,14 +104,12 @@ def post_process_impacts(result: AnalysisResult) -> AnalysisResult:
                 ))
             seen.add(ticker)
 
-    # 再處理 LLM 給的，但只保留已知或可映射的
     for imp in result.impacts:
         t = imp.ticker.upper().replace(".", "")
         if t in KNOWN_TICKERS or imp.ticker.upper() in trusted_tickers:
             if imp.ticker.upper() not in seen:
                 validated_impacts.append(imp)
                 seen.add(imp.ticker.upper())
-        # else: 丟棄未知標的
 
     result.impacts = validated_impacts
     return result
@@ -136,16 +117,17 @@ def post_process_impacts(result: AnalysisResult) -> AnalysisResult:
 
 def get_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
     if not api_key:
         raise RuntimeError("請設定環境變數 OPENAI_API_KEY")
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
-def analyze_news(news_text: str, model: str = "gpt-4o-mini") -> AnalysisResult:
+def analyze_news(news_text: str, model: str = None) -> AnalysisResult:
     """
     對一則新聞做分析師水平的結構化分析。
     """
+    model = model or os.getenv("LLM_MODEL", "deepseek-v4-pro")
     client = get_client()
 
     system = """你是一位經驗豐富的金融分析師。
@@ -186,6 +168,11 @@ JSON Schema:
 
     user = f"新聞內容：\n{news_text.strip()}"
 
+    # DeepSeek V4 Pro 默認會走 thinking，這裡關掉以保證 JSON 輸出穩定
+    extra = {}
+    if "deepseek" in model.lower():
+        extra["thinking"] = {"type": "disabled"}
+
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -193,7 +180,9 @@ JSON Schema:
             {"role": "user", "content": user},
         ],
         temperature=0.2,
+        max_tokens=2000,
         response_format={"type": "json_object"},
+        extra_body=extra if extra else None,
     )
 
     raw = resp.choices[0].message.content
@@ -203,7 +192,6 @@ JSON Schema:
 
 
 def format_result(result: AnalysisResult) -> str:
-    """把結果轉成人類可讀的分析師報告。"""
     lines = []
     e = result.extraction
     lines.append(f"【事件類型】{e.event_type}")
@@ -215,9 +203,7 @@ def format_result(result: AnalysisResult) -> str:
     if not result.impacts:
         lines.append("  （無明確標的）")
     for imp in result.impacts:
-        lines.append(
-            f"  • {imp.ticker}  {imp.direction} ({imp.strength})  [{imp.path}]"
-        )
+        lines.append(f"  • {imp.ticker}  {imp.direction} ({imp.strength})  [{imp.path}]")
         lines.append(f"    {imp.reason}")
     lines.append("")
     lines.append(f"【整體結論】{result.summary}")
