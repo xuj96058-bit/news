@@ -4,6 +4,7 @@
 """
 
 import streamlit as st
+from src import env  # 自動載入本機 .env
 from src.analyzer import analyze_news, format_result
 from src.collector import save_event, load_events
 from src.report import generate_daily_report
@@ -23,7 +24,6 @@ with tab1:
                 result = analyze_news(news_input)
                 st.markdown("### 分析結果")
                 st.text(format_result(result))
-                # 可選儲存
                 if st.checkbox("儲存到日報庫", value=True):
                     saved = save_event(news_input, result.model_dump(), source="web")
                     if saved:
