@@ -4,6 +4,13 @@
 
 已接入 **Investat 金融信息流**（MCP），可拉取机构研究报告并生成结构化分析师结论。
 
+## 重要：API Key 不会上传到 GitHub
+
+- 所有密钥（DeepSeek、OpenRouter、Investat MCP Token）**只存在你本機的 `.env` 文件**
+- `.env` 已加入 `.gitignore`，**绝不会**被提交到仓库
+- 仓库里只有 `.env.example`（占位符），没有任何真实 key
+- 程序启动时会自动读取本機 `.env`
+
 ## 目标
 
 不是堆关键词或黑箱分数，而是能说清楚：
@@ -33,24 +40,29 @@ Investat MCP ──→ list_articles / get_article ──→ LLM 分析器 ─�
 
 - [x] 查询核心模块
 - [x] 标的映射 + 后处理校验
-- [x] Investat MCP 客户端（拉取文章）
+- [x] Investat MCP 客户端
 - [x] 管道：拉取 → 分析 → 去重存储 → 日报
 - [x] Streamlit 前端
-- [x] 支援 OpenRouter / DeepSeek 等兼容 endpoint
+- [x] 自动读取本机 `.env`（密钥不上传）
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# 编辑 .env：填入 LLM key 与 INVESTAT_MCP_TOKEN
+# 用编辑器打开 .env，填入你的真实 key（不会被提交）
+```
+
+`.env` 范例：
+```
+OPENAI_API_KEY=sk-你的DeepSeek_key
+OPENAI_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-pro
+INVESTAT_MCP_TOKEN=ift_你的令牌
 ```
 
 ### 从 Investat 拉取并分析
 ```bash
-export INVESTAT_MCP_TOKEN=ift_...
-export OPENAI_API_KEY=...
-export OPENAI_BASE_URL=https://openrouter.ai/api/v1   # 可选
 python -m src.pipeline
 ```
 
@@ -76,6 +88,7 @@ python -m src.report
 - `src/pipeline.py` — 拉取 + 分析 + 存储管道
 - `src/collector.py` — 去重存储
 - `src/report.py` — 日报生成
+- `src/env.py` — 自动载入本机 `.env`
 - `app.py` — Streamlit 前端
 
-LLM 支援任何 OpenAI 兼容 endpoint（OpenRouter、DeepSeek 等），通过 `OPENAI_BASE_URL` + `OPENAI_API_KEY` 切换。
+**记得：只要把 key 写在本机 `.env`，GitHub 仓库就会一直保持干净。**
