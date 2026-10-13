@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.key
+
+# Data & runtime
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
