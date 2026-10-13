@@ -90,6 +90,8 @@ python -m src.rss_pipeline --analysis-only --analysis-limit 10
 python -m src.rss_pipeline --analyze --analysis-limit 5
 ```
 
+`--analysis-limit` 目前只限制**單次命令執行**的分析數量，並非每小時額度，也不能代替下述雲端方案的持久化限額。
+
 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`LLM_MODEL` 設定相容服務。範例指向 DeepSeek，實際服務／模型是否可用取決於你的帳號及設定。模型的置信度是自評，不能視為股價預測成功率。分析器也會讀本機指數追蹤名單，避免只保留原本少量美股代碼。
 
 ## 網頁、Investat 與日報
@@ -106,6 +108,27 @@ python -m src.report
 Investat 原有批次流程仍需 `INVESTAT_MCP_TOKEN` 和 LLM key。原有手動／Investat 分析保存在 `data/events.jsonl`；日報會一起讀取已完成的 RSS 分析。日報目前仍按全部已保存分析的置信度篩選，沒有按當日日期限制；港股／A 股標的映射也尚未完整覆蓋。
 
 `data/feed_status.json` 保存新聞來源抓取狀態，SEC 單獨執行時使用 `data/sec_status.json`。新增收集流程的錯誤紀錄只保留安全分類，不保存 LLM 回應中的原始錯誤文字或密鑰。
+
+## 未來雲端方案（尚未實作或部署）
+
+以下是已討論的後續設計；目前仍是手動執行的本機版本，尚未建立雲端服務或自動排程。
+
+- **全天運行與收集：**雲端服務預計 24/7 運行，每 5 分鐘抓取一次新聞及 SEC 申報通知。收集與 AI 分析分開執行，先保存、去重，再排入分析佇列；超出分析額度的項目留待後續處理。來源發布延遲、抓取週期與排隊時間都會影響結果出現時間，不保證即時推送。
+- **分析額度：**任何滾動 60 分鐘內最多 20 次模型分析嘗試。每次實際送出的模型請求都須計數，失敗請求及重試也佔用額度；額度紀錄需持久保存，服務重啟後仍須遵守同一視窗。
+- **持久保存：**新聞、分析結果、佇列狀態及額度紀錄需保存在持久化資料庫。候選部署方式是 Railway 搭配 [Volume](https://docs.railway.com/volumes) 保存資料；尚未選定或部署。
+- **SEC 名單維護：**定期刷新兩個指數的公司追蹤名單，在七日有效期屆滿前完成更新；若更新失敗或名單過期，仍須遵守現有覆蓋檢查。收集內容仍是申報通知及連結，並非申報全文；全文下載與分析不在目前已完成範圍。
+- **網頁顯示：**未來網頁可自動刷新並顯示資料庫中已快取的新聞與分析結果；刷新頁面本身不應觸發新的模型請求。
+
+部署時透過平台環境變數／Secrets 設定密鑰及 SEC 聯絡資料，不寫入程式碼、README 或 Git。以下僅為設定範本，沒有真實密鑰或聯絡資料：
+
+```text
+OPENAI_API_KEY=<your-deepseek-api-key>
+OPENAI_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-pro
+SEC_USER_AGENT=my-news-reader/1.0 contact <your-contact-email>
+```
+
+模型名稱與價格在部署前仍須核對帳戶實際可用性及 [DeepSeek 官方模型／價格說明](https://api-docs.deepseek.com/quick_start/pricing/)。以上設定範本不代表已驗證雲端部署或模型呼叫。
 
 ## 測試
 
