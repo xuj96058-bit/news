@@ -2,12 +2,16 @@
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
 *.key
 
 # Data & runtime
 data/
 __pycache__/
 *.pyc
+*.sqlite3
+*.sqlite3-*
 .venv/
 venv/
 
