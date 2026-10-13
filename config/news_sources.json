@@ -1,0 +1,20 @@
+[
+  {"id":"fed_monetary","name":"Federal Reserve — Monetary Policy","url":"https://www.federalreserve.gov/feeds/press_monetary.xml","kind":"official","region":"us"},
+  {"id":"bls_cpi","name":"BLS — Consumer Price Index","url":"https://www.bls.gov/feed/cpi.rss","kind":"official","region":"us"},
+  {"id":"bls_employment","name":"BLS — Employment Situation","url":"https://www.bls.gov/feed/empsit.rss","kind":"official","region":"us"},
+  {"id":"bea","name":"Bureau of Economic Analysis","url":"https://apps.bea.gov/rss/rss.xml","kind":"official","region":"us"},
+  {"id":"ecb","name":"European Central Bank","url":"https://www.ecb.europa.eu/rss/press.html","kind":"official","region":"europe"},
+  {"id":"eia","name":"EIA — Today in Energy","url":"https://www.eia.gov/rss/todayinenergy.xml","kind":"official","region":"global"},
+  {"id":"nbs","name":"中國國家統計局 — 最新發布","url":"https://www.stats.gov.cn/sj/zxfb/rss.xml","kind":"official","region":"china","timezone":"Asia/Shanghai"},
+  {"id":"pboc","name":"中國人民銀行","url":"https://www.pbc.gov.cn/goutongjiaoliu/113456/2986536/index.html","kind":"official","region":"china","timezone":"Asia/Shanghai"},
+  {"id":"cnbc_top","name":"CNBC — Top News","url":"https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114","kind":"media","region":"global"},
+  {"id":"cnbc_earnings","name":"CNBC — Earnings","url":"https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135","kind":"media","region":"us"},
+  {"id":"cnbc_economy","name":"CNBC — Economy","url":"https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258","kind":"media","region":"global"},
+  {"id":"bbc_business","name":"BBC — Business","url":"https://feeds.bbci.co.uk/news/business/rss.xml","kind":"media","region":"global"},
+  {"id":"rthk_finance","name":"香港電台 — 財經新聞","url":"https://rthk.hk/rthk/news/rss/c_expressnews_cfinance.xml","kind":"media","region":"hong_kong","timezone":"Asia/Hong_Kong"},
+  {"id":"ft_global_economy","name":"Financial Times — Global Economy","url":"https://www.ft.com/global-economy?format=rss","kind":"media","region":"global"},
+  {"id":"hkex","name":"香港交易所 — 新聞稿","url":"https://www.hkex.com.hk/Services/RSS-Feeds/News-Releases?sc_lang=zh-HK","kind":"official","region":"hong_kong","timezone":"Asia/Hong_Kong"},
+  {"id":"nvidia","name":"NVIDIA — Press Releases","url":"https://nvidianews.nvidia.com/cats/press_release.xml","kind":"company","region":"us"},
+  {"id":"apple","name":"Apple Newsroom","url":"https://www.apple.com/newsroom/rss-feed.rss","kind":"company","region":"us"},
+  {"id":"hkma","name":"香港金融管理局 — 新聞稿","url":"https://api.hkma.gov.hk/public/press-releases?lang=tc","kind":"official","region":"hong_kong","format":"hkma_json","timezone":"Asia/Hong_Kong"}
+]

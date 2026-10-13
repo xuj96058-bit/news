@@ -6,10 +6,26 @@
 from datetime import datetime
 from .collector import load_events
 from .analyzer import format_result, AnalysisResult
+from .news_store import DEFAULT_DB_PATH, NewsStore
+
+
+def load_report_events():
+    """Combine existing manual/Investat analyses with completed feed analyses."""
+    events = load_events()
+    if DEFAULT_DB_PATH.exists():
+        with NewsStore() as inbox:
+            for article in inbox.export_articles():
+                if article["status"] == "analyzed" and article["analysis"]:
+                    events.append({"analysis": article["analysis"],
+                                   "source": ", ".join(dict.fromkeys(
+                                       s["source_name"] for s in article["sources"])),
+                                   "source_url": article["url"],
+                                   "content_scope": article["content_scope"]})
+    return events
 
 
 def generate_daily_report(min_confidence: float = 0.7) -> str:
-    events = load_events()
+    events = load_report_events()
     # 過濾高置信度
     high_conf = []
     for e in events:
@@ -30,6 +46,8 @@ def generate_daily_report(min_confidence: float = 0.7) -> str:
             result = AnalysisResult(**analysis_dict)
             lines.append(f"## {i}. {e.get('source', 'unknown')} | 置信度 {result.overall_confidence:.0%}")
             lines.append(format_result(result))
+            if e.get("source_url"):
+                lines.append(f"來源：{e['source_url']}（{e.get('content_scope', 'feed')}）")
             lines.append("\n---\n")
         except Exception:
             lines.append(f"## {i}. 解析失敗\n")
