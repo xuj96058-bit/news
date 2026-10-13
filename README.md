@@ -15,6 +15,10 @@ cp .env.example .env
 
 Windows PowerShell 可使用 `Copy-Item .env.example .env`。真實密鑰和 SEC 聯絡資料只填入本機 `.env`；它與 `data/` 已被 Git 忽略。`.gitignore` 不能撤回已公開的內容，也不能阻止強制加入檔案，提交前仍應檢查 diff。
 
+Windows 安裝依賴後，雙擊專案根目錄的 **`Start-News.cmd`** 即可啟動最新版網頁並開啟 `http://127.0.0.1:8502/`。啟動器優先使用專案的 `.venv`／`venv`，其次使用已安裝的 Python；缺少依賴時會提示安裝命令。服務在背景運行，重複啟動會沿用現有服務。電腦重啟後需再次雙擊；啟動紀錄保存在被 Git 忽略的 `data/`，不包含 token 設定。
+
+`main` 是目前維護的版本，已包含公開新聞來源、多家 AI 服務商及 Investat 整合。更新程式不會覆蓋本機 `.env` 或 `data/`；工作階段中輸入的密鑰在網頁或服務重啟後需重新填入。
+
 ## 抓取新聞
 
 ```bash
