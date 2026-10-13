@@ -74,6 +74,60 @@ class InvestatPipelineTests(unittest.TestCase):
         rows = {article["external_id"]: article for article in self.store.export_articles()}
         self.assertEqual(rows["8"]["url"], "")
 
+    def test_millisecond_publication_timestamp_is_saved_as_utc_iso(self):
+        self.collect(Client([item(publishedAt=1791879646558, reportDate="2026-10-12")]))
+        row = self.store.export_articles()[0]
+        self.assertEqual(row["published_at"], "2026-10-13T08:20:46.558000+00:00")
+        self.assertNotIn("reportDate", row["sources"][0]["raw_metadata"])
+        self.assertEqual(self.collect(Client([item(publishedAt=1791879646558)]))["duplicates"], 1)
+
+    def test_detail_publication_overrides_list_numeric_or_stale_string_date(self):
+        for listed in (1791793246558, "2026-10-12T08:00:00Z"):
+            for key in ("publishedAt", "published_at"):
+                with self.subTest(listed=listed, key=key), NewsStore(":memory:") as store:
+                    client = Client([item(publishedAt=listed)],
+                                    {(7, 0): {"id": 7, "body": "Provided text", key: 1791879646558}})
+                    collect_investat(store, token=TOKEN, client_factory=lambda **_: client)
+                    self.assertEqual(store.export_articles()[0]["published_at"],
+                                     "2026-10-13T08:20:46.558000+00:00")
+
+    def test_valid_publication_string_formats_are_preserved(self):
+        for value in ("2026-10-13T08:00:00Z", "2026-10-13T16:00:00+08:00",
+                      "Tue, 13 Oct 2026 08:00:00 +0000", "2026-10-13"):
+            with self.subTest(value=value), NewsStore(":memory:") as store:
+                client = Client([item(publishedAt=value)])
+                collect_investat(store, token=TOKEN, client_factory=lambda **_: client)
+                self.assertEqual(store.export_articles()[0]["published_at"], value)
+
+    def test_invalid_publication_values_are_unknown_without_report_date_fallback(self):
+        for value in (None, "", " ", "not-a-date", True, False, float("nan"),
+                      float("inf"), -float("inf"), 10**100, {"date": "2026-10-13"}, []):
+            with self.subTest(value=value), NewsStore(":memory:") as store:
+                client = Client([item(publishedAt=value, reportDate="2026-10-12")])
+                report = collect_investat(store, token=TOKEN, client_factory=lambda **_: client)
+                self.assertEqual(report["added"], 1)
+                self.assertIsNone(store.export_articles()[0]["published_at"])
+
+    def test_invalid_detail_date_preserves_list_date_and_valid_alternate_is_used(self):
+        client = Client([item(publishedAt=1791879646558)],
+                        {(7, 0): {"id": 7, "publishedAt": float("nan"), "body": "Provided text"}})
+        self.collect(client)
+        self.assertEqual(self.store.export_articles()[0]["published_at"],
+                         "2026-10-13T08:20:46.558000+00:00")
+        client = Client([item(publishedAt=False, published_at="2026-10-13T08:00:00Z")])
+        self.collect(client)
+        self.assertEqual(self.store.export_articles()[0]["published_at"], "2026-10-13T08:00:00Z")
+
+    def test_epoch_boundary_values_are_milliseconds_without_local_timezone(self):
+        values = ((0, "1970-01-01T00:00:00+00:00"),
+                  (-1, "1969-12-31T23:59:59.999000+00:00"),
+                  (0.5, "1970-01-01T00:00:00.000500+00:00"))
+        for value, expected in values:
+            with self.subTest(value=value), NewsStore(":memory:") as store:
+                client = Client([item(publishedAt=value)])
+                collect_investat(store, token=TOKEN, client_factory=lambda **_: client)
+                self.assertEqual(store.export_articles()[0]["published_at"], expected)
+
     def test_repeated_collection_deduplicates_and_never_calls_llm(self):
         with patch("src.analyzer.analyze_news") as model:
             self.assertEqual(self.collect()["added"], 1)

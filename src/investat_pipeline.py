@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 from .investat import InvestatClient, InvestatError
@@ -14,6 +15,38 @@ def _text(value) -> str:
 
 def _first_text(record, *keys) -> str:
     return next((_text(record.get(key)) for key in keys if _text(record.get(key))), "")
+
+
+def _publication_value(value) -> str | None:
+    """Convert Investat's Unix milliseconds; retain valid supplied date strings."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsedate_to_datetime(text)
+            except (ValueError, TypeError, OverflowError):
+                return None
+        return text
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            published = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=value)
+        except (ValueError, OverflowError):
+            return None
+        return published.isoformat()
+    return None
+
+
+def _publication_time(record) -> str | None:
+    # A research report's reportDate is not its publication timestamp.
+    for key in ("publishedAt", "published_at"):
+        value = _publication_value(record.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _body(record) -> str:
@@ -64,7 +97,7 @@ def _normalize(record, article_id, body: str, *, partial=False) -> dict:
         "summary": summary,
         "content": body,
         "url": _url(record),
-        "published_at": _first_text(record, "publishedAt", "published_at") or None,
+        "published_at": _publication_time(record),
         "content_scope": ("partial_text" if partial else "provided_text") if body
                          else "summary" if summary and summary != title else "title_only",
     }
@@ -143,10 +176,14 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
                 outcome["body_pages"] += 1
                 # Empty fields on a chunk do not erase list-summary metadata.
                 for key in ("title", "headline", "summary", "abstract", "excerpt",
-                            "publishedAt", "published_at", "url", "sourceUrl", "source_url",
+                            "url", "sourceUrl", "source_url",
                             "institutionName", "institution_name"):
                     if _text(detail.get(key)):
                         combined[key] = detail[key]
+                publication = _publication_time(detail)
+                if publication is not None:
+                    combined["publishedAt"] = publication
+                    combined.pop("published_at", None)
                 if _institution(detail):
                     combined["institution"] = _institution(detail)
                 chunk = _body(detail)
