@@ -1,18 +1,18 @@
 """
 新聞查詢入口
 用法：python -m src.query "新聞內容"
-或：python src/query.py "新聞內容"
 """
 
 import sys
 import argparse
+from . import env  # 自動載入本機 .env
 from .analyzer import analyze_news, format_result
 
 
 def main():
     parser = argparse.ArgumentParser(description="金融新聞分析查詢")
     parser.add_argument("news", nargs="*", help="新聞文本（可直接貼上）")
-    parser.add_argument("--model", default="gpt-4o-mini", help="LLM 模型")
+    parser.add_argument("--model", default=None, help="LLM 模型（默認讀取 LLM_MODEL 環境變數）")
     args = parser.parse_args()
 
     if args.news:
