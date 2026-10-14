@@ -4,13 +4,16 @@ import os
 from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
+from threading import Event
 import unittest
 from unittest.mock import MagicMock, patch
 
 with patch('dotenv.load_dotenv'):
     from streamlit.testing.v1 import AppTest
     from src.feeds import Source
-    from src.research_store import ResearchStore
+    from src.research import ResearchError
+    from src.research_progress import run_generation
+    from src.research_store import ResearchStore, ResearchStoreError
     import src.research_ui as ui
 
 APP = Path(__file__).resolve().parents[1] / 'app.py'
@@ -63,10 +66,14 @@ class ResearchUiTests(unittest.TestCase):
         return app
 
     def test_generate_edit_restore_and_export_without_second_api_call(self):
+        progress = self.patch('src.research_ui._generation_progress', wraps=ui._generation_progress)
         app = self.app()
         app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
         app.button(key='research_generate').click().run()
         self.assertEqual(len(app.exception), 0)
+        stages = [call.args[1] for call in progress.call_args_list]
+        self.assertIn('saving', stages)
+        self.assertEqual(stages[-1], 'saved')
         with ResearchStore(self.db) as store:
             report = store.list_reports()[0]
         identifier = report['id']
@@ -89,6 +96,82 @@ class ResearchUiTests(unittest.TestCase):
         self.assertEqual(restored['version'], 3)
         self.assertEqual(restored['body'], restored['original_body'])
         self.assertEqual(self.generator.call_count, 1)
+
+    def test_empty_selection_explains_disabled_button_and_quick_selection_enables(self):
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_clear_articles').click().run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, [])
+        self.assertTrue(app.button(key='research_generate').disabled)
+        self.assertTrue(any('預覽至少有1個來源' in item.value for item in app.info))
+        self.assertTrue(any('找到1篇可用候選' in item.value for item in app.caption))
+        self.generator.assert_not_called()
+
+        app.button(key='research_select_articles').click().run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        self.assertFalse(app.button(key='research_generate').disabled)
+        self.assertEqual(len(app.exception), 0)
+
+    def test_missing_api_key_explains_disabled_generation(self):
+        app = self.app()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        self.assertTrue(app.button(key='research_generate').disabled)
+        self.assertTrue(any('API key並按Enter' in item.value for item in app.info))
+        self.generator.assert_not_called()
+
+    def test_generation_failure_preserves_selection_and_saves_no_report(self):
+        self.generator.side_effect = ResearchError('invalid_citations')
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any('來源編號' in item.value for item in app.error))
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        self.assertFalse(app.button(key='research_generate').disabled)
+        with ResearchStore(self.db) as store:
+            self.assertEqual(store.list_reports(), [])
+
+    def test_generation_timeout_discards_late_draft_without_saving(self):
+        release = Event()
+        finished = Event()
+        self.addCleanup(release.set)
+
+        def delayed_draft(*args, on_progress=None, **kwargs):
+            on_progress('requesting', 0)
+            release.wait(5)
+            finished.set()
+            return {'title': '遲來的草稿', 'body': '遲來的內容', 'metadata': {}}
+
+        self.generator.side_effect = delayed_draft
+        self.patch('src.research_ui.run_generation', side_effect=lambda generate, update: run_generation(
+            generate, update, timeout=0.04, tick_seconds=0.01))
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any('生成逾時' in item.value for item in app.error))
+        with ResearchStore(self.db) as store:
+            self.assertEqual(store.list_reports(), [])
+        release.set()
+        self.assertTrue(finished.wait(1))
+        app.run()
+        with ResearchStore(self.db) as store:
+            self.assertEqual(store.list_reports(), [])
+
+    def test_storage_failure_reports_error_without_saved_success(self):
+        self.patch('src.research_store.ResearchStore.create_report',
+                   side_effect=ResearchStoreError('無法保存報告。請檢查資料庫。'))
+        progress = self.patch('src.research_ui._generation_progress', wraps=ui._generation_progress)
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any('無法保存報告' in item.value for item in app.error))
+        stages = [call.args[1] for call in progress.call_args_list]
+        self.assertIn('saving', stages)
+        self.assertNotIn('saved', stages)
+        with ResearchStore(self.db) as store:
+            self.assertEqual(store.list_reports(), [])
 
     def test_switching_reports_keeps_unsaved_editor_buffer(self):
         first = self.create('報告A', 'A正文')

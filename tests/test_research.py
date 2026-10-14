@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
+from openai import APITimeoutError
+from requests.exceptions import ReadTimeout
+
 from src.analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
 from src.llm_providers import PROVIDERS
 from src.research import (
@@ -231,6 +234,105 @@ class ResearchReportTests(unittest.TestCase):
         self.assertEqual(request["extra_body"], {"thinking": {"type": "disabled"}})
         self.assertNotIn(KEY, json.dumps(request))
 
+    def test_progress_tracks_stream_lifecycle_without_response_text_or_credentials(self):
+        client, stream = fake_client()
+        events = []
+        result = self.generate(client, on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(events[:2], [("preparing", 0), ("requesting", 0)])
+        receiving = [(stage, size) for stage, size in events if stage == "receiving"]
+        self.assertGreater(len(receiving), 1)
+        counts = [size for _, size in receiving]
+        self.assertEqual(counts, sorted(set(counts)))
+        self.assertEqual(counts[-1], len(stream.raw))
+        self.assertEqual(events[-2:], [("validating", len(stream.raw)), ("ready", len(stream.raw))])
+        self.assertTrue(all(isinstance(stage, str) and isinstance(size, int) for stage, size in events))
+        serialized = json.dumps(events)
+        for sensitive in (KEY, OTHER_KEY, stream.raw, self.sources[0]["content"]):
+            self.assertNotIn(sensitive, serialized)
+        self.assertEqual(os.environ["OPENAI_API_KEY"], OTHER_KEY)
+        self.assertEqual(os.environ["OPENAI_BASE_URL"], "https://untrusted.example")
+        self.assertEqual(result["title"], payload()["title"])
+        self.assertTrue(stream.closed)
+
+    def test_invalid_response_progress_never_signals_ready_or_exposes_model_text(self):
+        client, stream = fake_client(raw=KEY + " malformed-provider-response")
+        events = []
+        with self.assertRaises(ModelResponseError):
+            self.generate(client, on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(events[-1], ("validating", len(stream.raw)))
+        self.assertNotIn("ready", [stage for stage, _ in events])
+        self.assertNotIn(KEY, json.dumps(events))
+        self.assertTrue(stream.closed)
+
+    def test_request_timeouts_have_specific_safe_error_and_close_owned_client(self):
+        errors = (TimeoutError(KEY), ReadTimeout(KEY), APITimeoutError(request=SimpleNamespace()))
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                client, _ = fake_client()
+                client.chat.completions.create.side_effect = error
+                events = []
+                with patch("src.research.OpenAI", return_value=client):
+                    with self.assertRaises(ResearchError) as caught:
+                        self.generate(None, on_progress=lambda stage, size: events.append((stage, size)))
+                self.assertEqual(caught.exception.reason, "generation_timeout")
+                self.assertIn("180 秒", str(caught.exception))
+                self.assertNotIn(KEY, str(caught.exception))
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertEqual(events, [("preparing", 0), ("requesting", 0)])
+                client.close.assert_called_once()
+
+    def test_claude_sanitized_transport_timeout_is_recognized_through_wrapper(self):
+        events = []
+        with patch("src.llm_providers.requests.post", side_effect=ReadTimeout(KEY)):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(None, provider="anthropic", on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertEqual(events, [("preparing", 0), ("requesting", 0)])
+
+    def test_stream_timeout_closes_stream_without_validation_or_ready_progress(self):
+        class TimedOutStream:
+            closed = False
+
+            def __iter__(self):
+                yield SimpleNamespace(choices=[SimpleNamespace(finish_reason=None, delta=SimpleNamespace(content="partial"))])
+                raise ReadTimeout(KEY)
+
+            def close(self):
+                self.closed = True
+
+        client = MagicMock()
+        stream = TimedOutStream()
+        client.chat.completions.create.return_value = stream
+        events = []
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client, on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertEqual(events[-1], ("receiving", len("partial")))
+        self.assertNotIn("validating", [stage for stage, _ in events])
+        self.assertNotIn("ready", [stage for stage, _ in events])
+        self.assertTrue(stream.closed)
+
+    def test_stream_deadline_has_specific_timeout_error_and_preserves_cleanup(self):
+        client, stream = fake_client()
+        events = []
+        with patch("src.research.time.monotonic", side_effect=[0.0, 181.0]):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(client, on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertEqual(events, [("preparing", 0), ("requesting", 0)])
+        self.assertTrue(stream.closed)
+
+    def test_claude_progress_reports_stage_and_count_after_native_response(self):
+        raw = json.dumps(payload())
+        response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=raw))])
+        events = []
+        with patch("src.research.claude_completion", return_value=response):
+            self.generate(None, provider="anthropic", on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(events, [("preparing", 0), ("requesting", 0), ("receiving", len(raw)),
+                                  ("validating", len(raw)), ("ready", len(raw))])
+
     def test_only_explicit_evidence_switches_report_mode(self):
         self.sources = prepare_evidence(self.sources, [{"title": "Manual", "content": "A manual excerpt.", "source_type": "manual"}])
         client, _ = fake_client(payload(executive_findings="Manual evidence was supplied. [S2]"))
@@ -259,6 +361,65 @@ class ResearchReportTests(unittest.TestCase):
                 self.assertEqual(set(result["metadata"]), {"provider", "model", "report_scope"})
         self.assertEqual(os.environ["OPENAI_API_KEY"], OTHER_KEY)
         self.assertEqual(os.environ["OPENAI_BASE_URL"], "https://untrusted.example")
+
+    def test_cancel_hooks_register_owned_client_before_request_and_stream_before_read(self):
+        callbacks = []
+        client = MagicMock()
+        test = self
+
+        class CheckedStream(FakeStream):
+            def __iter__(self):
+                test.assertEqual(callbacks, [client.close, self.close])
+                yield from super().__iter__()
+
+        stream = CheckedStream(json.dumps(payload()))
+
+        def create(**kwargs):
+            self.assertEqual(callbacks, [client.close])
+            return stream
+
+        client.chat.completions.create.side_effect = create
+        with patch("src.research.OpenAI", return_value=client):
+            result = self.generate(None, register_cancel=callbacks.append)
+        self.assertEqual(callbacks, [client.close, stream.close])
+        self.assertEqual(result["title"], payload()["title"])
+        self.assertTrue(stream.closed)
+        client.close.assert_called_once()
+
+    def test_cancel_hook_registers_injected_stream_without_taking_client_ownership(self):
+        client, stream = fake_client()
+        callbacks = []
+        self.generate(client, register_cancel=callbacks.append)
+        self.assertEqual(callbacks, [stream.close])
+        self.assertTrue(stream.closed)
+        client.close.assert_not_called()
+
+    def test_cancel_during_client_construction_closes_resource_before_any_request(self):
+        client, _ = fake_client()
+
+        def already_cancelled(close):
+            close()
+            raise ResearchError("generation_timeout")
+
+        with patch("src.research.OpenAI", return_value=client):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(None, register_cancel=already_cancelled)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        client.chat.completions.create.assert_not_called()
+        self.assertGreaterEqual(client.close.call_count, 1)
+
+    def test_stream_cancel_registration_failure_still_closes_stream(self):
+        client, stream = fake_client()
+
+        def already_cancelled(close):
+            close()
+            raise ResearchError("generation_timeout")
+
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client, register_cancel=already_cancelled)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertTrue(stream.closed)
+        client.close.assert_not_called()
 
     def test_claude_reuses_native_adapter_with_safe_prompt(self):
         response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps(payload())))])

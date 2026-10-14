@@ -10,13 +10,15 @@ import json
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
 from .llm_providers import claude_completion, get_provider, validate_provider_model
@@ -44,6 +46,7 @@ _SAFE_ERRORS = {
     "invalid_citations": "模型報告包含未知或缺少的來源編號，請重新生成。",
     "untraceable_numbers": "模型數字敘述未能追溯至同段引用的來源快照，請重新生成。",
     "invented_url": "模型報告包含來源快照以外的連結，請重新生成。",
+    "generation_timeout": "報告生成逾時：AI 服務未及時回應，或已超過 180 秒整體時限。請稍後重試，或減少所選新聞。",
 }
 
 
@@ -424,16 +427,45 @@ JSON 欄位：title、executive_findings、chart_data_interpretation、differenc
 """
 
 
-def _stream_content(stream) -> str:
+def _progress(on_progress: Callable[[str, int], None] | None, stage: str, received_chars: int = 0):
+    """Report only lifecycle stages and counts; never forward model text."""
+    if on_progress is not None:
+        on_progress(stage, received_chars)
+
+
+def _transport_timed_out(error: Exception) -> bool:
+    """Recognize transport timeouts through provider wrappers without reading bodies."""
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        if isinstance(current, (APITimeoutError, RequestsTimeout, TimeoutError)):
+            return True
+        # The installed SDK can use either httpx or httpx2. Avoid importing a
+        # second HTTP stack solely to classify its stream iteration errors.
+        if any(cls.__name__ == "TimeoutException" and cls.__module__.split(".")[0] in {"httpx", "httpx2"}
+               for cls in type(current).__mro__):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = None,
+                    register_cancel: Callable[[Callable[[], None]], None] | None = None) -> str:
     pieces = []
     size = 0
     chunks = 0
     finished = False
     deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
     try:
+        close = getattr(stream, "close", None)
+        if register_cancel is not None and callable(close):
+            register_cancel(close)
         for chunk in stream:
             chunks += 1
-            if chunks > MAX_STREAM_CHUNKS or time.monotonic() > deadline:
+            if time.monotonic() > deadline:
+                raise ResearchError("generation_timeout")
+            if chunks > MAX_STREAM_CHUNKS:
                 raise ProviderAPIError()
             choices = getattr(chunk, "choices", None)
             if choices == []:  # Usage-only final chunks have no choices.
@@ -456,6 +488,8 @@ def _stream_content(stream) -> str:
                 size += len(content)
                 if size > MAX_RESPONSE_CHARS:
                     raise ModelResponseError("truncated")
+                if content:
+                    _progress(on_progress, "receiving", size)
         if not finished:
             raise ModelResponseError("truncated" if pieces else "empty_content")
         return "".join(pieces)
@@ -565,13 +599,19 @@ def _number_values(text: str) -> set[Decimal]:
 
 
 def generate_research_report(topic, sources, *, api_key: str, provider: str = "deepseek",
-                             model: str | None = None, as_of: str, instructions: str = "", client=None) -> dict:
+                             model: str | None = None, as_of: str, instructions: str = "", client=None,
+                             on_progress: Callable[[str, int], None] | None = None,
+                             register_cancel: Callable[[Callable[[], None]], None] | None = None) -> dict:
     """Generate one bounded AI draft; external evidence gathering is explicit.
 
     Compatible providers stream their responses. Claude uses the existing native
     adapter with its bounded 4096-token response. Credentials never enter the
     prompt, process environment, report, metadata, or safe diagnostic.
+    Optional progress callbacks receive a stage and character count, never text.
+    The caller may register cleanup hooks to close an in-flight transport when
+    cancelling; injected clients remain caller-owned, but their streams close.
     """
+    _progress(on_progress, "preparing")
     checked = _validated_sources(sources)
     topic = _text(topic)
     if not topic or len(topic) > 500:
@@ -594,12 +634,16 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
         raise ResearchError("source_budget")
     owned_client = False
     try:
+        _progress(on_progress, "requesting")
         if provider == "anthropic":
             raw = _nonstream_content(claude_completion(model=selected_model, api_key=key, system=_SYSTEM, user=user))
+            _progress(on_progress, "receiving", len(raw))
         else:
             if client is None:
                 client = OpenAI(api_key=key, base_url=selected.base_url, timeout=60.0, max_retries=0)
                 owned_client = True
+                if register_cancel is not None:
+                    register_cancel(client.close)
             elif isinstance(client, OpenAI):
                 # Injected SDK clients must preserve the same endpoint/key owner.
                 if (str(client.base_url).rstrip("/") != selected.base_url.rstrip("/")
@@ -614,10 +658,15 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
                 request.update(temperature=0.2, max_tokens=MAX_REPORT_TOKENS)
             if provider == "deepseek":
                 request["extra_body"] = {"thinking": {"type": "disabled"}}
-            raw = _stream_content(client.chat.completions.create(**request))
-    except (ModelResponseError, ProviderConfigurationError, ProviderAPIError):
+            raw = _stream_content(client.chat.completions.create(**request), on_progress=on_progress,
+                                  register_cancel=register_cancel)
+    except (ResearchError, ModelResponseError, ProviderConfigurationError):
         raise
     except Exception as error:
+        if _transport_timed_out(error):
+            raise ResearchError("generation_timeout") from None
+        if isinstance(error, ProviderAPIError):
+            raise
         status = getattr(error, "status_code", None)
         status = status if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599 else None
         raise ProviderAPIError(status) from None
@@ -627,6 +676,7 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
                 client.close()
             except Exception:
                 pass
+    _progress(on_progress, "validating", len(raw))
     draft, review_warnings = _parse_draft(raw, checked)
     title = " ".join(draft.title.split())
     scope_label = "RSS／Investat 與使用者明確提供的補充證據" if report_scope == "with_explicit_evidence" else "所選 RSS／Investat 新聞"
@@ -640,4 +690,5 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
     metadata = {"provider": provider, "model": selected_model, "report_scope": report_scope}
     if review_warnings:
         metadata["review_warnings"] = review_warnings
+    _progress(on_progress, "ready", len(raw))
     return {"title": title, "body": "\n".join(lines), "metadata": metadata}

@@ -14,6 +14,7 @@ from .investat_pipeline import collect_investat
 from .news_store import NewsStore
 from .research import ResearchError, filter_articles, generate_research_report, prepare_evidence, prepare_sources
 from .research_evidence import CATALOG, collect_evidence
+from .research_progress import run_generation
 from .research_export import ResearchExportError, export_html, export_markdown, export_pdf
 from .research_store import ResearchConflictError, ResearchStore, ResearchStoreError
 from .rss_pipeline import collect_sources
@@ -31,6 +32,24 @@ def _origins(article):
 
 def _flash(message):
     st.session_state["research_flash"] = message
+
+
+def _select_articles(identifiers):
+    st.session_state["research_article_ids"] = identifiers
+
+
+def _generation_progress(bar, stage, received_chars=0, elapsed=0):
+    steps = {
+        "preparing": (0.05, "1/5 整理所選資料"),
+        "requesting": (0.20, "2/5 等待AI回應"),
+        "receiving": (0.40, f"2/5 正在接收AI草稿（已收到{received_chars:,}個字元）"),
+        "validating": (0.75, "3/5 檢查報告格式與來源引用"),
+        "ready": (0.85, "3/5 草稿檢查完成"),
+        "saving": (0.95, "4/5 保存報告"),
+        "saved": (1.0, "5/5 報告已保存"),
+    }
+    value, label = steps.get(stage, steps["requesting"])
+    bar.progress(value, text=f"{label} · 已用{int(elapsed)}秒")
 
 
 def _remember_editor(report_id, title_key, body_key, base_key):
@@ -101,6 +120,11 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         valid = [key for key in previous if key in by_id]
         if valid != previous:
             st.session_state["research_article_ids"] = valid
+    pick, clear = st.columns(2)
+    pick.button("選取前8篇候選", key="research_select_articles", disabled=not by_id,
+                on_click=_select_articles, args=(list(by_id)[:8],))
+    clear.button("清除選材", key="research_clear_articles", disabled=not st.session_state.get("research_article_ids"),
+                 on_click=_select_articles, args=([],))
     chosen_ids = st.multiselect("確認報告選材（最多30篇）", list(by_id),
                                default=None if "research_article_ids" in st.session_state else list(by_id)[:8],
                                format_func=lambda key: f"{by_id[key].get('published_at') or '日期未知'}｜{by_id[key]['title']}",
@@ -155,23 +179,41 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
+    if not sources:
+        st.info("請先在「確認報告選材」選擇新聞，可點「選取前8篇候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
+    if not analysis_available:
+        st.info("請在左側輸入所選AI服務商的API key並按Enter，並確認模型設定有效，才能生成報告。")
+    if not topic.strip():
+        st.info("請先填寫研究主題，才能生成報告。")
     if st.button("生成並保存報告草稿", type="primary", key="research_generate",
                  disabled=not analysis_available or not sources or not topic.strip()):
+        bar = st.progress(0.0, text="1/5 準備生成報告")
+        st.caption("進度按處理步驟顯示；AI回應速度會變動，最長等待180秒。")
         try:
-            with st.spinner("AI整理所選證據並生成報告…"):
-                draft = generate_research_report(topic, sources, api_key=api_key, provider=provider,
-                                                 model=model, as_of=today.isoformat(), instructions=instructions)
-                metadata = {**draft["metadata"], "source_count": len(sources),
-                            "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
-                                          "source_ids": selected_sources},
-                            "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
-                with ResearchStore() as store:
-                    saved = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
-                                                provider=provider, model=model, as_of=today.isoformat(), metadata=metadata)
+            elapsed = 0
+
+            def update(stage, received_chars, seconds):
+                nonlocal elapsed
+                elapsed = seconds
+                _generation_progress(bar, stage, received_chars, elapsed)
+
+            draft = run_generation(
+                lambda **kwargs: generate_research_report(topic, sources, api_key=api_key, provider=provider,
+                    model=model, as_of=today.isoformat(), instructions=instructions, **kwargs), update)
+            metadata = {**draft["metadata"], "source_count": len(sources),
+                        "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
+                                      "source_ids": selected_sources},
+                        "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
+            _generation_progress(bar, "saving", elapsed=elapsed)
+            with ResearchStore() as store:
+                saved = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
+                                            provider=provider, model=model, as_of=today.isoformat(), metadata=metadata)
+            _generation_progress(bar, "saved", elapsed=elapsed)
             st.session_state["research_active_report"] = saved["id"]
             _flash("草稿已保存；請在「報告庫與編輯」修改和匯出。再次生成會建立另一份報告。")
             st.rerun()
         except Exception as error:
+            bar.empty()
             st.error(_safe_message(error))
 
 
