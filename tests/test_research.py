@@ -1,0 +1,516 @@
+"""Research snapshots and report generation use synthetic evidence only."""
+
+import copy
+import json
+import os
+from types import SimpleNamespace
+import unittest
+from unittest.mock import MagicMock, patch
+
+from src.analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
+from src.llm_providers import PROVIDERS
+from src.research import (
+    MAX_REPORT_TOKENS, MAX_RESPONSE_CHARS, MAX_SOURCE_CHARS, MAX_TOTAL_SOURCE_CHARS,
+    ResearchError, filter_articles, format_sources_appendix, generate_research_report,
+    prepare_evidence, prepare_sources,
+)
+
+
+KEY = "synthetic-research-session-key"
+OTHER_KEY = "synthetic-other-provider-key"
+
+
+def article(**overrides):
+    data = {"id": "news-1", "source_id": "test-rss", "source_name": "Synthetic publisher",
+            "title": "Synthetic financing report", "url": "https://example.org/story",
+            "published_at": "2026-10-13T17:00:00Z", "last_seen": "2026-10-14T02:00:00Z",
+            "content_scope": "summary", "content": "", "summary": "Reported gross financing of 20 billion in September.",
+            "sources": []}
+    data.update(overrides)
+    return data
+
+
+def payload(**overrides):
+    data = {"title": "A synthetic research draft",
+            "executive_findings": "Reported gross financing of 20 billion in September. [S1]",
+            "chart_data_interpretation": "The excerpt describes financing; it does not supply a chart. [S1]",
+            "differences_and_alternatives": "A gross financing figure need not measure net flows. [S1]",
+            "conditional_mechanisms": "If the financing supports spending, demand could respond; the excerpt cannot establish that. [S1]",
+            "watchlist": "Check the original table and the observation period. [S1]",
+            "limitations": "The supplied excerpt is insufficient to infer investor ownership. [S1]"}
+    data.update(overrides)
+    return data
+
+
+class FakeStream:
+    def __init__(self, raw, *, reason="stop", chunk_size=41, end=True):
+        self.raw = raw
+        self.reason = reason
+        self.chunk_size = chunk_size
+        self.end = end
+        self.closed = False
+
+    def __iter__(self):
+        for offset in range(0, len(self.raw), self.chunk_size):
+            yield SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason=None, delta=SimpleNamespace(content=self.raw[offset:offset + self.chunk_size]))])
+        if self.end:
+            yield SimpleNamespace(choices=[SimpleNamespace(finish_reason=self.reason, delta=SimpleNamespace(content=None))])
+            yield SimpleNamespace(choices=[])
+
+    def close(self):
+        self.closed = True
+
+
+def fake_client(data=None, *, raw=None, **stream_options):
+    stream = FakeStream(json.dumps(payload() if data is None else data) if raw is None else raw, **stream_options)
+    client = MagicMock()
+    client.chat.completions.create.return_value = stream
+    return client, stream
+
+
+class SourceSnapshotTests(unittest.TestCase):
+    def test_snapshot_keeps_scope_dates_article_id_and_all_deduplicated_origins(self):
+        original = article(sources=[{
+            "source_id": "investat", "source_name": "Synthetic institutional research",
+            "title": "Same syndicated story", "url": None, "published_at": "2026-10-13T17:00:00Z",
+            "last_seen": "2026-10-14T03:00:00Z", "content_scope": "fragment",
+            "raw_metadata": {"token": OTHER_KEY},
+        }])
+        source = prepare_sources([original])[0]
+        self.assertEqual(source["id"], "S1")
+        self.assertEqual(source["article_id"], "news-1")
+        self.assertEqual(source["content_scope"], "summary")
+        self.assertEqual(source["published_at"], "2026-10-13T17:00:00Z")
+        self.assertEqual(source["publication_date"], "2026-10-14")
+        self.assertEqual(source["retrieved_date"], "2026-10-14")
+        self.assertEqual({item["source_type"] for item in source["origins"]}, {"rss", "investat"})
+        self.assertEqual(source["verification_status"], "not_independently_verified")
+        self.assertNotIn(OTHER_KEY, json.dumps(source))
+        self.assertNotIn("S1", original)
+
+    def test_metadata_only_articles_and_duplicate_selected_ids_are_skipped(self):
+        articles = [article(content_scope="title_only"), article(content_scope="filing_notice"),
+                    article(summary=""), article(summary="Synthetic financing report"),
+                    article(), article(), article(id="news-2")]
+        sources = prepare_sources(articles)
+        self.assertEqual([source["id"] for source in sources], ["S1", "S2"])
+        self.assertEqual([source["article_id"] for source in sources], ["news-1", "news-2"])
+
+    def test_per_article_and_overall_source_budgets_are_explicit(self):
+        sources = prepare_sources([article(id=f"news-{index}", content="x" * 14000) for index in range(40)])
+        self.assertEqual(len(sources), 30)
+        self.assertLessEqual(sum(len(item["content"]) for item in sources), MAX_TOTAL_SOURCE_CHARS)
+        self.assertTrue(all(len(item["content"]) <= MAX_SOURCE_CHARS for item in sources))
+        self.assertTrue(all(item["content_truncated"] for item in sources))
+        self.assertTrue(all(item["supplied_character_count"] == 14000 for item in sources))
+        limited = prepare_sources([article(), article(id="news-2")], max_articles=1, max_chars_per_article=10)
+        self.assertEqual(len(limited), 1)
+        self.assertEqual(len(limited[0]["content"]), 10)
+        self.assertEqual(limited[0]["content_scope"], "summary")
+
+    def test_zero_and_invalid_limits(self):
+        self.assertEqual(prepare_sources([article()], max_articles=0), [])
+        self.assertEqual(prepare_sources([article()], max_chars_per_article=0), [])
+        for limit in (-1, True, "10"):
+            with self.subTest(limit=limit), self.assertRaises(ResearchError):
+                prepare_sources([article()], max_articles=limit)
+
+    def test_credentials_and_nonpublic_investat_identity_never_become_urls(self):
+        for url in ("investat:abc", "javascript:alert(1)", "https://user:secret@example.org", "https://example.org/<bad>"):
+            with self.subTest(url=url):
+                source = prepare_sources([article(source_id="investat", url=url)])[0]
+                self.assertIsNone(source["url"])
+                appendix = format_sources_appendix([source])
+                self.assertNotIn(url, appendix)
+                self.assertIn("未提供有效公開連結", appendix)
+
+    def test_credential_query_fields_and_fragments_are_removed_from_all_origins(self):
+        url = ("https://example.org/story?q=financing&page=2&API_KEY=" + KEY +
+               "&access_token=" + OTHER_KEY + "&X-Amz-Signature=synthetic-signature#token=synthetic-fragment")
+        source = prepare_sources([article(url=url, sources=[{
+            "source_id": "other-rss", "source_name": "Another publisher", "url": url,
+            "title": "Same story", "content_scope": "summary",
+        }])])[0]
+        self.assertEqual(source["url"], "https://example.org/story?q=financing&page=2")
+        appendix = format_sources_appendix([source])
+        for secret in (KEY, OTHER_KEY, "synthetic-signature", "synthetic-fragment"):
+            self.assertNotIn(secret, json.dumps(source))
+            self.assertNotIn(secret, appendix)
+
+    def test_appendix_uses_real_snapshot_fields_and_escapes_metadata_markup(self):
+        source = prepare_sources([article(title="A [S999] title", source_name="Publisher **markup**")])[0]
+        appendix = format_sources_appendix([source])
+        self.assertIn("[S1]", appendix)
+        self.assertIn("https://example.org/story", appendix)
+        self.assertIn("A \\[S999\\] title", appendix)
+        self.assertIn("summary", appendix)
+        self.assertNotIn("raw_metadata", appendix)
+
+    def test_explicit_evidence_retains_separate_publication_and_observation_dates(self):
+        original = prepare_sources([article()])
+        before = copy.deepcopy(original)
+        combined = prepare_evidence(original, [{
+            "title": "Synthetic official table", "publisher": "Synthetic central bank",
+            "url": "https://example.org/official/table", "publication_date": "2026-10-13",
+            "observation_date": "2026-09-30", "content": "September net financing was 8 billion.",
+            "source_type": "official", "api_key": OTHER_KEY,
+        }, {"title": "Manual excerpt", "content": "A user supplied observation.", "source_type": "manual"}])
+        self.assertEqual([item["id"] for item in combined], ["S1", "S2", "S3"])
+        self.assertEqual(combined[1]["publication_date"], "2026-10-13")
+        self.assertEqual(combined[1]["observation_date"], "2026-09-30")
+        self.assertEqual(combined[1]["content_scope"], "official_evidence")
+        self.assertEqual(combined[2]["content_scope"], "manual_evidence")
+        self.assertEqual(original, before)
+        self.assertNotIn(OTHER_KEY, json.dumps(combined))
+
+    def test_evidence_can_be_used_without_news_and_bad_evidence_is_rejected(self):
+        self.assertEqual(prepare_evidence([], [{"title": "Manual", "content": "Evidence.", "source_type": "manual"}])[0]["id"], "S1")
+        for item in ({"title": "Missing content", "source_type": "manual"},
+                     {"title": "Unsupported", "content": "Text", "source_type": "automatic_check"},
+                     {"title": "Bad date", "content": "Text", "source_type": "official", "publication_date": "secret-invalid-date"}):
+            with self.subTest(item=item), self.assertRaises(ResearchError) as caught:
+                prepare_evidence([], [item])
+            self.assertNotIn("secret-invalid-date", str(caught.exception))
+
+
+class ArticleFilterTests(unittest.TestCase):
+    def test_hong_kong_day_is_inclusive_and_unknown_dates_are_excluded(self):
+        articles = [article(id="early", published_at="2026-10-13T15:59:59Z"),
+                    article(id="start", published_at="2026-10-13T16:00:00Z"),
+                    article(id="end", published_at="2026-10-14T15:59:59Z"),
+                    article(id="late", published_at="2026-10-14T16:00:00Z"),
+                    article(id="unknown", published_at=None)]
+        selected = filter_articles(articles, start_date="2026-10-14", end_date="2026-10-14")
+        self.assertEqual([item["id"] for item in selected], ["start", "end"])
+
+    def test_comma_keywords_match_financial_traditional_simplified_variants(self):
+        articles = [article(id="chinese", title="美聯儲資金流動與機構持倉"),
+                    article(id="english", title="Gross FINANCING rose"),
+                    article(id="none", title="Other news", summary="Unrelated excerpt")]
+        selected = filter_articles(articles, keywords="美联储资金， financing")
+        self.assertEqual([item["id"] for item in selected], ["chinese", "english"])
+
+    def test_invalid_or_reversed_dates_have_safe_error(self):
+        for start, end in (("sensitive-invalid-date", None), ("2026-10-15", "2026-10-14"),
+                           ("9999-12-31T23:59:59Z", None), ("0001-01-01T00:00:00+23:59", None)):
+            with self.subTest(start=start), self.assertRaises(ResearchError) as caught:
+                filter_articles([article()], start_date=start, end_date=end)
+            self.assertNotIn("sensitive", str(caught.exception))
+
+
+class ResearchReportTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"OPENAI_API_KEY": OTHER_KEY, "OPENAI_BASE_URL": "https://untrusted.example"}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sources = prepare_sources([article()])
+
+    def generate(self, client, **overrides):
+        arguments = {"api_key": KEY, "as_of": "2026-10-14", "client": client}
+        arguments.update(overrides)
+        return generate_research_report("Synthetic research topic", self.sources, **arguments)
+
+    def test_valid_stream_renders_required_sections_and_snapshot_appendix(self):
+        client, stream = fake_client()
+        result = self.generate(client)
+        self.assertTrue(stream.closed)
+        self.assertEqual(result["title"], "A synthetic research draft")
+        for heading in ("核心結論", "圖表與數據解讀", "差異與替代解釋", "條件式傳導機制", "後續觀察清單", "限制與資料缺口", "來源附錄"):
+            self.assertIn(heading, result["body"])
+        self.assertIn("AI 研究草稿", result["body"])
+        self.assertIn("尚未獨立核實", result["body"])
+        self.assertIn("summary", result["body"])
+        self.assertIn("https://example.org/story", result["body"])
+        self.assertEqual(result["metadata"], {"provider": "deepseek", "model": "deepseek-v4-pro", "report_scope": "rss_investat_only"})
+        self.assertNotIn(KEY, json.dumps(result))
+        self.assertNotIn(OTHER_KEY, json.dumps(result))
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["max_tokens"], MAX_REPORT_TOKENS)
+        self.assertEqual(request["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertNotIn(KEY, json.dumps(request))
+
+    def test_only_explicit_evidence_switches_report_mode(self):
+        self.sources = prepare_evidence(self.sources, [{"title": "Manual", "content": "A manual excerpt.", "source_type": "manual"}])
+        client, _ = fake_client(payload(executive_findings="Manual evidence was supplied. [S2]"))
+        result = self.generate(client)
+        self.assertEqual(result["metadata"]["report_scope"], "with_explicit_evidence")
+        self.assertIn("manual\\_evidence", result["body"])
+
+    def test_factory_pins_provider_endpoint_key_and_parameter_isolation(self):
+        for provider in ("deepseek", "openai", "xai", "gemini"):
+            with self.subTest(provider=provider):
+                client, _ = fake_client()
+                with patch("src.research.OpenAI", return_value=client) as factory:
+                    result = generate_research_report("Synthetic topic", self.sources,
+                                                      api_key="  " + KEY + "  ", provider=provider, as_of="2026-10-14")
+                factory.assert_called_once_with(api_key=KEY, base_url=PROVIDERS[provider].base_url, timeout=60.0, max_retries=0)
+                request = client.chat.completions.create.call_args.kwargs
+                self.assertEqual(request["model"], PROVIDERS[provider].models[0])
+                self.assertTrue(request["stream"])
+                if provider == "openai":
+                    self.assertEqual(request["max_completion_tokens"], MAX_REPORT_TOKENS)
+                    self.assertNotIn("temperature", request)
+                    self.assertNotIn("max_tokens", request)
+                if provider != "deepseek":
+                    self.assertNotIn("extra_body", request)
+                client.close.assert_called_once()
+                self.assertEqual(set(result["metadata"]), {"provider", "model", "report_scope"})
+        self.assertEqual(os.environ["OPENAI_API_KEY"], OTHER_KEY)
+        self.assertEqual(os.environ["OPENAI_BASE_URL"], "https://untrusted.example")
+
+    def test_claude_reuses_native_adapter_with_safe_prompt(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps(payload())))])
+        with patch("src.research.claude_completion", return_value=response) as adapter, patch("src.research.OpenAI") as factory:
+            result = self.generate(None, provider="anthropic")
+        factory.assert_not_called()
+        arguments = adapter.call_args.kwargs
+        self.assertEqual(arguments["api_key"], KEY)
+        self.assertEqual(arguments["model"], PROVIDERS["anthropic"].models[0])
+        self.assertNotIn(KEY, arguments["user"])
+        self.assertEqual(result["metadata"]["provider"], "anthropic")
+
+    def test_missing_key_model_and_empty_sources_fail_before_request(self):
+        client, _ = fake_client()
+        for key in (None, "", " ", "a\nb"):
+            with self.subTest(key=key), self.assertRaises(ProviderConfigurationError):
+                self.generate(client, api_key=key)
+        with self.assertRaises(ProviderConfigurationError):
+            self.generate(client, model="claude-synthetic")
+        with self.assertRaises(ResearchError):
+            generate_research_report("Topic", [], api_key=KEY, as_of="2026-10-14", client=client)
+        client.chat.completions.create.assert_not_called()
+
+    def test_duplicate_or_metadata_only_source_ids_are_rejected(self):
+        client, _ = fake_client()
+        for bad in ([self.sources[0], self.sources[0]], [dict(self.sources[0], content_scope="title_only")],
+                    [dict(self.sources[0], id="untrusted-id")]):
+            with self.subTest(bad=bad), self.assertRaises(ResearchError):
+                generate_research_report("Topic", bad, api_key=KEY, as_of="2026-10-14", client=client)
+        client.chat.completions.create.assert_not_called()
+
+    def test_invented_or_grouped_source_refs_are_rejected(self):
+        for citation in ("[S999]", "[S0]", "[S1, S2]", "[s1]", "[S 1]", "[S999", "S999", "S1"):
+            with self.subTest(citation=citation):
+                client, _ = fake_client(payload(executive_findings="Claim. " + citation))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client)
+                self.assertEqual(caught.exception.reason, "invalid_citations")
+                self.assertNotIn(citation, str(caught.exception))
+
+    def test_report_with_no_citations_is_rejected(self):
+        client, _ = fake_client({key: value.replace(" [S1]", "") for key, value in payload().items()})
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.reason, "invalid_citations")
+
+    def test_number_in_uncited_paragraph_is_rejected(self):
+        client, _ = fake_client(payload(chart_data_interpretation="Uncited financing was 500 billion.\n\nThe cited excerpt is partial. [S1]"))
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.reason, "untraceable_numbers")
+
+    def test_literal_number_mismatches_trigger_review_without_claiming_factcheck(self):
+        for claim in ("Financing was 500 billion. [S1]", "融資五百億元。 [S1]"):
+            with self.subTest(claim=claim):
+                client, _ = fake_client(payload(chart_data_interpretation=claim))
+                result = self.generate(client)
+                self.assertTrue(result["metadata"]["review_warnings"])
+                self.assertIn("數字核對提示", result["body"])
+                self.assertIn("尚未獨立核實", result["body"])
+
+    def test_explicit_unit_conversion_is_draft_with_review_warning(self):
+        self.sources = prepare_sources([article(summary="Balance was 1,453,832 USDm during September.")])
+        client, _ = fake_client(payload(
+            executive_findings="Balance was 1,453,832 USDm in September. [S1]",
+            chart_data_interpretation="Calculated conversion: 1,453,832 USDm / 1,000,000 = 1.453832 trillion USD for the same period. [S1]"))
+        result = self.generate(client)
+        self.assertIn("1.453832", result["body"])
+        self.assertTrue(result["metadata"]["review_warnings"])
+
+    def test_nonnumeric_or_chinese_number_uncited_claims_are_rejected(self):
+        for claim in ("An uncited factual paragraph.", "融資五百億元。"):
+            with self.subTest(claim=claim):
+                client, _ = fake_client(payload(chart_data_interpretation=claim + "\n\nThe excerpt is partial. [S1]"))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client)
+                self.assertEqual(caught.exception.reason, "invalid_citations")
+
+    def test_uncited_plus_and_parenthesis_list_items_are_rejected(self):
+        for claim in ("1) Cited claim. [S1]\n2) An uncited factual claim.",
+                      "+ Cited claim. [S1]\n+ An uncited factual claim.",
+                      "1、Cited claim. [S1]\n2、An uncited factual claim."):
+            with self.subTest(claim=claim):
+                client, _ = fake_client(payload(chart_data_interpretation=claim))
+                with self.assertRaises(ResearchError):
+                    self.generate(client)
+
+    def test_model_cannot_add_a_source_url_outside_snapshot(self):
+        client, _ = fake_client(payload(watchlist="Read [invented source](https://invented.example/table). [S1]"))
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.reason, "invented_url")
+        self.assertNotIn("invented.example", str(caught.exception))
+
+    def test_relative_ftp_and_html_links_cannot_bypass_snapshot_urls(self):
+        for link in ("[table](//invented.example/table)", "[table](ftp://invented.example/table)",
+                     "[table](relative/table)", '<a href="//invented.example/table">table</a>',
+                     "[table][t]. [S1]\n[t]: //invented.example/table", "<ftp://invented.example/table>",
+                     "<a href=//invented.example/table>table</a>"):
+            with self.subTest(link=link):
+                client, _ = fake_client(payload(watchlist="Check " + link + ". [S1]"))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client)
+                self.assertEqual(caught.exception.reason, "invented_url")
+
+    def test_claude_requires_a_successful_terminal_reason(self):
+        for reason in (None, "tool_calls", "content_filter"):
+            response = SimpleNamespace(choices=[SimpleNamespace(finish_reason=reason, message=SimpleNamespace(content=json.dumps(payload())))])
+            with self.subTest(reason=reason), patch("src.research.claude_completion", return_value=response):
+                with self.assertRaises(ModelResponseError) as caught:
+                    self.generate(None, provider="anthropic")
+                self.assertEqual(caught.exception.reason, "invalid_shape")
+
+    def test_prompt_sets_evidence_boundaries_without_claiming_factchecking(self):
+        client, _ = fake_client()
+        self.generate(client)
+        request = client.chat.completions.create.call_args.kwargs
+        system = request["messages"][0]["content"]
+        user = json.loads(request["messages"][1]["content"])
+        for instruction in ("模型記憶", "淨額", "資金流", "持倉", "觀察期間", "新聞篇數", "不能聲稱已完成核查"):
+            self.assertIn(instruction, system)
+        self.assertEqual(user["sources"][0]["content_scope"], "summary")
+        self.assertEqual(user["as_of_hong_kong_date"], "2026-10-14")
+        self.assertEqual(user["sources"][0]["content"], self.sources[0]["content"])
+
+    def test_empty_malformed_shape_schema_and_extra_fields_have_safe_errors(self):
+        cases = [("", "empty_content"), ("  ", "empty_content"),
+                 (KEY + " malformed-provider-response", "invalid_json"),
+                 ("[]", "invalid_shape"), ("null", "invalid_shape"),
+                 ("{}", "invalid_schema"),
+                 (json.dumps(payload(title=7)), "invalid_schema"),
+                 (json.dumps(payload(limitations=" ")), "invalid_schema"),
+                 ("[" * 19000 + "0" + "]" * 19000, "invalid_json"),
+                 (json.dumps(dict(payload(), invented_sources=[{"url": "https://invented.example"}])), "invalid_schema")]
+        for raw, reason in cases:
+            with self.subTest(reason=reason, raw=raw):
+                client, stream = fake_client(raw=raw)
+                with self.assertRaises(ModelResponseError) as caught:
+                    self.generate(client)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertNotIn(KEY, str(caught.exception))
+                self.assertNotIn("malformed-provider-response", str(caught.exception))
+                self.assertTrue(stream.closed)
+
+    def test_length_finish_missing_terminal_and_size_limit_are_truncated(self):
+        for options in ({"reason": "length"}, {"end": False}, {"raw": "x" * (MAX_RESPONSE_CHARS + 1)}):
+            with self.subTest(options={key: len(value) if key == "raw" else value for key, value in options.items()}):
+                client, stream = fake_client(**options)
+                with self.assertRaises(ModelResponseError) as caught:
+                    self.generate(client)
+                self.assertEqual(caught.exception.reason, "truncated")
+                self.assertTrue(stream.closed)
+
+    def test_provider_error_body_headers_and_key_are_not_exposed(self):
+        client, _ = fake_client()
+        raw_error = RuntimeError(KEY + " secret-response-body authorization-header")
+        raw_error.status_code = 401
+        client.chat.completions.create.side_effect = raw_error
+        with self.assertRaises(ProviderAPIError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(str(caught.exception), "Provider request failed")
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_stream_iteration_error_is_sanitized_and_closed(self):
+        class FailedStream:
+            closed = False
+
+            def __iter__(self):
+                raise RuntimeError(KEY + " sensitive-request-headers")
+
+            def close(self):
+                self.closed = True
+
+        client = MagicMock()
+        stream = FailedStream()
+        client.chat.completions.create.return_value = stream
+        with self.assertRaises(ProviderAPIError) as caught:
+            self.generate(client)
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertTrue(stream.closed)
+
+    def test_installed_sdk_stream_roundtrip_uses_only_mock_http_transport(self):
+        from openai import OpenAI
+        import inspect
+        transport_module = "httpx2" if "httpx2" in str(inspect.signature(OpenAI)) else "httpx"
+        http = __import__(transport_module)
+        captured = []
+
+        def handle_request(request):
+            self.assertEqual(str(request.url), "https://api.deepseek.com/chat/completions")
+            self.assertEqual(request.headers["authorization"], "Bearer " + KEY)
+            captured.append(json.loads(request.content))
+            events = [
+                {"id": "synthetic-report", "object": "chat.completion.chunk", "created": 1,
+                 "model": "deepseek-v4-pro", "choices": [{"index": 0, "finish_reason": None,
+                 "delta": {"content": json.dumps(payload())}}]},
+                {"id": "synthetic-report", "object": "chat.completion.chunk", "created": 1,
+                 "model": "deepseek-v4-pro", "choices": [{"index": 0, "finish_reason": "stop", "delta": {}}]},
+            ]
+            body = "".join("data: " + json.dumps(event) + "\n\n" for event in events) + "data: [DONE]\n\n"
+            return http.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+        with http.Client(transport=http.MockTransport(handle_request)) as http_client, \
+             OpenAI(api_key=KEY, base_url=PROVIDERS["deepseek"].base_url,
+                    http_client=http_client, max_retries=0) as client:
+            result = self.generate(client)
+        self.assertEqual(result["title"], payload()["title"])
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0]["stream"])
+        self.assertEqual(captured[0]["max_tokens"], MAX_REPORT_TOKENS)
+        self.assertNotIn(KEY, json.dumps(captured))
+
+    def test_injected_sdk_client_cannot_change_provider_endpoint_or_key_owner(self):
+        from openai import OpenAI
+        import inspect
+        transport_module = "httpx2" if "httpx2" in str(inspect.signature(OpenAI)) else "httpx"
+        http = __import__(transport_module)
+        for endpoint, key in (("https://untrusted.example", KEY), (PROVIDERS["deepseek"].base_url, OTHER_KEY)):
+            with self.subTest(endpoint=endpoint), http.Client(transport=http.MockTransport(
+                lambda _: self.fail("Unexpected external request"))) as http_client, \
+                 OpenAI(api_key=key, base_url=endpoint, http_client=http_client) as client:
+                with patch.object(client.chat.completions, "create") as create:
+                    with self.assertRaises(ProviderConfigurationError):
+                        self.generate(client)
+                    create.assert_not_called()
+
+    def test_unknown_nested_metadata_is_not_forwarded_in_sources(self):
+        source = dict(self.sources[0], publisher={"api_key": OTHER_KEY},
+                      supplied_character_count={"secret": OTHER_KEY}, verification_status="verified")
+        source["origins"] = [dict(source["origins"][0], raw_metadata={"api_key": OTHER_KEY})]
+        client, _ = fake_client()
+        generate_research_report("Topic", [source], api_key=KEY, as_of="2026-10-14", client=client)
+        request = client.chat.completions.create.call_args.kwargs
+        user = json.loads(request["messages"][1]["content"])
+        self.assertNotIn(OTHER_KEY, json.dumps(user))
+        self.assertEqual(user["sources"][0]["verification_status"], "not_independently_verified")
+
+    def test_news_and_manual_evidence_url_secrets_never_reach_prompt_or_body(self):
+        sensitive_url = "https://example.org/story?q=safe&token=" + OTHER_KEY + "&key=" + KEY + "#access_token=fragment-secret"
+        self.sources = prepare_evidence(prepare_sources([article(url=sensitive_url)]), [{
+            "title": "Manual table", "content": "A user-supplied table.", "source_type": "manual", "url": sensitive_url,
+        }])
+        client, _ = fake_client()
+        result = self.generate(client)
+        request = client.chat.completions.create.call_args.kwargs
+        for secret in (KEY, OTHER_KEY, "fragment-secret"):
+            self.assertNotIn(secret, json.dumps(self.sources))
+            self.assertNotIn(secret, json.dumps(request))
+            self.assertNotIn(secret, json.dumps(result))
+        self.assertIn("https://example.org/story?q=safe", result["body"])
+
+
+if __name__ == "__main__":
+    unittest.main()
