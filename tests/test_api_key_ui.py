@@ -50,6 +50,8 @@ class ApiKeyUiTests(unittest.TestCase):
         self.start_patch(patch("src.collector.load_events", return_value=[]))
         self.start_patch(patch("src.report.load_report_events", return_value=[]))
         self.start_patch(patch("src.report.generate_daily_report", return_value="Synthetic report"))
+        # The research workflow has its own integration tests and database boundary.
+        self.start_patch(patch("src.research_ui.render_research_tab"))
         self.start_patch(patch("src.feeds.load_sources", return_value=[
             Source("test", "Synthetic feed", "https://example.org/feed", "official", "us"),
         ]))

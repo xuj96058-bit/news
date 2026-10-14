@@ -17,6 +17,7 @@ from src.news_store import NewsStore
 from src.rss_pipeline import collect_sources, collect_sec, analyze_pending
 from src.sec_universe import FeedFetchError, SecConfigError, refresh_universe
 from src.investat_pipeline import collect_investat
+from src.research_ui import render_research_tab
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -114,7 +115,7 @@ def analyze_for_session(text):
 st.title("金融新聞影響分析")
 st.caption("分析師水平：說清楚影響誰、為什麼、幅度、置信度")
 
-tab1, tab2, tab3 = st.tabs(["新聞查詢", "日報", "新聞來源"])
+tab1, tab2, tab3, tab4 = st.tabs(["新聞查詢", "日報", "新聞來源", "研究報告"])
 
 with tab1:
     news_input = st.text_area("貼上新聞內容", height=200, placeholder="輸入中文或英文新聞...")
@@ -208,4 +209,8 @@ with tab3:
             elif item.get("source_id") == "investat":
                 st.caption(f"Investat 文章 ID：{item['external_id']}（接口未提供文章連結）")
                 st.link_button("前往 Investat", "https://investat.ai/")
+
+with tab4:
+    render_research_tab(provider=provider_id, model=selected_model, api_key=effective_api_key,
+                        investat_token=effective_investat_token, analysis_available=analysis_available)
 

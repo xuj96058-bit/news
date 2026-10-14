@@ -5,3 +5,5 @@ requests>=2.32.0
 python-dotenv>=1.0.0
 feedparser>=6.0.11
 tzdata>=2025.1
+reportlab>=4.2.0
+pypdf>=5.0.0
