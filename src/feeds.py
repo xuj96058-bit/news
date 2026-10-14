@@ -153,7 +153,12 @@ def _published(value: object, source: Source) -> str | None:
         try:
             dt = parsedate_to_datetime(value)
         except (TypeError, ValueError, OverflowError):
-            return None
+            # FINRA Notices supplies a publication day such as "Oct 09, 2026".
+            # Use the configured source zone, never the time of collection.
+            try:
+                dt = datetime.strptime(value, "%b %d, %Y")
+            except ValueError:
+                return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_source_zone(source.timezone))
     try:

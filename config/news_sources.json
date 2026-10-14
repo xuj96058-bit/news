@@ -1,5 +1,13 @@
 [
   {"id":"fed_monetary","name":"Federal Reserve — Monetary Policy","url":"https://www.federalreserve.gov/feeds/press_monetary.xml","kind":"official","region":"us"},
+  {"id":"fed_scoos","name":"Federal Reserve — SCOOS DDP 更新公告","url":"https://www.federalreserve.gov/feeds/scoos.xml","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"fed_z1","name":"Federal Reserve — Z.1 金融帳戶發布與修訂","url":"https://www.federalreserve.gov/feeds/z1.xml","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"fed_notes","name":"Federal Reserve — FEDS Notes 研究","url":"https://www.federalreserve.gov/feeds/feds_notes.xml","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"finra_news","name":"FINRA — 新聞與演講","url":"http://feeds.finra.org/FINRANews","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"finra_notices","name":"FINRA — 監管公告","url":"http://feeds.finra.org/FINRANotices","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"sec_press","name":"SEC — 新聞公告","url":"https://www.sec.gov/news/pressreleases.rss","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"cftc_press","name":"CFTC — 新聞稿","url":"https://www.cftc.gov/RSS/RSSGP/rssgp.xml","kind":"official","region":"us","timezone":"America/New_York"},
+  {"id":"state_street_signals","name":"State Street — Street Signals 播客摘要","url":"https://omny.fm/shows/street-signals/playlists/podcast.rss","kind":"company","region":"global"},
   {"id":"bls_cpi","name":"BLS — Consumer Price Index","url":"https://www.bls.gov/feed/cpi.rss","kind":"official","region":"us"},
   {"id":"bls_employment","name":"BLS — Employment Situation","url":"https://www.bls.gov/feed/empsit.rss","kind":"official","region":"us"},
   {"id":"bea","name":"Bureau of Economic Analysis","url":"https://apps.bea.gov/rss/rss.xml","kind":"official","region":"us"},
