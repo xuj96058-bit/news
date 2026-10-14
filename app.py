@@ -11,13 +11,16 @@ from src.analyzer import analyze_news, format_result
 from src.analysis_errors import AnalyzerReloadRequired, analysis_error_message
 from src.llm_providers import PROVIDERS, provider_environment_key, validate_provider_model
 from src.collector import save_event, load_events
-from src.report import generate_daily_report, load_report_events
+from src.report import generate_daily_report, generate_daily_essay, load_report_events
 from src.feeds import load_sources
 from src.news_store import NewsStore
 from src.rss_pipeline import collect_sources, collect_sec, analyze_pending
 from src.sec_universe import FeedFetchError, SecConfigError, refresh_universe
 from src.investat_pipeline import collect_investat
 from src.research_ui import render_research_tab
+from src.research_ui import _generation_progress
+from src.research_progress import run_generation
+from src.research_store import ResearchStore
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -113,7 +116,7 @@ def analyze_for_session(text):
 
 
 st.title("金融新聞影響分析")
-st.caption("分析師水平：說清楚影響誰、為什麼、幅度、置信度")
+st.caption("以新聞為論據，說清楚論點、影響途徑、反證和下一個驗證點")
 
 tab1, tab2, tab3, tab4 = st.tabs(["新聞查詢", "日報", "新聞來源", "研究報告"])
 
@@ -136,11 +139,46 @@ with tab1:
                 st.error(analysis_error_message(exc))
 
 with tab2:
-    st.subheader("高置信度日報")
-    min_conf = st.slider("最低置信度", 0.5, 1.0, 0.7, 0.05)
-    if st.button("生成日報"):
-        report = generate_daily_report(min_conf)
-        st.markdown(report)
+    st.subheader("今日市場論說")
+    st.caption("按香港日期選材，合併重複事件，以新聞為論據形成論點、反證及可驗證的觀察。")
+    if st.button("生成議論文日報", disabled=not analysis_available, key="daily_essay_generate"):
+        bar = st.progress(0.0, text="準備今日市場論說")
+        initial_daily = None
+
+        def save_daily_initial(draft):
+            global initial_daily
+            day = draft["metadata"]["daily_selection"]["hong_kong_date"]
+            with ResearchStore() as store:
+                initial_daily = store.create_report(topic="今日金融市場的重要變化與影響",
+                    title=draft["title"], body=draft["body"], sources=draft.get("sources", []),
+                    provider=provider_id, model=selected_model, as_of=day, metadata=draft["metadata"])
+            st.session_state["daily_essay"] = draft
+            return initial_daily["id"]
+
+        try:
+            draft = run_generation(lambda **kwargs: generate_daily_essay(api_key=effective_api_key,
+                provider=provider_id, model=selected_model, **kwargs),
+                lambda stage,size,elapsed: _generation_progress(bar,stage,size,elapsed),
+                on_artifact=save_daily_initial, timeout=720)
+            if initial_daily is not None:
+                with ResearchStore() as store:
+                    store.save_review(initial_daily["id"], title=draft["title"], body=draft["body"],
+                        expected_version=initial_daily["version"], metadata=draft["metadata"], note="議論文日報審稿")
+            st.session_state["daily_essay"] = draft
+            bar.progress(1.0, text="日報已生成並保存至報告庫")
+        except Exception as exc:
+            bar.empty()
+            st.error(analysis_error_message(exc))
+    daily = st.session_state.get("daily_essay")
+    if daily:
+        st.markdown(daily["body"])
+        st.download_button("下載議論文日報", daily["body"].encode("utf-8"),
+                           file_name="daily-essay.md", mime="text/markdown")
+    with st.expander("查看今日已分析事件摘要"):
+        min_conf = st.slider("最低置信度", 0.5, 1.0, 0.7, 0.05)
+        if st.button("生成日報"):
+            report = generate_daily_report(min_conf)
+            st.markdown(report)
     st.caption(f"目前庫中共 {len(load_report_events())} 則已分析記錄")
 
 with tab3:

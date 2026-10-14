@@ -81,6 +81,9 @@ class ResearchUiHarness:
         if report_mode == 'gap':
             app.radio(key='research_report_mode').set_value('資料缺口簡報').run()
             self.assertEqual(len(app.exception), 0)
+        elif report_mode == 'research':
+            app.radio(key='research_report_mode').set_value('完整研究報告（建議）').run()
+            self.assertEqual(len(app.exception), 0)
         return app
 
 

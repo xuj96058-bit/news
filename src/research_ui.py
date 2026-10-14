@@ -45,6 +45,11 @@ def _select_articles(identifiers):
 def _generation_progress(bar, stage, received_chars=0, elapsed=0):
     steps = {
         "preparing": (0.05, "5/5 核對研究資料與寫作範圍"),
+        "retrieving": (0.08, "讀取相關原文與公開補證資料"),
+        "organizing": (0.15, "整理可追溯數據"),
+        "planning": (0.25, "根據證據規劃論點與反證"),
+        "writing": (0.45, f"撰寫議論文（已收到{received_chars:,}個字元）"),
+        "revising": (0.78, "按審稿意見修正論證"),
         "requesting": (0.15, "5/5 等待AI初稿"),
         "receiving": (0.35, f"5/5 接收初稿（已收到{received_chars:,}個字元）"),
         "validating": (0.40, "5/5 核對正文與來源清單"),
@@ -401,19 +406,24 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
     brief = _organize_data(topic=topic, sources=sources, as_of=today.isoformat(), brief=brief,
         provider=provider, model=model, api_key=api_key, analysis_available=analysis_available)
     st.markdown("**5．寫作及實質審稿**")
-    report_label = st.radio("報告模式", ["完整研究報告（建議）", "資料缺口簡報"], key="research_report_mode",
-                            help="完整研究報告須通過必要證據檢查；資料缺口簡報會明確列出欠缺資料和下一步，不能當作完整研究結論。")
-    report_mode = "gap" if report_label == "資料缺口簡報" else "research"
+    report_label = st.radio("報告模式", ["議論文式研究報告（建議）", "完整研究報告（建議）", "資料缺口簡報"], key="research_report_mode",
+                            help="議論文模式會補讀相關原文、先規劃論點再撰稿與審查；資料不足會縮小結論。原有模式仍可使用。")
+    report_mode = "argumentative" if report_label == "議論文式研究報告（建議）" else ("gap" if report_label == "資料缺口簡報" else "research")
     missing = [item["label"] for item in brief["requirements"] if item["id"] in brief["missing_required"]]
     if brief["ready"]:
         st.success("必要證據已具備可追溯觀測值，可進入寫作與實質審稿；結論仍須審查原始資料與適用範圍。")
     elif report_mode == "research":
         st.warning("完整研究報告尚缺：" + "、".join(missing) + "。請回到補充資料及數據整理，或明確選擇「資料缺口簡報」。")
-    else:
+    elif report_mode == "gap":
         st.info("本次將保存為「資料缺口簡報」；尚缺：" + "、".join(missing) + "。正文會限制結論，並列出補充資料步驟。")
+    else:
+        st.info("生成時會讀取相關原文及建議公開資料，再決定可支持的論點。缺少直接證據的主張會縮小或列為待驗證假說。")
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
-    st.caption("數據整理通常調用1次AI；寫作並保存初稿，再獨立實質審稿，通常另調用2次AI。審稿會檢查必要證據、數據比較與結論是否相符，全文仍可修改和匯出。")
+    if report_mode == "argumentative":
+        st.caption("議論文模式依序規劃論點、撰稿、實質審稿；需要時整理數據及進行一次修訂，最多5次AI調用。以選材準確、證據充分、判斷有用、讀起來清楚作為審查標準。")
+    else:
+        st.caption("數據整理通常調用1次AI；寫作並保存初稿，再獨立實質審稿，通常另調用2次AI。全文仍可修改和匯出。")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
     if not sources:
         st.info("請先在「確認報告選材」選擇新聞，可點「選取最多8篇主題候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
@@ -421,11 +431,12 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("請在左側輸入所選AI服務商的API key並按Enter，並確認模型設定有效，才能生成報告。")
     if not topic.strip():
         st.info("請先填寫研究主題，才能生成報告。")
-    button_label = "生成並保存資料缺口簡報" if report_mode == "gap" else "生成並保存完整研究報告"
+    button_label = "生成並保存議論文報告" if report_mode == "argumentative" else ("生成並保存資料缺口簡報" if report_mode == "gap" else "生成並保存完整研究報告")
     if st.button(button_label, type="primary", key="research_generate",
                  disabled=not analysis_available or not sources or not topic.strip() or (report_mode == "research" and not brief["ready"])):
         bar = st.progress(0.0, text="5/5 準備寫作與實質審稿")
-        st.caption("進度按處理步驟顯示；寫作與審稿共用360秒整體等待上限。初稿會先保存，審稿失敗仍可繼續編輯。")
+        wait_limit = 720 if report_mode == "argumentative" else 360
+        st.caption(f"本次整體等待上限為{wait_limit}秒。初稿會先保存，審稿失敗仍可繼續編輯。")
         initial = None
         try:
             elapsed = 0
@@ -437,13 +448,14 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             def metadata_for(draft):
                 return {**draft.get("metadata", {}), "source_count": len(sources),
-                        "report_mode": report_mode, "research_brief": brief,
+                        "report_mode": report_mode, "research_brief": draft.get("metadata", {}).get("research_brief", brief),
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
                         "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
 
             def save_writer(draft):
-                nonlocal initial
+                nonlocal initial, sources
+                sources = draft.get("sources", sources)
                 _generation_progress(bar, "saving_initial", elapsed=elapsed)
                 with ResearchStore() as store:
                     initial = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
@@ -455,8 +467,9 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
             draft = run_generation(
                 lambda **kwargs: generate_research_workflow(topic, sources, api_key=api_key, provider=provider,
                     model=model, as_of=today.isoformat(), instructions=instructions,
-                    research_brief=brief, report_mode=report_mode, **kwargs),
-                update, on_artifact=save_writer, timeout=360)
+                    research_brief=brief, report_mode=report_mode,
+                    writing_style="argumentative" if report_mode == "argumentative" else "legacy", **kwargs),
+                update, on_artifact=save_writer, timeout=wait_limit)
             if initial is None:
                 save_writer(draft)
             _generation_progress(bar, "saving", elapsed=elapsed)

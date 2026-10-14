@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 import re
 import unicodedata
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 MAX_ITEMS = 500
 MAX_CONTENT = 18000
@@ -95,17 +96,62 @@ def _terms(text):
     return list(dict.fromkeys(terms))[:80]
 
 
-def rank_articles(articles, topic, keywords="", *, include_unrelated=False):
+def _article_url(article):
+    """Ignore tracking parameters, but retain query keys identifying a story."""
+    value = _text(article.get("canonical_url") or article.get("url"), 2048)
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return ""
+        query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                 if not key.casefold().startswith("utm_") and key.casefold() not in {"fbclid", "gclid"}]
+        return urlunsplit((parts.scheme, parts.netloc.casefold(), parts.path.rstrip("/"), urlencode(query), ""))
+    except ValueError:
+        return ""
+
+
+def _publisher_key(article):
+    label = _normal(article.get("publisher") or article.get("source_name") or article.get("source_id"))
+    try:
+        return label or urlsplit(_article_url(article)).hostname or ""
+    except ValueError:
+        return label
+
+
+def _event_key(article):
+    # Conservative identity: differently worded interpretations remain separate
+    # evidence. Exact syndicated headlines and canonical links form one event.
+    explicit = _text(article.get("event_id"), 160)
+    title = re.sub(r"[^a-z0-9" + _HAN + r"]+", " ", _normal(article.get("title"))).strip()
+    return explicit, title if len(title) >= 16 else "", _article_url(article)
+
+
+def _has_research_signal(text, concepts):
+    if not any(key in concepts for key in ("crowding", "leverage")):
+        return True
+    # 'Industry', 'US', 'AI' and 'stocks' alone cannot make a general news story
+    # evidence for positioning or leverage. Catalog document names are candidates.
+    return (any(_concept(text, key) for key in (
+        "crowding", "leverage", "positioning", "margin", "borrowing", "concentration"))
+        or any(_contains(text, marker) for marker in (
+            "finra", "form pf", "private fund", "private funds", "scoos", "私募基金", "对冲基金")))
+
+
+def rank_articles(articles, topic, keywords="", *, include_unrelated=False, deduplicate=True, diversify=True):
     """Rank topic matches stably, retaining the original article dictionaries.
 
     Additional keywords supplement the topic. Scores are relevance hints, never
-    evidence verification or a claim that differently worded stories are one event.
+    evidence verification. Exact URL/headline duplicates retain their original
+    dictionaries in ``duplicate_articles``; distinct interpretations stay separate.
+    Source diversity breaks near-score ties instead of promoting unrelated news.
     """
     if not isinstance(articles, (list, tuple)):
         return []
     topic_text = _normal(_text(topic, 500))
     topic_terms, extra_terms = _terms(topic_text), _terms(_text(keywords, 1000))
     concepts = [key for key in _CONCEPTS if _concept(topic_text + " " + _normal(keywords), key)]
+    if any(key in concepts for key in ("crowding", "leverage")):
+        concepts = list(dict.fromkeys(concepts + ["positioning", "margin", "borrowing", "concentration"]))
     ranked = []
     for index, article in enumerate(articles[:MAX_ITEMS]):
         if not isinstance(article, dict):
@@ -124,12 +170,105 @@ def rank_articles(articles, topic, keywords="", *, include_unrelated=False):
                 reasons.append("相關概念：" + key)
         if topic_text and len(topic_text) > 2:
             score += sum(weight * 2 for text, weight in fields if _contains(text, topic_text))
+        if not _has_research_signal(" ".join(text for text, _ in fields), concepts):
+            score, reasons = 0, []
+        elif not score and any(key in concepts for key in ("crowding", "leverage")):
+            score, reasons = 3, ["相關融資或持倉資料候選"]
         if score > 0 or include_unrelated:
             ranked.append({"article": article, "score": score, "reasons": reasons[:12], "_index": index})
     ranked.sort(key=lambda item: (-item["score"], item["_index"]))
+    if deduplicate:
+        unique, seen = [], {}
+        for item in ranked:
+            keys = [(kind, value) for kind, value in zip(("event", "title", "url"), _event_key(item["article"])) if value]
+            duplicate = next((seen[key] for key in keys if key in seen), None) if item["score"] else None
+            if duplicate is not None:
+                duplicate.setdefault("duplicate_articles", []).append(item["article"])
+                duplicate["reasons"] = list(dict.fromkeys(duplicate["reasons"] + ["相同連結或標題，合併重複報導"]))[:12]
+            else:
+                unique.append(item)
+                if item["score"]:
+                    for key in keys:
+                        seen[key] = item
+        ranked = unique
+    if diversify:
+        ordered, counts = [], defaultdict(int)
+        while ranked:
+            ceiling = ranked[0]["score"]
+            candidates = [item for item in ranked if item["score"] >= ceiling * 0.85] if ceiling else [ranked[0]]
+            chosen = max(candidates, key=lambda item: (
+                item["score"] / (1 + 0.2 * counts[_publisher_key(item["article"])])
+                if _publisher_key(item["article"]) else item["score"], -item["_index"]))
+            ordered.append(chosen)
+            counts[_publisher_key(chosen["article"])] += 1
+            ranked.remove(chosen)
+        ranked = ordered
     for item in ranked:
         item.pop("_index")
     return ranked
+
+
+def select_relevant_passages(content, topic, *, max_chars=12000):
+    """Select exact passages throughout a document; retain table headers.
+
+    Offsets refer to the extracted document text, not the publisher's HTML/PDF.
+    Selection is a relevance hint and must never be labelled verified full text.
+    """
+    if not isinstance(content, str) or not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
+        return {"content": "", "spans": [], "content_truncated": bool(content)}
+    text = content.strip()
+    max_chars = min(max_chars, 18000)
+    blocks = []
+    for match in re.finditer(r"[^\n]+(?:\n(?!\s*\n)[^\n]+)*", text):
+        start, end = match.span()
+        lines = list(re.finditer(r"[^\n]+", match.group()))
+        header_end = lines[min(1, len(lines) - 1)].end() + start if " | " in match.group() else start
+        # Long paragraphs are split at sentence boundaries, never only the head.
+        boundaries = list(re.finditer(r"[^\n]+(?:\n|$)", match.group())) if len(lines) > 1 else list(re.finditer(r"[^。.!?]+[。.!?]?", match.group()))
+        cursor = start
+        for boundary in boundaries:
+            part_end = start + boundary.end()
+            if part_end - cursor > 1800 and part_end > cursor:
+                for offset in range(cursor, part_end, 1800):
+                    blocks.append((offset, min(offset + 1800, part_end), start, header_end))
+                cursor = part_end
+            elif part_end - cursor >= 1000:
+                blocks.append((cursor, part_end, start, header_end))
+                cursor = part_end
+        if cursor < end:
+            blocks.append((cursor, end, start, header_end))
+    candidates = []
+    for index, (start, end, table_start, header_end) in enumerate(blocks):
+        matches = rank_articles([{"content": text[start:end]}], topic, deduplicate=False, diversify=False)
+        if matches:
+            candidates.append((matches[0]["score"], index, start, end, table_start, header_end))
+    if not candidates:
+        return {"content": "", "spans": [], "content_truncated": bool(text)}
+    ranges, used = [], 0
+    for _, _, start, end, table_start, header_end in sorted(candidates, key=lambda item: (-item[0], item[1])):
+        proposed = [(start, end)]
+        if table_start < start and header_end > table_start:
+            proposed.insert(0, (table_start, header_end))
+        for left, right in proposed:
+            if any(left >= old_left and right <= old_right for old_left, old_right in ranges):
+                continue
+            allowance = max_chars - used - (2 if ranges else 0)
+            if allowance <= 0:
+                break
+            right = min(right, left + allowance)
+            ranges.append((left, right))
+            used += right - left + (2 if len(ranges) > 1 else 0)
+        if used >= max_chars:
+            break
+    merged = []
+    for left, right in sorted(ranges):
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(right, merged[-1][1]))
+        else:
+            merged.append((left, right))
+    excerpt = "\n\n".join(text[left:right] for left, right in merged)
+    return {"content": excerpt, "spans": [{"start": left, "end": right} for left, right in merged],
+            "content_truncated": excerpt != text}
 
 
 def _period(value):
