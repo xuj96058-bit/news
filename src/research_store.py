@@ -16,6 +16,8 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "research_repor
 METADATA_FIELDS = frozenset({
     "article_count", "source_count", "warnings", "limitations", "coverage",
     "selection", "generated_at", "duration_seconds", "usage", "report_scope", "review_warnings", "citation_repaired",
+    "workflow_stage", "review_status", "structured_draft", "review_findings", "review_summary",
+    "review_error", "parent_report_id", "reviewed_version", "workflow_schema_version", "validation_warnings",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",
@@ -269,6 +271,57 @@ class ResearchStore:
         """Append a human edit, rejecting a stale editor without losing either draft."""
         return self._append_revision(report_id, title=title, body=body,
                                      expected_version=expected_version, note=note)
+
+    def save_review(self, report_id: str, *, title: str, body: str, expected_version: int,
+                    metadata: dict, note: str = "AI independent review") -> dict:
+        """Append review and its safe workflow facts atomically, preserving human edits.
+
+        A reviewer works from a specific saved draft. If its author has edited that
+        draft while review was running, no review text or metadata is written. The
+        caller may save the review separately rather than replace the author's work.
+        """
+        report_id, title, body = (_text(report_id, "Report ID"), _text(title, "Title"), _text(body, "Body"))
+        note, expected_version = _text(note, "Revision note"), _version(expected_version)
+        if not isinstance(metadata, dict):
+            raise ResearchStoreError("Report metadata must be a dictionary.")
+        try:
+            safe_metadata = _clean_json({key: value for key, value in metadata.items() if key in METADATA_FIELDS})
+            # Validate before taking a write lock. This also rejects NaN and cycles.
+            _json(safe_metadata)
+        except RecursionError:
+            raise ResearchStoreError("Report snapshots contain too many nested fields.") from None
+        now = _now()
+        try:
+            with self.connection:
+                result = self.connection.execute(
+                    "UPDATE research_reports SET current_version = current_version + 1, updated_at = ? "
+                    "WHERE id = ? AND current_version = ?", (now, report_id, expected_version),
+                )
+                if not result.rowcount:
+                    exists = self.connection.execute("SELECT 1 FROM research_reports WHERE id = ?", (report_id,)).fetchone()
+                    if exists is None:
+                        raise ResearchStoreError("Research report was not found.")
+                    raise ResearchConflictError("This report has newer edits. Reload it before saving.")
+                row = self.connection.execute(
+                    "SELECT metadata_json FROM research_reports WHERE id = ?", (report_id,),
+                ).fetchone()
+                merged_metadata = json.loads(row["metadata_json"])
+                merged_metadata.update(safe_metadata)
+                if merged_metadata.get("review_status") in ("reviewed", "needs_review"):
+                    merged_metadata["reviewed_version"] = expected_version + 1
+                else:
+                    merged_metadata.pop("reviewed_version", None)
+                self.connection.execute(
+                    "UPDATE research_reports SET metadata_json = ? WHERE id = ?",
+                    (_json(merged_metadata), report_id),
+                )
+                self.connection.execute(
+                    "INSERT INTO research_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid4()), report_id, expected_version + 1, title, body, note, None, now),
+                )
+        except sqlite3.Error:
+            raise ResearchStoreError("Could not save the report review.") from None
+        return self.get_report(report_id)
 
     def list_revisions(self, report_id: str) -> list[dict]:
         report_id = _text(report_id, "Report ID")

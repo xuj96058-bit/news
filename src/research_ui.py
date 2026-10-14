@@ -12,7 +12,8 @@ from .analysis_errors import analysis_error_message
 from .feeds import load_sources
 from .investat_pipeline import collect_investat
 from .news_store import NewsStore
-from .research import ResearchError, filter_articles, generate_research_report, prepare_evidence, prepare_sources
+from .research import ResearchError, filter_articles, prepare_evidence, prepare_sources
+from .research_workflow import generate_research_workflow
 from .research_evidence import CATALOG, collect_evidence
 from .research_progress import run_generation
 from .research_export import ResearchExportError, export_html, export_markdown, export_pdf
@@ -40,14 +41,15 @@ def _select_articles(identifiers):
 
 def _generation_progress(bar, stage, received_chars=0, elapsed=0):
     steps = {
-        "preparing": (0.05, "1/5 整理所選資料"),
-        "requesting": (0.20, "2/5 等待AI回應"),
-        "receiving": (0.40, f"2/5 正在接收AI草稿（已收到{received_chars:,}個字元）"),
-        "validating": (0.75, "3/5 檢查報告格式與來源引用"),
-        "repairing": (0.75, "3/5 AI正在修正來源引用（最多一次）"),
-        "ready": (0.85, "3/5 草稿檢查完成"),
-        "saving": (0.95, "4/5 保存報告"),
-        "saved": (1.0, "5/5 報告已保存"),
+        "preparing": (0.05, "1/6 整理所選資料"),
+        "requesting": (0.15, "2/6 等待AI初稿"),
+        "receiving": (0.35, f"2/6 接收初稿（已收到{received_chars:,}個字元）"),
+        "validating": (0.40, "3/6 整理正文與來源清單"),
+        "saving_initial": (0.45, "3/6 保存初稿"),
+        "reviewing": (0.65, f"4/6 獨立審稿：核對數字、日期與來源（已收到{received_chars:,}個字元）"),
+        "ready": (0.85, "5/6 準備保存審稿結果"),
+        "saving": (0.95, "5/6 保存審稿版本"),
+        "saved": (1.0, "6/6 報告已保存"),
     }
     value, label = steps.get(stage, steps["requesting"])
     bar.progress(value, text=f"{label} · 已用{int(elapsed)}秒")
@@ -185,8 +187,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         _sources_preview(sources)
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
-    repair_citations = st.checkbox("引用不完整時自動修正一次（可能額外調用AI）", value=True,
-                                   key="research_repair_citations")
+    st.caption("先寫作並保存初稿，再獨立審稿，通常調用2次AI。正文與來源編號分開生成；引用問題標成待核對，全文仍可修改和匯出。")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
     if not sources:
         st.info("請先在「確認報告選材」選擇新聞，可點「選取前8篇候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
@@ -196,8 +197,9 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("請先填寫研究主題，才能生成報告。")
     if st.button("生成並保存報告草稿", type="primary", key="research_generate",
                  disabled=not analysis_available or not sources or not topic.strip()):
-        bar = st.progress(0.0, text="1/5 準備生成報告")
-        st.caption("進度按處理步驟顯示；AI回應速度會變動，最長等待180秒。")
+        bar = st.progress(0.0, text="1/6 準備生成報告")
+        st.caption("進度按處理步驟顯示；寫作與審稿共用360秒整體等待上限。初稿會先保存，審稿失敗仍可繼續編輯。")
+        initial = None
         try:
             elapsed = 0
 
@@ -206,25 +208,68 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 elapsed = seconds
                 _generation_progress(bar, stage, received_chars, elapsed)
 
-            draft = run_generation(
-                lambda **kwargs: generate_research_report(topic, sources, api_key=api_key, provider=provider,
-                    model=model, as_of=today.isoformat(), instructions=instructions,
-                    repair_citations=repair_citations, **kwargs), update)
-            metadata = {**draft["metadata"], "source_count": len(sources),
+            def metadata_for(draft):
+                return {**draft.get("metadata", {}), "source_count": len(sources),
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
                         "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
+
+            def save_writer(draft):
+                nonlocal initial
+                _generation_progress(bar, "saving_initial", elapsed=elapsed)
+                with ResearchStore() as store:
+                    initial = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
+                        provider=provider, model=model, as_of=today.isoformat(), metadata=metadata_for(draft))
+                st.session_state["research_active_report"] = initial["id"]
+                st.success("初稿已保存，正在獨立審稿。")
+                return initial["id"]
+
+            draft = run_generation(
+                lambda **kwargs: generate_research_workflow(topic, sources, api_key=api_key, provider=provider,
+                    model=model, as_of=today.isoformat(), instructions=instructions, **kwargs),
+                update, on_artifact=save_writer, timeout=360)
+            if initial is None:
+                save_writer(draft)
             _generation_progress(bar, "saving", elapsed=elapsed)
+            conflict = False
             with ResearchStore() as store:
-                saved = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
-                                            provider=provider, model=model, as_of=today.isoformat(), metadata=metadata)
+                try:
+                    saved = store.save_review(initial["id"], title=draft["title"], body=draft["body"],
+                        expected_version=initial["version"], metadata=metadata_for(draft), note="AI獨立審稿結果")
+                except ResearchConflictError:
+                    # Another page may already be editing the saved initial draft.
+                    # Keep that text and save the review as a separate suggestion.
+                    conflict = True
+                    suggestion_metadata = {**metadata_for(draft), "parent_report_id": initial["id"]}
+                    if suggestion_metadata.get("review_status") in {"reviewed", "needs_review"}:
+                        suggestion_metadata["reviewed_version"] = 1
+                    saved = store.create_report(topic=topic, title=draft["title"] + "（審稿建議）", body=draft["body"],
+                        sources=sources, provider=provider, model=model, as_of=today.isoformat(),
+                        metadata=suggestion_metadata)
             _generation_progress(bar, "saved", elapsed=elapsed)
-            st.session_state["research_active_report"] = saved["id"]
-            _flash("草稿已保存；請在「報告庫與編輯」修改和匯出。再次生成會建立另一份報告。")
+            st.session_state["research_active_report"] = initial["id"] if conflict else saved["id"]
+            if conflict:
+                _flash("你的修改已保留；AI審稿結果另存為「審稿建議」，可在報告清單選取比較。")
+            elif draft.get("metadata", {}).get("review_status") == "review_failed":
+                _flash("初稿已保存；獨立審稿未完成，可直接修改與匯出。")
+            else:
+                _flash("初稿與審稿版本均已保存；請在「報告庫與編輯」核對、修改和匯出。")
             st.rerun()
         except Exception as error:
             bar.empty()
             st.error(_safe_message(error))
+            if initial is not None:
+                try:
+                    with ResearchStore() as store:
+                        store.save_review(initial["id"], title=initial["title"], body=initial["body"],
+                            expected_version=initial["version"], metadata={"workflow_stage": "review_failed",
+                                "review_status": "review_failed", "review_error": _safe_message(error)},
+                            note="審稿未完成；初稿保留")
+                except ResearchConflictError:
+                    pass
+                except ResearchStoreError as save_error:
+                    st.error(_safe_message(save_error))
+                st.warning("初稿已保存，審稿未完成；可到「報告庫與編輯」修改或匯出。")
 
 
 def _import_report():
@@ -285,6 +330,30 @@ def _library():
     if st.session_state[base_key] != report["version"]:
         st.warning("其他頁面已保存新版本。你的編輯仍保留；先複製需要的文字，再載入最新版本合併修改。")
     st.caption(f"已保存版本v{report['version']} · {report['provider']}／{report['model']} · 修改不會調用AI或覆蓋原始草稿。")
+    metadata = report.get("metadata", {})
+    status = metadata.get("review_status")
+    reviewed_version = metadata.get("reviewed_version")
+    if not isinstance(status, str):
+        status = None
+    if not isinstance(reviewed_version, int) or isinstance(reviewed_version, bool) or reviewed_version < 1:
+        reviewed_version = None
+    if status:
+        if reviewed_version and reviewed_version != report["version"]:
+            st.info(f"AI審稿基於v{reviewed_version}；目前v{report['version']}包含後續修改，仍由你核對。")
+        else:
+            st.info({"pending": "初稿已保存，尚待獨立審稿。", "draft": "初稿已保存，尚待獨立審稿。",
+                "reviewed": "已完成AI獨立審稿；尚未人工核實，全文可自由修改。",
+                "needs_review": "此稿有待核對項目，全文仍可自由修改和匯出。",
+                "review_failed": "獨立審稿未完成；初稿已保留，可自由修改和匯出。"}.get(status, "草稿待核對。"))
+        with st.expander("獨立審稿結果與待核對項目", expanded=status in {"needs_review", "review_failed"}):
+            if metadata.get("review_summary"):
+                st.text(metadata["review_summary"])
+            if metadata.get("review_error"):
+                st.text(metadata["review_error"])
+            for issue in [*metadata.get("validation_warnings", []), *metadata.get("review_findings", [])][:40]:
+                st.text(issue.get("message", "") if isinstance(issue, dict) else str(issue))
+    if metadata.get("parent_report_id"):
+        st.caption("此稿是另存的審稿建議；原報告中的人工修改已保留。")
     if report.get("metadata", {}).get("citation_repaired"):
         st.caption("生成時已經過一次AI引用修正；仍請核對正文與來源是否相符。")
     for warning in report.get("metadata", {}).get("review_warnings", []):

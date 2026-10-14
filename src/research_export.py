@@ -35,6 +35,18 @@ def _fields(report: Mapping[str, Any]) -> tuple[str, str, list[str]]:
         value = report.get(key)
         if value is not None and value != "":
             metadata.append(f"{label}：{str(value).replace(chr(13), ' ').replace(chr(10), ' ')}")
+    workflow = report.get("metadata", {})
+    if isinstance(workflow, Mapping) and isinstance(workflow.get("review_status"), str) and workflow["review_status"]:
+        reviewed = workflow.get("reviewed_version")
+        if not isinstance(reviewed, int) or isinstance(reviewed, bool) or reviewed < 1:
+            reviewed = None
+        if reviewed and reviewed != report.get("version"):
+            label = f"人工修改後待核對（AI審稿基於v{reviewed}）"
+        else:
+            label = {"pending": "初稿待審稿", "draft": "初稿待審稿", "reviewed": "AI審稿完成，尚未人工核實",
+                     "needs_review": "有待核對項目", "review_failed": "審稿未完成，初稿保留"}.get(
+                         workflow["review_status"], "草稿待核對")
+        metadata.append("草稿狀態：" + label)
     return title, body, metadata
 
 
@@ -87,7 +99,8 @@ def _table_start(lines: list[str], index: int) -> bool:
 
 def _block_start(lines: list[str], index: int) -> bool:
     line = lines[index]
-    return bool(_HEADING.match(line) or _LIST.match(line) or _RULE.match(line)
+    return bool(line.startswith(("    ", "\t"))
+                or _HEADING.match(line) or _LIST.match(line) or _RULE.match(line)
                 or line.lstrip().startswith(("```", "~~~", ">"))
                 or _table_start(lines, index))
 
@@ -103,7 +116,23 @@ def _blocks(body: str) -> list[_Block]:
             index += 1
             continue
         heading = _HEADING.match(line)
-        if heading:
+        if line.startswith(("    ", "\t")):
+            # Raw model responses are retained as indented Markdown code. Keep
+            # their links, fences and HTML inert in every rendered export too.
+            content = []
+            while index < len(lines):
+                current = lines[index]
+                if current.startswith("    "):
+                    content.append(current[4:])
+                elif current.startswith("\t"):
+                    content.append(current[1:])
+                elif not current.strip():
+                    content.append("")
+                else:
+                    break
+                index += 1
+            blocks.append(_Block("code", "\n".join(content).rstrip("\n")))
+        elif heading:
             blocks.append(_Block("heading", heading.group(2), len(heading.group(1))))
             index += 1
         elif line.lstrip().startswith(("```", "~~~")):

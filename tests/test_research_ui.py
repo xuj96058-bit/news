@@ -1,4 +1,5 @@
 """End-to-end editing with a real local store, without contacting any API."""
+import copy
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ with patch('dotenv.load_dotenv'):
 APP = Path(__file__).resolve().parents[1] / 'app.py'
 
 
-class ResearchUiTests(unittest.TestCase):
+class ResearchUiHarness:
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -44,9 +45,22 @@ class ResearchUiTests(unittest.TestCase):
         self.patch('src.news_store.NewsStore', new=factory)
         self.patch('src.research_ui.NewsStore', new=factory)
         self.patch('src.report.load_report_events', return_value=[])
-        self.generator = self.patch('src.research_ui.generate_research_report', return_value={
+        self.initial_draft = {
             'title': 'AI草稿', 'body': '# AI草稿\n\n原始分析[S1]。',
-            'metadata': {'provider': 'deepseek', 'model': 'deepseek-v4-pro', 'report_scope': 'rss_investat_only'}})
+            'metadata': {'provider': 'deepseek', 'model': 'deepseek-v4-pro',
+                         'report_scope': 'rss_investat_only', 'workflow_stage': 'writer_saved',
+                         'review_status': 'pending', 'validation_warnings': []}}
+        self.reviewed_draft = {
+            'title': '審稿後草稿', 'body': '# 審稿後草稿\n\n審稿修訂分析[S1]。',
+            'metadata': {**self.initial_draft['metadata'], 'workflow_stage': 'review_complete',
+                         'review_status': 'reviewed', 'review_findings': [], 'review_summary': '已核對來源快照。'}}
+
+        def completed_workflow(*args, on_progress=None, on_draft=None, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            on_progress('reviewing', 0)
+            return copy.deepcopy(self.reviewed_draft)
+
+        self.generator = self.patch('src.research_ui.generate_research_workflow', side_effect=completed_workflow)
 
     def start_patch(self, patcher):
         result = patcher.start()
@@ -66,7 +80,9 @@ class ResearchUiTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         return app
 
-    def test_generate_edit_restore_and_export_without_second_api_call(self):
+
+class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
+    def test_generate_edit_restore_and_export_without_additional_generation(self):
         progress = self.patch('src.research_ui._generation_progress', wraps=ui._generation_progress)
         app = self.app()
         app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
@@ -75,7 +91,7 @@ class ResearchUiTests(unittest.TestCase):
         stages = [call.args[1] for call in progress.call_args_list]
         self.assertIn('saving', stages)
         self.assertEqual(stages[-1], 'saved')
-        self.assertIs(self.generator.call_args.kwargs['repair_citations'], True)
+        self.assertNotIn('repair_citations', self.generator.call_args.kwargs)
         with ResearchStore(self.db) as store:
             report = store.list_reports()[0]
         identifier = report['id']
@@ -86,7 +102,7 @@ class ResearchUiTests(unittest.TestCase):
             saved = store.get_report(identifier)
             revisions = store.list_revisions(identifier)
         self.assertEqual(saved['body'], '我的完整修改')
-        self.assertEqual(saved['version'], 2)
+        self.assertEqual(saved['version'], 3)
         self.assertIn('原始分析', saved['original_body'])
         self.assertNotIn('synthetic-session-credential', json.dumps(saved))
         self.assertEqual(self.generator.call_count, 1)
@@ -95,7 +111,7 @@ class ResearchUiTests(unittest.TestCase):
         app.button(key=f'research_restore_{identifier}').click().run()
         with ResearchStore(self.db) as store:
             restored = store.get_report(identifier)
-        self.assertEqual(restored['version'], 3)
+        self.assertEqual(restored['version'], 4)
         self.assertEqual(restored['body'], restored['original_body'])
         self.assertEqual(self.generator.call_count, 1)
 
@@ -185,8 +201,8 @@ class ResearchUiTests(unittest.TestCase):
             return {'title': '遲來的草稿', 'body': '遲來的內容', 'metadata': {}}
 
         self.generator.side_effect = delayed_draft
-        self.patch('src.research_ui.run_generation', side_effect=lambda generate, update: run_generation(
-            generate, update, timeout=0.04, tick_seconds=0.01))
+        self.patch('src.research_ui.run_generation', side_effect=lambda generate, update, **kwargs: run_generation(
+            generate, update, **{**kwargs, 'timeout': 0.04, 'tick_seconds': 0.01}))
         app = self.app()
         app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
         app.button(key='research_generate').click().run()
@@ -210,52 +226,220 @@ class ResearchUiTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(any('無法保存報告' in item.value for item in app.error))
         stages = [call.args[1] for call in progress.call_args_list]
-        self.assertIn('saving', stages)
+        self.assertIn('saving_initial', stages)
         self.assertNotIn('saved', stages)
         with ResearchStore(self.db) as store:
             self.assertEqual(store.list_reports(), [])
 
-    def test_citation_repair_can_be_disabled_for_generation(self):
+    def test_generation_explains_independent_review_and_retains_both_versions(self):
         app = self.app()
-        self.assertTrue(app.checkbox(key='research_repair_citations').value)
+        self.assertFalse(any(item.key == 'research_repair_citations' for item in app.checkbox))
+        self.assertTrue(any('審稿' in item.value and '2' in item.value for item in app.caption))
         app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
-        app.checkbox(key='research_repair_citations').uncheck().run()
         app.button(key='research_generate').click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertIs(self.generator.call_args.kwargs['repair_citations'], False)
         with ResearchStore(self.db) as store:
-            self.assertEqual(len(store.list_reports()), 1)
+            reports = store.list_reports()
+            self.assertEqual(len(reports), 1)
+            report = reports[0]
+            self.assertEqual(report['version'], 2)
+            self.assertEqual(report['body'], self.reviewed_draft['body'])
+            self.assertEqual(report['original_body'], self.initial_draft['body'])
+            self.assertEqual([item['version'] for item in store.list_revisions(report['id'])], [2, 1])
 
-    def test_citation_repair_updates_generation_progress_label(self):
+    def test_review_updates_generation_progress_label(self):
         release = Event()
         self.addCleanup(release.set)
-        draft = self.generator.return_value
         bar = MagicMock()
         self.patch('src.research_ui.st.progress', return_value=bar)
         render_progress = ui._generation_progress
 
         def track_progress(progress_bar, stage, *args, **kwargs):
             render_progress(progress_bar, stage, *args, **kwargs)
-            if stage == 'repairing':
+            if stage == 'reviewing':
                 release.set()
 
         self.patch('src.research_ui._generation_progress', side_effect=track_progress)
 
-        def repaired_draft(*args, on_progress, **kwargs):
-            on_progress('repairing', 50)
+        def reviewed_draft(*args, on_progress, on_draft, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            on_progress('reviewing', 50)
             if not release.wait(2):
-                raise AssertionError('Citation repair progress was never displayed.')
-            return draft
+                raise AssertionError('Independent review progress was never displayed.')
+            return copy.deepcopy(self.reviewed_draft)
 
-        self.generator.side_effect = repaired_draft
+        self.generator.side_effect = reviewed_draft
         app = self.app()
         app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
         app.button(key='research_generate').click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertTrue(any('AI正在修正來源引用（最多一次）' in call.kwargs.get('text', '')
+        self.assertTrue(any('審稿' in call.kwargs.get('text', '')
                             for call in bar.progress.call_args_list))
         with ResearchStore(self.db) as store:
             self.assertEqual(len(store.list_reports()), 1)
+
+    def test_writer_draft_is_persisted_before_independent_review_completes(self):
+        observed = []
+
+        def paused_review(*args, on_draft, on_progress, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            with ResearchStore(self.db) as store:
+                reports = store.list_reports()
+                observed.append(reports)
+            on_progress('reviewing', 0)
+            return copy.deepcopy(self.reviewed_draft)
+
+        self.generator.side_effect = paused_review
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(len(observed[0]), 1)
+        self.assertEqual(observed[0][0]['body'], self.initial_draft['body'])
+        self.assertEqual(observed[0][0]['version'], 1)
+        self.assertEqual(observed[0][0]['metadata']['review_status'], 'pending')
+
+    def test_review_failure_preserves_writer_draft_and_user_editing(self):
+        def failed_review(*args, on_draft, on_progress, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            on_progress('reviewing', 0)
+            return {**copy.deepcopy(self.initial_draft), 'metadata': {
+                **self.initial_draft['metadata'], 'workflow_stage': 'review_failed',
+                'review_status': 'review_failed', 'review_error': '審稿回應不完整，初稿仍已保存。'}}
+
+        self.generator.side_effect = failed_review
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        with ResearchStore(self.db) as store:
+            report = store.list_reports()[0]
+        self.assertEqual(report['body'], self.initial_draft['body'])
+        self.assertEqual(report['original_body'], self.initial_draft['body'])
+        self.assertEqual(report['metadata']['review_status'], 'review_failed')
+        self.assertTrue(any('審稿未完成' in item.value for item in [*app.info, *app.warning]))
+        app.text_area(key=f"research_editor_body_{report['id']}").input('審稿失敗後由我完成的正文').run()
+        app.button(key='research_save_edit').click().run()
+        with ResearchStore(self.db) as store:
+            saved = store.get_report(report['id'])
+        self.assertEqual(saved['body'], '審稿失敗後由我完成的正文')
+        self.assertEqual(saved['version'], report['version'] + 1)
+        self.assertEqual(self.generator.call_count, 1)
+
+    def test_timeout_after_writer_save_keeps_initial_draft_editable_and_discards_late_review(self):
+        release = Event()
+        finished = Event()
+        self.addCleanup(release.set)
+
+        def delayed_review(*args, on_draft, on_progress, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            on_progress('reviewing', 0)
+            release.wait(5)
+            finished.set()
+            return copy.deepcopy(self.reviewed_draft)
+
+        self.generator.side_effect = delayed_review
+        self.patch('src.research_ui.run_generation', side_effect=lambda generate, update, **kwargs: run_generation(
+            generate, update, **{**kwargs, 'timeout': 0.3, 'tick_seconds': 0.01}))
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        with ResearchStore(self.db) as store:
+            reports = store.list_reports()
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        self.assertEqual(report['version'], 2)
+        self.assertEqual(report['body'], self.initial_draft['body'])
+        self.assertEqual(report['metadata']['review_status'], 'review_failed')
+        self.assertTrue(any('逾時' in item.value for item in [*app.error, *app.warning]))
+        app.text_area(key=f"research_editor_body_{report['id']}").input('逾時後保存的手動修改').run()
+        app.button(key='research_save_edit').click().run()
+        release.set()
+        self.assertTrue(finished.wait(1))
+        app.run()
+        with ResearchStore(self.db) as store:
+            saved = store.get_report(report['id'])
+        self.assertEqual(saved['body'], '逾時後保存的手動修改')
+        self.assertEqual(saved['version'], 3)
+        self.assertEqual(saved['original_body'], self.initial_draft['body'])
+
+    def test_review_cannot_overwrite_a_manual_edit_saved_from_another_window(self):
+        edited_id = []
+
+        def review_while_user_edits(*args, on_draft, on_progress, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            with ResearchStore(self.db) as store:
+                report = store.list_reports()[0]
+                edited_id.append(report['id'])
+                store.save_revision(report['id'], title='我保存的標題', body='另一窗口保存的人工正文',
+                                    expected_version=1, note='Manual edit while review runs')
+            on_progress('reviewing', 0)
+            return copy.deepcopy(self.reviewed_draft)
+
+        self.generator.side_effect = review_while_user_edits
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        with ResearchStore(self.db) as store:
+            reports = store.list_reports()
+            user_report = store.get_report(edited_id[0])
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(user_report['body'], '另一窗口保存的人工正文')
+        self.assertEqual(user_report['version'], 2)
+        reviewed = next(report for report in reports if report['id'] != user_report['id'])
+        self.assertEqual(reviewed['body'], self.reviewed_draft['body'])
+        self.assertEqual(reviewed['metadata']['parent_report_id'], user_report['id'])
+        self.assertEqual(user_report['original_body'], self.initial_draft['body'])
+
+    def test_failed_review_conflict_stays_unreviewed_after_manual_edit_and_export(self):
+        from src.research_export import export_html, export_markdown
+        edited_id = []
+
+        def failed_review_while_user_edits(*args, on_draft, on_progress, **kwargs):
+            on_draft(copy.deepcopy(self.initial_draft))
+            with ResearchStore(self.db) as store:
+                report = store.list_reports()[0]
+                edited_id.append(report['id'])
+                store.save_revision(report['id'], title='人工版本', body='另一窗口的人工修改',
+                                    expected_version=1, note='Edit while reviewer is pending')
+            on_progress('reviewing', 0)
+            return {**copy.deepcopy(self.initial_draft), 'metadata': {
+                **self.initial_draft['metadata'], 'workflow_stage': 'review_failed',
+                'review_status': 'review_failed', 'review_error': '審稿服務未完成；初稿保留。'}}
+
+        self.generator.side_effect = failed_review_while_user_edits
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        with ResearchStore(self.db) as store:
+            original = store.get_report(edited_id[0])
+            reports = store.list_reports()
+        self.assertEqual(original['body'], '另一窗口的人工修改')
+        self.assertEqual(len(reports), 2)
+        failed = next(report for report in reports if report['id'] != original['id'])
+        self.assertEqual(failed['metadata']['parent_report_id'], original['id'])
+        self.assertEqual(failed['metadata']['review_status'], 'review_failed')
+        self.assertNotIn('reviewed_version', failed['metadata'])
+        app.selectbox(key='research_active_report').select(failed['id']).run()
+        app.text_area(key=f"research_editor_body_{failed['id']}").input('審稿未完成，我自行修改。').run()
+        app.button(key='research_save_edit').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any('獨立審稿未完成' in item.value for item in app.info))
+        self.assertFalse(any('AI審稿基於v' in item.value for item in app.info))
+        with ResearchStore(self.db) as store:
+            saved = store.get_report(failed['id'])
+        self.assertEqual(saved['body'], '審稿未完成，我自行修改。')
+        self.assertEqual(saved['metadata']['review_status'], 'review_failed')
+        self.assertNotIn('reviewed_version', saved['metadata'])
+        for export in (export_markdown, export_html):
+            text = export(saved).decode('utf-8')
+            self.assertIn('審稿未完成，初稿保留', text)
+            self.assertNotIn('AI審稿基於v', text)
+        self.assertEqual(self.generator.call_count, 1)
 
     def test_switching_reports_keeps_unsaved_editor_buffer(self):
         first = self.create('報告A', 'A正文')

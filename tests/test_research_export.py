@@ -62,7 +62,55 @@ def generated_appendix_report():
     return {"title": "來源附錄匯出測試", "body": format_sources_appendix(sources), "sources": sources}
 
 
+def raw_fallback_report():
+    """Use the actual workflow's inert raw-draft wrapper, with no model call."""
+    from src.research_workflow import _body, _warning
+    source_report = generated_appendix_report()
+    raw = (
+        '[unprovided Markdown](https://unprovided.example/markdown)\n'
+        '\n'
+        '![unprovided image](https://unprovided.example/image.png)\n'
+        '<a href="https://unprovided.example/html">raw HTML link</a>\n'
+        '<img src="https://unprovided.example/html-image.png" onerror="alert(1)">\n'
+        '<script>alert("raw fallback")</script>\n'
+        '```\n'
+        '[after closing fence](https://unprovided.example/after-fence)\n'
+        '```\n'
+        '<https://unprovided.example/autolink>\n'
+        'https://unprovided.example/plain-url\n'
+    )
+    return {'title': '原始模型草稿', 'version': 2,
+            'metadata': {'review_status': 'review_failed'}, 'sources': source_report['sources'],
+            'body': _body('原始模型草稿', None, source_report['sources'], '2026-10-14',
+                          stage='review_failed', warnings=[_warning('invalid_schema')], raw=raw)}, raw
+
+
 class ResearchExportTests(unittest.TestCase):
+    def test_raw_fallback_indented_markdown_and_fences_remain_inert_in_html(self):
+        report, raw = raw_fallback_report()
+        exported = export_html(report).decode('utf-8')
+        parsed = ParsedHTML(exported)
+        self.assertIn('pre', parsed.tags)
+        self.assertIn('code', parsed.tags)
+        self.assertNotIn('script', parsed.tags)
+        self.assertNotIn('img', parsed.tags)
+        destinations = {link['href'] for link in parsed.links}
+        self.assertEqual(destinations, {'https://example.org/source?view=full',
+                                       'https://mirror.example.org/source'})
+        text = ''.join(parsed.text)
+        for line in raw.splitlines():
+            if line.strip():
+                self.assertIn(line, text)
+
+    def test_exports_label_review_state_and_later_manual_edits_without_blocking(self):
+        report = edited_report()
+        report['metadata'] = {'review_status': 'review_failed'}
+        self.assertIn('審稿未完成，初稿保留', export_markdown(report).decode('utf-8'))
+        self.assertIn('審稿未完成，初稿保留', export_html(report).decode('utf-8'))
+        report['metadata'] = {'review_status': 'reviewed', 'reviewed_version': 2}
+        self.assertIn('人工修改後待核對（AI審稿基於v2）', export_markdown(report).decode('utf-8'))
+        self.assertIn('人工修改後待核對（AI審稿基於v2）', export_html(report).decode('utf-8'))
+
     def test_markdown_preserves_the_latest_body_and_only_display_metadata(self):
         report = edited_report()
         exported = export_markdown(report).decode("utf-8-sig")
@@ -164,6 +212,20 @@ class ResearchPDFTests(unittest.TestCase):
         data = export_pdf(report)
         self.assertTrue(data.startswith(b"%PDF-"))
         return PdfReader(BytesIO(data))
+
+    def test_raw_fallback_indented_markdown_has_no_unprovided_pdf_link_annotations(self):
+        report, raw = raw_fallback_report()
+        reader = self.reader(report)
+        destinations = {annotation.get_object()['/A']['/URI']
+                        for page in reader.pages for annotation in page.get('/Annots', [])
+                        if annotation.get_object().get('/A', {}).get('/S') == '/URI'}
+        self.assertEqual(destinations, {'https://example.org/source?view=full',
+                                       'https://mirror.example.org/source'})
+        text = '\n'.join(page.extract_text() for page in reader.pages)
+        self.assertIn('[unprovided Markdown](https://unprovided.example/markdown)', text)
+        self.assertIn('https://unprovided.example/after-fence', text)
+        self.assertIn('<script>alert("raw fallback")</script>', text)
+        self.assertIn('審稿未完成，初稿保留', text)
 
     def test_pdf_has_editable_body_chinese_sources_and_no_credential_metadata(self):
         reader = self.reader(edited_report())

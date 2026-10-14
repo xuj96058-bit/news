@@ -8,6 +8,50 @@ from src.research_progress import run_generation
 
 
 class ResearchProgressTests(unittest.TestCase):
+    def test_draft_is_acknowledged_on_caller_thread_before_review_starts(self):
+        caller = get_ident()
+        stages = []
+        draft = {'title': 'Initial', 'body': 'Editable initial draft'}
+
+        def generate(*, on_progress, register_cancel, on_draft):
+            identifier = on_draft(draft)
+            stages.append(('review', identifier))
+            return {'body': 'Reviewed draft'}
+
+        def save_draft(value):
+            self.assertEqual(get_ident(), caller)
+            self.assertIs(value, draft)
+            stages.append(('saved', 'report-id'))
+            return 'report-id'
+
+        result = run_generation(generate, lambda *event: None, on_artifact=save_draft,
+                                timeout=1, tick_seconds=0.01)
+        self.assertEqual(stages, [('saved', 'report-id'), ('review', 'report-id')])
+        self.assertEqual(result['body'], 'Reviewed draft')
+
+    def test_failed_draft_save_stops_worker_before_review(self):
+        review_started = Event()
+        worker_finished = Event()
+        expected = ValueError('Synthetic save failure')
+
+        def generate(*, on_progress, register_cancel, on_draft):
+            try:
+                on_draft({'body': 'Initial'})
+                review_started.set()
+                return {'body': 'Reviewed'}
+            finally:
+                worker_finished.set()
+
+        def save_draft(value):
+            raise expected
+
+        with self.assertRaises(ValueError) as caught:
+            run_generation(generate, lambda *event: None, on_artifact=save_draft,
+                           timeout=1, tick_seconds=0.01)
+        self.assertIs(caught.exception, expected)
+        self.assertTrue(worker_finished.wait(1))
+        self.assertFalse(review_started.is_set())
+
     def test_elapsed_updates_while_blocked_and_updates_run_on_caller_thread(self):
         release = Event()
         self.addCleanup(release.set)

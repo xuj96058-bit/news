@@ -77,6 +77,139 @@ class ResearchStoreTests(unittest.TestCase):
             self.assertEqual(saved["metadata"], {"citation_repaired": True})
         self.assertNotIn(b"SYNTHETIC_PRIVATE_SETTING", self.path.read_bytes())
 
+    def test_review_saves_revision_and_metadata_preserving_writer_draft_and_history(self):
+        original_metadata = {
+            "article_count": 1, "workflow_schema_version": 1,
+            "workflow_stage": "writer", "review_status": "draft",
+            "structured_draft": {"title": "Writer title", "sections": [
+                {"heading": "Evidence", "paragraphs": [{"text": "Writer claim", "source_ids": ["S1"]}]}]},
+        }
+        created = self.store.create_report(**report_args(metadata=original_metadata))
+        # The writer's output must already be durable while the review runs.
+        with ResearchStore(self.path) as reopened:
+            self.assertEqual(reopened.get_report(created["id"])["body"], created["body"])
+            self.assertEqual(reopened.get_report(created["id"])["metadata"], original_metadata)
+        reviewed = self.store.save_review(
+            created["id"], title="Reviewed title", body="Reviewed analysis [S1]", expected_version=1,
+            metadata={"workflow_stage": "review", "review_status": "reviewed",
+                      "review_summary": "Checked dates and source claims.", "review_findings": [],
+                      "reviewed_version": 99},
+        )
+        self.assertEqual((reviewed["version"], reviewed["title"], reviewed["body"]),
+                         (2, "Reviewed title", "Reviewed analysis [S1]"))
+        self.assertEqual(reviewed["original_body"], created["body"])
+        self.assertEqual(reviewed["original_title"], created["title"])
+        self.assertEqual(reviewed["sources"], created["sources"])
+        self.assertEqual(reviewed["metadata"]["article_count"], 1)
+        self.assertEqual(reviewed["metadata"]["structured_draft"], original_metadata["structured_draft"])
+        self.assertEqual(reviewed["metadata"]["reviewed_version"], 2)
+        edited = self.store.save_revision(created["id"], title="My title", body="My complete replacement",
+                                          expected_version=2, note="Author edit")
+        self.assertEqual((edited["version"], edited["body"]), (3, "My complete replacement"))
+        self.assertEqual(edited["metadata"]["reviewed_version"], 2)
+        history = self.store.list_revisions(created["id"])
+        self.assertEqual([revision["body"] for revision in history],
+                         ["My complete replacement", "Reviewed analysis [S1]", created["body"]])
+        self.assertEqual(history[1]["note"], "AI independent review")
+
+    def test_review_cannot_change_author_edits_or_metadata_on_stale_version(self):
+        created = self.store.create_report(**report_args(metadata={"review_status": "draft", "warnings": ["Writer warning"]}))
+        with ResearchStore(self.path) as reviewer:
+            expected_version = reviewer.get_report(created["id"])["version"]
+            author_edit = self.store.save_revision(created["id"], title="Author's title", body="Author's text",
+                                                   expected_version=1, note="Keep this edit")
+            history = self.store.list_revisions(created["id"])
+            with self.assertRaises(ResearchConflictError):
+                reviewer.save_review(created["id"], title="AI title", body="AI revision",
+                                     expected_version=expected_version,
+                                     metadata={"review_status": "reviewed", "review_summary": "AI change"})
+        self.assertEqual(self.store.get_report(created["id"]), author_edit)
+        self.assertEqual(self.store.list_revisions(created["id"]), history)
+
+    def test_failed_review_transaction_rolls_back_metadata_version_and_revision(self):
+        created = self.store.create_report(**report_args(metadata={"review_status": "draft", "workflow_stage": "writer"}))
+        history = self.store.list_revisions(created["id"])
+        self.store.connection.execute("""
+            CREATE TRIGGER reject_test_review BEFORE INSERT ON research_revisions
+            BEGIN SELECT RAISE(ABORT, 'sensitive database detail'); END
+        """)
+        with self.assertRaisesRegex(ResearchStoreError, "^Could not save the report review\\.$"):
+            self.store.save_review(created["id"], title="AI title", body="AI review", expected_version=1,
+                                   metadata={"review_status": "reviewed", "review_summary": "New metadata"})
+        self.assertEqual(self.store.get_report(created["id"]), created)
+        self.assertEqual(self.store.list_revisions(created["id"]), history)
+
+    def test_review_metadata_failure_rolls_back_before_revision_append(self):
+        created = self.store.create_report(**report_args())
+        self.store.connection.execute("""
+            CREATE TRIGGER reject_test_metadata BEFORE UPDATE OF metadata_json ON research_reports
+            BEGIN SELECT RAISE(ABORT, 'sensitive metadata detail'); END
+        """)
+        with self.assertRaisesRegex(ResearchStoreError, "^Could not save the report review\\.$"):
+            self.store.save_review(created["id"], title="AI title", body="AI review", expected_version=1,
+                                   metadata={"review_status": "reviewed"})
+        self.assertEqual(self.store.get_report(created["id"]), created)
+        self.assertEqual(len(self.store.list_revisions(created["id"])), 1)
+
+    def test_safe_workflow_metadata_persists_and_strips_nested_credentials(self):
+        created = self.store.create_report(**report_args(metadata={
+            "workflow_schema_version": 1, "workflow_stage": "writer", "review_status": "pending",
+            "validation_warnings": [{"code": "unknown_source", "section": "Evidence", "paragraph": 0,
+                                     "message": "Source requires confirmation", "api_key": "WARNING_SECRET"}],
+            "parent_report_id": "older-report", "structured_draft": {
+                "paragraphs": [{"text": "Evidence", "source_ids": ["S1"], "api_key": "DRAFT_SECRET"}],
+                "request": {"messages": "REQUEST_SECRET"}},
+        }))
+        reviewed = self.store.save_review(
+            created["id"], title="Review", body="Reviewed", expected_version=1,
+            metadata={"workflow_stage": "review", "review_status": "needs_review",
+                      "review_findings": [{"severity": "warning", "text": "Unclear date", "access_token": "FINDING_SECRET"}],
+                      "review_summary": "Verify date", "review_error": None,
+                      "usage": {"review": {"tokens": 23, "headers": {"authorization": "AUTH_SECRET"}}},
+                      "request": {"messages": "TOP_SECRET"}, "client_settings": "CLIENT_SECRET"},
+        )
+        self.assertEqual(reviewed["metadata"]["structured_draft"],
+                         {"paragraphs": [{"text": "Evidence", "source_ids": ["S1"]}]})
+        self.assertEqual(reviewed["metadata"]["review_findings"], [{"severity": "warning", "text": "Unclear date"}])
+        self.assertEqual(reviewed["metadata"]["validation_warnings"], [{"code": "unknown_source", "section": "Evidence",
+                                                                     "paragraph": 0, "message": "Source requires confirmation"}])
+        self.assertEqual(reviewed["metadata"]["usage"], {"review": {"tokens": 23}})
+        self.assertEqual(reviewed["metadata"]["reviewed_version"], 2)
+        self.assertEqual(reviewed["metadata"]["parent_report_id"], "older-report")
+        with ResearchStore(self.path) as reopened:
+            self.assertEqual(reopened.get_report(created["id"])["metadata"], reviewed["metadata"])
+        self.assertNotIn(b"SECRET", self.path.read_bytes())
+
+    def test_failed_review_status_does_not_claim_current_version_was_reviewed(self):
+        created = self.store.create_report(**report_args(metadata={"review_status": "draft"}))
+        reviewed = self.store.save_review(created["id"], title="Review", body="Review", expected_version=1,
+                                          metadata={"review_status": "reviewed"})
+        failed = self.store.save_review(created["id"], title=reviewed["title"], body=reviewed["body"], expected_version=2,
+                                       metadata={"review_status": "review_failed", "review_error": "Review could not complete"})
+        self.assertNotIn("reviewed_version", failed["metadata"])
+        self.assertEqual(failed["metadata"]["review_status"], "review_failed")
+        self.assertEqual(len(self.store.list_revisions(created["id"])), 3)
+
+    def test_invalid_review_metadata_does_not_write_and_old_reports_remain_editable(self):
+        created = self.store.create_report(**report_args())
+        self.assertNotIn("workflow_stage", created["metadata"])
+        for metadata in (["not a dictionary"], {"review_findings": object()}, {"review_findings": [float("nan")]},
+                         {"structured_draft": {1: "non-text key"}}):
+            with self.assertRaises(ResearchStoreError):
+                self.store.save_review(created["id"], title="AI title", body="AI text", expected_version=1,
+                                       metadata=metadata)
+        cyclic = []
+        cyclic.append(cyclic)
+        with self.assertRaises(ResearchStoreError):
+            self.store.save_review(created["id"], title="AI title", body="AI text", expected_version=1,
+                                   metadata={"review_findings": cyclic})
+        self.assertEqual(self.store.get_report(created["id"]), created)
+        self.assertEqual(len(self.store.list_revisions(created["id"])), 1)
+        edited = self.store.save_revision(created["id"], title="", body="Freely edited old report", expected_version=1)
+        self.assertEqual(edited["body"], "Freely edited old report")
+        with self.assertRaisesRegex(ResearchStoreError, "not found"):
+            self.store.save_review("missing", title="x", body="x", expected_version=1, metadata={})
+
     def test_second_editor_cannot_overwrite_newer_version_or_restore_over_it(self):
         created = self.store.create_report(**report_args())
         with ResearchStore(self.path) as second_editor:
