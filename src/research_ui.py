@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -13,7 +14,9 @@ from .feeds import load_sources
 from .investat_pipeline import collect_investat
 from .news_store import NewsStore
 from .research import ResearchError, filter_articles, prepare_evidence, prepare_sources
-from .research_workflow import generate_research_workflow
+from .research_workflow import ResearchEvidenceError, generate_research_workflow
+from .research_quality import build_research_brief, rank_articles
+from .research_analysis import extract_research_observations
 from .research_evidence import CATALOG, collect_evidence
 from .research_progress import run_generation
 from .research_export import ResearchExportError, export_html, export_markdown, export_pdf
@@ -22,7 +25,7 @@ from .rss_pipeline import collect_sources
 
 
 def _safe_message(error):
-    if isinstance(error, (ResearchError, ResearchStoreError, ResearchExportError)):
+    if isinstance(error, (ResearchError, ResearchEvidenceError, ResearchStoreError, ResearchExportError)):
         return str(error)
     return analysis_error_message(error)
 
@@ -41,15 +44,15 @@ def _select_articles(identifiers):
 
 def _generation_progress(bar, stage, received_chars=0, elapsed=0):
     steps = {
-        "preparing": (0.05, "1/6 整理所選資料"),
-        "requesting": (0.15, "2/6 等待AI初稿"),
-        "receiving": (0.35, f"2/6 接收初稿（已收到{received_chars:,}個字元）"),
-        "validating": (0.40, "3/6 整理正文與來源清單"),
-        "saving_initial": (0.45, "3/6 保存初稿"),
-        "reviewing": (0.65, f"4/6 獨立審稿：核對數字、日期與來源（已收到{received_chars:,}個字元）"),
-        "ready": (0.85, "5/6 準備保存審稿結果"),
-        "saving": (0.95, "5/6 保存審稿版本"),
-        "saved": (1.0, "6/6 報告已保存"),
+        "preparing": (0.05, "5/5 核對研究資料與寫作範圍"),
+        "requesting": (0.15, "5/5 等待AI初稿"),
+        "receiving": (0.35, f"5/5 接收初稿（已收到{received_chars:,}個字元）"),
+        "validating": (0.40, "5/5 核對正文與來源清單"),
+        "saving_initial": (0.45, "5/5 保存初稿"),
+        "reviewing": (0.65, f"5/5 實質審稿：核對證據、比較與結論（已收到{received_chars:,}個字元）"),
+        "ready": (0.85, "5/5 準備保存審稿結果"),
+        "saving": (0.95, "5/5 保存審稿版本"),
+        "saved": (1.0, "5/5 報告已保存"),
     }
     value, label = steps.get(stage, steps["requesting"])
     bar.progress(value, text=f"{label} · 已用{int(elapsed)}秒")
@@ -75,13 +78,193 @@ def _sources_preview(sources):
                 st.link_button(f"來源原文（{source['id']}）", source["url"])
 
 
+def _source_fingerprint(source):
+    """Bind an observation to content rather than a reusable S-number."""
+    fields = ("article_id", "title", "publisher", "url", "publication_date", "observation_date", "content")
+    payload = {field: source.get(field) for field in fields}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _bound_observations(sources, observations):
+    by_id = {source["id"]: source for source in sources}
+    accepted, stale = [], 0
+    for row in observations:
+        source = by_id.get(row.get("source_id")) if isinstance(row, dict) else None
+        if source is None or row.get("source_fingerprint") != _source_fingerprint(source):
+            stale += 1
+            continue
+        accepted.append({key: value for key, value in row.items() if key != "source_fingerprint"})
+    return accepted, stale
+
+
+def _merge_evidence(existing, added):
+    """A failed refresh must not discard previously fetched documents."""
+    records = {}
+    for item in [*existing, *added]:
+        marker = item.get("title") or item.get("url")
+        records[marker] = item
+    return list(records.values())
+
+
+def _prepare_selection(by_id, chosen_ids, evidence):
+    sources = prepare_sources([by_id[key] for key in chosen_ids]) if chosen_ids else []
+    return prepare_evidence(sources, evidence) if evidence else sources
+
+
+def _research_brief(topic, sources, as_of):
+    rows, stale = _bound_observations(sources, st.session_state.get("research_observations", []))
+    brief = build_research_brief(topic, sources, observations=rows, as_of=as_of)
+    return brief, stale
+
+
+def _requirements_checklist(brief):
+    labels = {"fulfilled": "已具備", "candidate": "待提取與核對", "missing": "缺少"}
+    st.caption(f"證據規格：{brief['profile']['label']}。來源提到主題只算候選；須有可追溯的數值、單位、觀測期與口徑才計為齊備。")
+    for item in brief["requirements"]:
+        source_ids = "、".join(f"[{value}]" for value in item.get("source_ids", []))
+        st.write(f"{labels.get(item['status'], item['status'])}｜{item['label']} {source_ids}")
+        st.caption(item.get("reason", ""))
+
+
+def _fetch_supplements(keys):
+    with st.spinner("讀取選定網頁及PDF摘錄…"):
+        outcome = collect_evidence(keys)
+    st.session_state["research_official_evidence"] = _merge_evidence(
+        st.session_state.get("research_official_evidence", []), outcome["evidence"])
+    st.session_state["research_evidence_status"] = outcome["sources"]
+    st.session_state["research_pending_evidence_keys"] = list(keys)
+    _flash(f"取得{len(outcome['evidence'])}份補充資料；已保留先前成功取得的資料，請核對內容及觀測期。")
+    st.rerun()
+
+
+def _remember_observations(sources, rows):
+    source_map = {source["id"]: source for source in sources}
+    records = {}
+    for row in [*st.session_state.get("research_observations", []), *[
+            {**row, "source_fingerprint": _source_fingerprint(source_map[row["source_id"]])}
+            for row in rows if row.get("source_id") in source_map]]:
+        marker = tuple(row.get(key) for key in ("source_fingerprint", "source_id", "requirement_id",
+                       "metric", "unit", "period", "scope", "group"))
+        records[marker] = row
+    st.session_state["research_observations"] = list(records.values())
+
+
+def _preparation_context(topic, sources):
+    return (topic, tuple((source["id"], _source_fingerprint(source)) for source in sources))
+
+
+def _warning_message(warning):
+    return warning.get("message", "資料仍需核對。") if isinstance(warning, dict) else str(warning)
+
+
+def _organize_data(*, topic, sources, as_of, brief, provider, model, api_key, analysis_available):
+    st.markdown("**4．整理數據與比較**")
+    st.caption("AI可先提取原文觀測值；程式再核對連續原文、數值、單位、觀測期與統計口徑，僅比較口徑一致的數據。通過錨點檢查仍需核對原始來源。")
+    if st.button("AI整理證據與數據", key="research_organize_data",
+                 disabled=not analysis_available or not sources or not topic.strip()):
+        bar = st.progress(0.0, text="4/5 準備整理來源中的數據")
+
+        def update(stage, received_chars, elapsed):
+            labels = {"preparing": "準備數據提取", "requesting": "等待AI提取觀測值",
+                      "receiving": f"接收觀測值（{received_chars:,}個字元）", "validating": "核對原文並計算可比變化"}
+            bar.progress(0.8 if stage == "validating" else 0.4,
+                         text=f"4/5 {labels.get(stage, '整理數據')} · 已用{int(elapsed)}秒")
+
+        try:
+            result = run_generation(
+                lambda **kwargs: extract_research_observations(topic, sources, api_key=api_key, provider=provider,
+                    model=model, as_of=as_of, **kwargs), update, timeout=180)
+            _remember_observations(sources, result["observations"])
+            st.session_state["research_preparation"] = {
+                "context": _preparation_context(topic, sources), "summary": result.get("preparation", {}),
+                "warnings": result.get("warnings", [])}
+            _flash("數據整理完成；請核對表格與原文，並補充尚缺的必要證據。")
+            st.rerun()
+        except Exception as error:
+            bar.empty()
+            st.error(_safe_message(error))
+    preparation = st.session_state.get("research_preparation", {})
+    if preparation.get("context") == _preparation_context(topic, sources):
+        summary = preparation.get("summary", {})
+        st.caption(f"上次AI整理：建議{summary.get('suggested_count', 0)}筆，通過原文錨點檢查{summary.get('accepted_count', 0)}筆；尚未人工驗證。")
+        for warning in preparation.get("warnings", []):
+            st.warning(_warning_message(warning))
+    with st.expander("手動整理或補充一筆觀測值"):
+        st.caption("逐字貼上包含指標、數字、單位、範圍和期間的連續原文；指標、單位、範圍及分組名稱均使用原文用詞。觀測期可來自來源的觀測日期欄位，不能用發布日或擷取日代替。")
+        source_map = {source["id"]: source for source in sources}
+        requirements = {item["id"]: item["label"] for item in brief["requirements"]
+                        if item["id"] != "historical_comparison"}
+        with st.form("research_add_observation"):
+            source_id = st.selectbox("引用來源", list(source_map), key="research_observation_source",
+                format_func=lambda key: f"[{key}] {source_map[key]['title']}", disabled=not sources)
+            requirement = st.selectbox("對應必要證據", list(requirements), key="research_observation_requirement",
+                                      format_func=lambda key: requirements[key])
+            metric = st.text_input("指標（原文名稱）", key="research_observation_metric")
+            value = st.text_input("數值（十進制，不含單位或千分位）", key="research_observation_value")
+            unit = st.text_input("單位（原文用詞）", key="research_observation_unit")
+            period = st.text_input("觀測期（YYYY-MM-DD、YYYY-MM或YYYYQn）", key="research_observation_period")
+            scope = st.text_input("統計範圍／分母／樣本（原文用詞）", key="research_observation_scope")
+            group = st.text_input("比較分組（可選，使用原文用詞）", key="research_observation_group")
+            excerpt = st.text_area("逐字原文摘錄", height=110, key="research_observation_excerpt")
+            if st.form_submit_button("核對並加入觀測值", disabled=not sources):
+                row = {"source_id": source_id, "requirement_id": requirement, "metric": metric, "value": value,
+                       "unit": unit, "period": period, "scope": scope, "evidence_text": excerpt}
+                if group.strip():
+                    row["group"] = group
+                checked = build_research_brief(topic, sources, observations=[row], as_of=as_of)
+                if checked["observations"]:
+                    _remember_observations(sources, checked["observations"])
+                    _flash("已加入通過原文錨點檢查的觀測值；來源與統計口徑仍需人工核對。")
+                    st.rerun()
+                else:
+                    for warning in checked["warnings"]:
+                        st.warning(_warning_message(warning))
+                    if not checked["warnings"]:
+                        st.warning("觀測值未通過檢查，請補齊數值、單位、期間、口徑及逐字原文。")
+    if st.button("清除已整理觀測值", key="research_clear_observations",
+                 disabled=not st.session_state.get("research_observations")):
+        st.session_state["research_observations"] = []
+        st.session_state.pop("research_preparation", None)
+        st.rerun()
+    brief, stale = _research_brief(topic, sources, as_of)
+    if stale:
+        st.warning(f"{stale}筆觀測值所引用的來源已改變或未選入，已排除，請按本次來源重新整理；來源編號不能沿用為新證據。")
+    for warning in brief.get("warnings", []):
+        st.warning(_warning_message(warning))
+    if brief["observations"]:
+        st.caption("通過原文錨點檢查的數據（可在來源預覽逐字核對）")
+        st.dataframe([{ "引用": f"[{row['source_id']}]", "證據項目": row["requirement_id"],
+                        "指標": row["metric"], "數值": row["value"], "單位": row["unit"],
+                        "觀測期": row["period"], "統計範圍": row["scope"], "分組": row.get("group", ""),
+                        "原文摘錄": row["evidence_text"]} for row in brief["observations"]], hide_index=True)
+    else:
+        st.info("尚無通過原文錨點檢查的觀測值。可先按「AI整理證據與數據」，再手動補齊缺口。")
+    if brief["comparisons"]:
+        st.caption("同指標、單位、範圍與分組的期間比較；百分比指標的絕對變化以百分點表示，相對變化另列。算式及引用隨報告保存。")
+        st.dataframe([{"指標": row["metric"], "單位": row["unit"], "統計範圍": row["scope"],
+                       "分組": row.get("group", ""), "起期": row["from_period"], "起值": row["from_value"],
+                       "迄期": row["to_period"], "迄值": row["to_value"], "變化（原單位／百分點）": row["change"],
+                       "相對變化（%）": row.get("percent_change"), "算式": row["formula"],
+                       "引用": "、".join(f"[{key}]" for key in row["source_ids"])}
+                      for row in brief["comparisons"]], hide_index=True)
+    else:
+        st.caption("目前沒有可比期間；補充同指標、同單位和同統計範圍的另一觀測期後，才會計算變化。")
+    return brief
+
+
 def _generate(*, provider, model, api_key, investat_token, analysis_available):
     today = datetime.now(timezone(timedelta(hours=8))).date()
+    pending = st.session_state.pop("research_pending_evidence_keys", None)
+    if pending is not None:
+        st.session_state["research_use_evidence"] = True
+        selected = st.session_state.get("research_official_keys", [])
+        st.session_state["research_official_keys"] = list(dict.fromkeys([*selected, *pending]))
+    st.markdown("**1．按主題篩選來源**")
     topic = st.text_input("研究主題", value="行業擁擠度與美股槓桿集中度", key="research_topic")
     left, right = st.columns(2)
     start = left.date_input("新聞起始日期", value=today - timedelta(days=30), key="research_start")
     end = right.date_input("新聞結束日期", value=today, key="research_end")
-    keywords = st.text_input("選材關鍵字（逗號分隔，留空顯示全部）", value="擁擠,集中,槓桿,融資,科技,AI", key="research_keywords")
+    keywords = st.text_input("補充選材關鍵字（逗號分隔）", value="", key="research_keywords")
     available = [source for source in load_sources() if source.enabled]
     names = {source.id: source.name for source in available}
     names["investat"] = "Investat／機構研究"
@@ -110,14 +293,24 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
     articles = [item for item in articles if _origins(item) & set(selected_sources)]
     include_unknown = st.checkbox("包括發布日期未知的新聞", value=False, key="research_unknown_dates")
     try:
-        filtered = filter_articles(articles, keywords=keywords, start_date=start, end_date=end)
+        filtered = filter_articles(articles, start_date=start, end_date=end)
         if include_unknown:
-            filtered += filter_articles([item for item in articles if not item.get("published_at")], keywords=keywords)
+            filtered += filter_articles([item for item in articles if not item.get("published_at")])
     except ResearchError as error:
         st.warning(str(error))
         filtered = []
-    usable = [item for item in filtered if item.get("content_scope") not in {"title_only", "filing_notice"}
-              and (item.get("content") or item.get("summary"))][:200]
+    ranked = rank_articles([item for item in filtered if item.get("content_scope") not in {"title_only", "filing_notice"}
+                           and (item.get("content") or item.get("summary"))], topic, keywords=keywords, include_unrelated=True)
+    show_all = st.checkbox("顯示日期範圍內所有可用新聞（包括主題不匹配者）", value=False,
+                           key="research_show_all_articles")
+    suggestions = [item for item in ranked if item["score"] > 0]
+    visible = ranked if show_all else suggestions
+    usable = [item["article"] for item in visible[:200]]
+    suggested_ids = [str(item["article"]["id"]) for item in suggestions[:8]]
+    st.caption("候選按研究主題與補充關鍵字排序；推薦分數代表內容相關性，不代表證據已足夠。")
+    for recommendation in suggestions[:8]:
+        reason = "；".join(recommendation.get("reasons", []))
+        st.caption(f"推薦｜{recommendation['article']['title']}｜{reason}")
     by_id = {str(item["id"]): item for item in usable}
     if "research_article_ids" in st.session_state:
         previous = st.session_state["research_article_ids"]
@@ -125,30 +318,47 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         if valid != previous:
             st.session_state["research_article_ids"] = valid
     pick, clear = st.columns(2)
-    pick.button("選取前8篇候選", key="research_select_articles", disabled=not by_id,
-                on_click=_select_articles, args=(list(by_id)[:8],))
+    pick.button("選取最多8篇主題候選", key="research_select_articles", disabled=not suggested_ids,
+                on_click=_select_articles, args=(suggested_ids,))
     clear.button("清除選材", key="research_clear_articles", disabled=not st.session_state.get("research_article_ids"),
                  on_click=_select_articles, args=([],))
     chosen_ids = st.multiselect("確認報告選材（最多30篇）", list(by_id),
-                               default=None if "research_article_ids" in st.session_state else list(by_id)[:8],
+                               default=None if "research_article_ids" in st.session_state else suggested_ids,
                                format_func=lambda key: f"{by_id[key].get('published_at') or '日期未知'}｜{by_id[key]['title']}",
                                key="research_article_ids", max_selections=30)
-    st.caption(f"找到{len(usable)}篇可用候選；僅標題及SEC申報通知不作研究正文。沒有結果時可調整日期或關鍵字。")
+    st.caption(f"找到{len(usable)}篇可用候選；主題匹配共{len(suggestions)}篇。僅標題及SEC申報通知不作研究正文。沒有結果時可調整日期或關鍵字，或開啟顯示全部。")
 
+    st.markdown("**2．檢查必要證據是否齊全**")
+    topic_defaults = build_research_brief(topic, [], as_of=today.isoformat())["recommended_catalog_keys"]
+    current_official_keys = st.session_state.get("research_official_keys", topic_defaults)
+    evidence = []
+    if st.session_state.get("research_use_evidence", False):
+        evidence = [item for item in st.session_state.get("research_official_evidence", [])
+                    if item.get("title") in {CATALOG[key][0] for key in current_official_keys if key in CATALOG}]
+        evidence += st.session_state.get("research_manual_evidence", [])
+    try:
+        sources = _prepare_selection(by_id, chosen_ids, evidence)
+    except ResearchError as error:
+        st.warning(str(error))
+        sources = []
+    brief, _ = _research_brief(topic, sources, today.isoformat())
+    _requirements_checklist(brief)
+
+    st.markdown("**3．補充資料**")
+    recommended_keys = [key for key in brief["recommended_catalog_keys"] if key in CATALOG]
+    if recommended_keys:
+        st.caption("依缺口建議：" + "、".join(CATALOG[key][0] for key in recommended_keys))
+    if st.button("按缺口讀取建議公開資料", key="research_fetch_recommended", disabled=not recommended_keys):
+        _fetch_supplements(recommended_keys)
     extra = st.checkbox("加入公開核對資料或手動證據", value=False, key="research_use_evidence")
     evidence = []
     if extra:
         st.caption("補充來源與新聞分開標示。自動摘錄方便核對，並不等於數字已經過人工驗證。")
-        official_keys = st.multiselect("公開資料", list(CATALOG), default=list(CATALOG),
+        official_keys = st.multiselect("公開資料", list(CATALOG),
+                                      default=None if "research_official_keys" in st.session_state else topic_defaults,
                                       format_func=lambda key: CATALOG[key][0], key="research_official_keys")
         if st.button("讀取公開核對資料", key="research_fetch_evidence", disabled=not official_keys):
-            with st.spinner("讀取選定網頁及PDF摘錄…"):
-                outcome = collect_evidence(official_keys)
-            st.session_state["research_official_evidence"] = outcome["evidence"]
-            for status in outcome["sources"]:
-                if status["status"] == "error":
-                    st.warning(f"{status['name']}：{status['error']}")
-            st.success(f"取得{len(outcome['evidence'])}份補充資料；請在下方確認內容和日期。")
+            _fetch_supplements(official_keys)
         evidence += [item for item in st.session_state.get("research_official_evidence", [])
                      if item.get("title") in {CATALOG[key][0] for key in official_keys}]
         with st.expander("手動加入資料、圖表數字或原文摘錄"):
@@ -165,16 +375,19 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                                 "publication_date": published, "observation_date": observed,
                                 "content": content, "source_type": "manual"}
                         st.session_state.setdefault("research_manual_evidence", []).append(item)
-                        st.success("已加入本次證據。")
+                        _flash("已加入本次證據；請在數據整理步驟提取可追溯的觀測值。")
+                        st.rerun()
                     else:
                         st.warning("請提供標題與正文。")
             if st.button("清除手動補充證據", key="research_clear_evidence"):
                 st.session_state["research_manual_evidence"] = []
+                st.rerun()
         evidence += st.session_state.get("research_manual_evidence", [])
+    for status in st.session_state.get("research_evidence_status", []):
+        if status["status"] == "error":
+            st.warning(f"{status['name']}：{status['error']}；先前成功取得的資料已保留。")
     try:
-        sources = prepare_sources([by_id[key] for key in chosen_ids]) if chosen_ids else []
-        if evidence:
-            sources = prepare_evidence(sources, evidence)
+        sources = _prepare_selection(by_id, chosen_ids, evidence)
     except ResearchError as error:
         st.warning(str(error))
         sources = []
@@ -185,19 +398,33 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("本次只使用公開核對資料或手動證據，尚未選入RSS／Investat新聞。若希望結合新聞分析，請先選取上方的報告選材。")
     with st.expander(f"預覽即將送給AI的資料（{len(sources)}個來源）", expanded=False):
         _sources_preview(sources)
+    brief = _organize_data(topic=topic, sources=sources, as_of=today.isoformat(), brief=brief,
+        provider=provider, model=model, api_key=api_key, analysis_available=analysis_available)
+    st.markdown("**5．寫作及實質審稿**")
+    report_label = st.radio("報告模式", ["完整研究報告（建議）", "資料缺口簡報"], key="research_report_mode",
+                            help="完整研究報告須通過必要證據檢查；資料缺口簡報會明確列出欠缺資料和下一步，不能當作完整研究結論。")
+    report_mode = "gap" if report_label == "資料缺口簡報" else "research"
+    missing = [item["label"] for item in brief["requirements"] if item["id"] in brief["missing_required"]]
+    if brief["ready"]:
+        st.success("必要證據已具備可追溯觀測值，可進入寫作與實質審稿；結論仍須審查原始資料與適用範圍。")
+    elif report_mode == "research":
+        st.warning("完整研究報告尚缺：" + "、".join(missing) + "。請回到補充資料及數據整理，或明確選擇「資料缺口簡報」。")
+    else:
+        st.info("本次將保存為「資料缺口簡報」；尚缺：" + "、".join(missing) + "。正文會限制結論，並列出補充資料步驟。")
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
-    st.caption("先寫作並保存初稿，再獨立審稿，通常調用2次AI。正文與來源編號分開生成；引用問題標成待核對，全文仍可修改和匯出。")
+    st.caption("數據整理通常調用1次AI；寫作並保存初稿，再獨立實質審稿，通常另調用2次AI。審稿會檢查必要證據、數據比較與結論是否相符，全文仍可修改和匯出。")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
     if not sources:
-        st.info("請先在「確認報告選材」選擇新聞，可點「選取前8篇候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
+        st.info("請先在「確認報告選材」選擇新聞，可點「選取最多8篇主題候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
     if not analysis_available:
         st.info("請在左側輸入所選AI服務商的API key並按Enter，並確認模型設定有效，才能生成報告。")
     if not topic.strip():
         st.info("請先填寫研究主題，才能生成報告。")
-    if st.button("生成並保存報告草稿", type="primary", key="research_generate",
-                 disabled=not analysis_available or not sources or not topic.strip()):
-        bar = st.progress(0.0, text="1/6 準備生成報告")
+    button_label = "生成並保存資料缺口簡報" if report_mode == "gap" else "生成並保存完整研究報告"
+    if st.button(button_label, type="primary", key="research_generate",
+                 disabled=not analysis_available or not sources or not topic.strip() or (report_mode == "research" and not brief["ready"])):
+        bar = st.progress(0.0, text="5/5 準備寫作與實質審稿")
         st.caption("進度按處理步驟顯示；寫作與審稿共用360秒整體等待上限。初稿會先保存，審稿失敗仍可繼續編輯。")
         initial = None
         try:
@@ -210,6 +437,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             def metadata_for(draft):
                 return {**draft.get("metadata", {}), "source_count": len(sources),
+                        "report_mode": report_mode, "research_brief": brief,
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
                         "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
@@ -226,7 +454,8 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             draft = run_generation(
                 lambda **kwargs: generate_research_workflow(topic, sources, api_key=api_key, provider=provider,
-                    model=model, as_of=today.isoformat(), instructions=instructions, **kwargs),
+                    model=model, as_of=today.isoformat(), instructions=instructions,
+                    research_brief=brief, report_mode=report_mode, **kwargs),
                 update, on_artifact=save_writer, timeout=360)
             if initial is None:
                 save_writer(draft)
@@ -331,6 +560,16 @@ def _library():
         st.warning("其他頁面已保存新版本。你的編輯仍保留；先複製需要的文字，再載入最新版本合併修改。")
     st.caption(f"已保存版本v{report['version']} · {report['provider']}／{report['model']} · 修改不會調用AI或覆蓋原始草稿。")
     metadata = report.get("metadata", {})
+    if metadata.get("report_mode") == "gap":
+        st.warning("報告模式：資料缺口簡報。必要證據尚未齊備，不可視為完整研究結論；修改標題或正文不會改變此保存狀態。")
+    elif metadata.get("report_mode") == "research":
+        st.caption("報告模式：完整研究報告；必要證據通過原文錨點檢查，仍須人工核對來源及結論。")
+    saved_brief = metadata.get("research_brief")
+    if isinstance(saved_brief, dict) and saved_brief.get("requirements"):
+        with st.expander("本次必要證據、數據與比較"):
+            _requirements_checklist(saved_brief)
+            st.caption(f"保存觀測值{len(saved_brief.get('observations', []))}筆；可比變化{len(saved_brief.get('comparisons', []))}組。")
+            st.json({"observations": saved_brief.get("observations", []), "comparisons": saved_brief.get("comparisons", [])})
     status = metadata.get("review_status")
     reviewed_version = metadata.get("reviewed_version")
     if not isinstance(status, str):
@@ -417,7 +656,7 @@ def _library():
 
 def render_research_tab(*, provider, model, api_key, investat_token, analysis_available):
     st.subheader("研究報告")
-    st.caption("選材 → 確認證據 → AI草稿 → 你的修改 → 保存版本與匯出")
+    st.caption("按主題篩選來源 → 檢查必要證據 → 補充資料 → 整理數據與比較 → 寫作及實質審稿")
     message = st.session_state.pop("research_flash", None)
     if message:
         st.success(message)

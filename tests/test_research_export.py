@@ -86,6 +86,12 @@ def raw_fallback_report():
 
 
 class ResearchExportTests(unittest.TestCase):
+    def test_gap_mode_label_survives_manual_title_and_body_replacement(self):
+        report = edited_report()
+        report['metadata'] = {'report_mode': 'gap', 'review_status': 'needs_review', 'quality_status': 'evidence_gap'}
+        self.assertIn('報告類型：資料缺口簡報', export_markdown(report).decode('utf-8'))
+        self.assertIn('報告類型：資料缺口簡報', export_html(report).decode('utf-8'))
+
     def test_raw_fallback_indented_markdown_and_fences_remain_inert_in_html(self):
         report, raw = raw_fallback_report()
         exported = export_html(report).decode('utf-8')

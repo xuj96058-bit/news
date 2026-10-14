@@ -35,7 +35,7 @@ class ResearchUiHarness:
         inbox = MagicMock()
         self.inbox = inbox
         inbox.stats.return_value = {'total': 1, 'analyzed': 0}
-        inbox.export_articles.return_value = [{'id': 1, 'title': '科技AI持倉', 'summary': '機構科技持倉上升。',
+        inbox.export_articles.return_value = [{'id': 1, 'title': '行業擁擠度與科技AI持倉', 'summary': '機構科技持倉上升。',
             'content': '', 'content_scope': 'summary', 'url': 'https://example.org/article',
             'published_at': datetime.now(timezone.utc).isoformat(), 'source_id': 'test',
             'source_name': 'Test RSS', 'source_kind': 'media', 'sources': [
@@ -75,9 +75,12 @@ class ResearchUiHarness:
             return store.create_report(topic=title, title=title, body=body, sources=[],
                                        provider='deepseek', model='deepseek-v4-pro', as_of='2026-10-14')
 
-    def app(self):
+    def app(self, report_mode='gap'):
         app = AppTest.from_file(str(APP), default_timeout=10).run()
         self.assertEqual(len(app.exception), 0)
+        if report_mode == 'gap':
+            app.radio(key='research_report_mode').set_value('資料缺口簡報').run()
+            self.assertEqual(len(app.exception), 0)
         return app
 
 
@@ -161,7 +164,7 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         rss['sources'].append({'source_id': 'investat', 'source_name': 'Investat',
                                'source_kind': 'research', 'title': rss['title'], 'url': rss['url']})
         self.inbox.export_articles.return_value.append({
-            'id': 2, 'title': 'AI科技融資研究', 'summary': 'Synthetic distinct financing excerpt.',
+            'id': 2, 'title': '行業槓桿與AI科技融資研究', 'summary': 'Synthetic distinct financing excerpt.',
             'content': '', 'content_scope': 'snippet', 'url': 'https://example.org/investat-study',
             'published_at': datetime.now(timezone.utc).isoformat(), 'source_id': 'investat',
             'source_name': 'Investat', 'source_kind': 'research', 'sources': []})
@@ -466,6 +469,162 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         self.assertEqual(app.text_area(key=f"research_editor_body_{report['id']}").value, '我的未保存修改')
         with ResearchStore(self.db) as store:
             self.assertEqual(store.get_report(report['id'])['version'], 2)
+        self.generator.assert_not_called()
+
+
+class ResearchPreparationUiTests(ResearchUiHarness, unittest.TestCase):
+    def test_default_complete_report_requires_specific_evidence_despite_relevant_news(self):
+        app = self.app(report_mode='research')
+        self.assertEqual(app.radio(key='research_report_mode').value, '完整研究報告（建議）')
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        self.assertTrue(app.button(key='research_generate').disabled)
+        warning = ' '.join(item.value for item in app.warning)
+        for required in ('行業持倉與擁擠度', 'FINRA', 'SEC', '同口徑歷史比較'):
+            self.assertIn(required, warning)
+        self.generator.assert_not_called()
+
+        app.radio(key='research_report_mode').set_value('資料缺口簡報').run()
+        self.assertFalse(app.button(key='research_generate').disabled)
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        arguments = self.generator.call_args.kwargs
+        self.assertEqual(arguments['report_mode'], 'gap')
+        self.assertFalse(arguments['research_brief']['ready'])
+        with ResearchStore(self.db) as store:
+            report = store.list_reports()[0]
+        self.assertEqual(report['metadata']['report_mode'], 'gap')
+        self.assertTrue(any('報告模式：資料缺口簡報' in item.value for item in app.warning))
+
+    def test_unrelated_articles_require_show_all_and_are_never_quick_selected(self):
+        unrelated = {**self.inbox.export_articles.return_value[0], 'id': 2, 'title': '城市公園春季園藝',
+                     'summary': '市民學習種植花卉。', 'url': 'https://example.org/garden'}
+        self.inbox.export_articles.return_value.append(unrelated)
+        app = self.app(report_mode='research')
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        self.assertEqual(len(app.multiselect(key='research_article_ids').options), 1)
+        self.assertTrue(any('推薦｜' in item.value and '主題詞' in item.value for item in app.caption))
+        app.checkbox(key='research_show_all_articles').check().run()
+        self.assertEqual(len(app.multiselect(key='research_article_ids').options), 2)
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        app.button(key='research_clear_articles').click().run()
+        app.button(key='research_select_articles').click().run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
+        self.assertEqual(len(app.exception), 0)
+
+    def test_unrelated_topic_has_no_automatic_catalog_selection(self):
+        app = self.app(report_mode='research')
+        app.text_input(key='research_topic').input('火星探測').run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, [])
+        self.assertTrue(app.button(key='research_fetch_recommended').disabled)
+        app.checkbox(key='research_use_evidence').check().run()
+        self.assertEqual(app.multiselect(key='research_official_keys').value, [])
+        self.assertEqual(len(app.exception), 0)
+
+    def test_gap_fetch_preserves_previous_success_when_refresh_fails(self):
+        evidence = {'title': ui.CATALOG['finra'][0], 'content': 'FINRA margin balances excerpt.',
+                    'source_type': 'official', 'publisher': 'FINRA', 'url': ui.CATALOG['finra'][1]}
+        collector = self.patch('src.research_ui.collect_evidence', side_effect=[
+            {'evidence': [evidence], 'sources': [{'id': 'finra', 'status': 'ok', 'name': 'FINRA'},
+                {'id': 'sec_pf', 'status': 'error', 'name': 'SEC', 'error': 'Synthetic fetch failure'}]},
+            {'evidence': [], 'sources': [{'id': 'finra', 'status': 'error', 'name': 'FINRA',
+                                         'error': 'Synthetic refresh failure'}]}])
+        app = self.app(report_mode='research')
+        app.button(key='research_fetch_recommended').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.checkbox(key='research_use_evidence').value)
+        self.assertEqual(set(collector.call_args.args[0]), {'sector_pack', 'finra', 'sec_pf'})
+        self.assertEqual(len(app.session_state['research_official_evidence']), 1)
+        self.assertTrue(any('待提取與核對｜FINRA' in item.value for item in app.markdown))
+        self.assertTrue(any('Synthetic fetch failure' in item.value for item in app.warning))
+        app.button(key='research_fetch_recommended').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state['research_official_evidence'], [evidence])
+        self.assertTrue(any('先前成功取得的資料已保留' in item.value for item in app.warning))
+        self.assertTrue(any('公開核對資料1份' in item.value for item in app.caption))
+        self.assertTrue(app.button(key='research_generate').disabled)
+
+    def _generic_data_app(self):
+        article = self.inbox.export_articles.return_value[0]
+        article.update(title='AI revenue', content_scope='provided_text', summary='',
+            content='AI revenue for US sample was 10 USD billion in 2026-08. '
+                    'AI revenue for US sample was 12 USD billion in 2026-09.')
+        app = self.app(report_mode='research')
+        app.text_input(key='research_topic').input('AI revenue').run()
+        app.button(key='research_select_articles').click().run()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        return app
+
+    def _observation(self, period='2026-08', value='10'):
+        return {'source_id': 'S1', 'requirement_id': 'generic_data', 'metric': 'AI revenue',
+                'value': value, 'unit': 'USD billion', 'period': period, 'scope': 'US sample',
+                'evidence_text': f'AI revenue for US sample was {value} USD billion in {period}.'}
+
+    def test_manual_observations_validate_anchors_and_show_comparable_periods(self):
+        app = self._generic_data_app()
+        self.assertTrue(app.button(key='research_generate').disabled)
+        for period, value in [('2026-08', '10'), ('2026-09', '12')]:
+            app.selectbox(key='research_observation_source').select('S1')
+            app.selectbox(key='research_observation_requirement').select('generic_data')
+            for key, item in {'metric': 'AI revenue', 'value': value, 'unit': 'USD billion',
+                              'period': period, 'scope': 'US sample'}.items():
+                app.text_input(key='research_observation_' + key).input(item)
+            app.text_area(key='research_observation_excerpt').input(self._observation(period, value)['evidence_text'])
+            next(item for item in app.button if item.label == '核對並加入觀測值').click().run()
+            self.assertEqual(len(app.exception), 0)
+        self.assertFalse(app.button(key='research_generate').disabled)
+        self.assertEqual(len(app.dataframe), 2)
+        self.assertEqual(list(app.dataframe[1].value['變化（原單位／百分點）']), ['2'])
+        self.assertEqual(list(app.dataframe[1].value['相對變化（%）']), ['20'])
+        app.button(key='research_generate').click().run()
+        self.assertEqual(self.generator.call_args.kwargs['report_mode'], 'research')
+        self.assertTrue(self.generator.call_args.kwargs['research_brief']['ready'])
+
+    def test_invalid_manual_excerpt_does_not_unlock_generation(self):
+        app = self._generic_data_app()
+        app.selectbox(key='research_observation_source').select('S1')
+        app.selectbox(key='research_observation_requirement').select('generic_data')
+        for key, item in {'metric': 'AI revenue', 'value': '999', 'unit': 'USD billion',
+                          'period': '2026-08', 'scope': 'US sample'}.items():
+            app.text_input(key='research_observation_' + key).input(item)
+        app.text_area(key='research_observation_excerpt').input('AI revenue for US sample was 999 USD billion in 2026-08.')
+        next(item for item in app.button if item.label == '核對並加入觀測值').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.button(key='research_generate').disabled)
+        self.assertTrue(any('完整原句' in item.value for item in app.warning), [item.value for item in app.warning])
+        self.generator.assert_not_called()
+
+    def test_observation_cannot_rebind_to_new_source_that_reuses_s1(self):
+        app = self._generic_data_app()
+        original = ui.prepare_sources(self.inbox.export_articles.return_value)[0]
+        app.session_state['research_observations'] = [{**self._observation(),
+            'source_fingerprint': ui._source_fingerprint(original)}]
+        app.run()
+        self.assertFalse(app.button(key='research_generate').disabled)
+        replacement = {**self.inbox.export_articles.return_value[0], 'id': 2, 'title': 'AI revenue revision',
+                       'content': original['content'] + ' Different data revision.', 'url': 'https://example.org/revised'}
+        self.inbox.export_articles.return_value = [replacement]
+        app.run()
+        app.multiselect(key='research_article_ids').set_value(['2']).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.button(key='research_generate').disabled)
+        self.assertTrue(any('來源已改變' in item.value for item in app.warning))
+
+    def test_ai_preparation_saves_only_accepted_bound_rows_and_displays_rejections(self):
+        app = self._generic_data_app()
+        sources = ui.prepare_sources(self.inbox.export_articles.return_value)
+        result = ui.build_research_brief('AI revenue', sources, observations=[self._observation()], as_of='2026-10-14')
+        result['preparation'] = {'suggested_count': 2, 'accepted_count': 1, 'manually_verified': False}
+        result['warnings'] = [{'code': 'unanchored_value', 'message': 'Synthetic rejected row', 'observation': 2}]
+        extractor = self.patch('src.research_ui.extract_research_observations', return_value=result)
+        app.button(key='research_organize_data').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.session_state['research_observations']), 1)
+        self.assertIn('source_fingerprint', app.session_state['research_observations'][0])
+        self.assertTrue(any('建議2筆，通過原文錨點檢查1筆' in item.value for item in app.caption))
+        self.assertTrue(any('Synthetic rejected row' in item.value for item in app.warning))
+        self.assertFalse(app.button(key='research_generate').disabled)
+        extractor.assert_called_once()
         self.generator.assert_not_called()
 
 

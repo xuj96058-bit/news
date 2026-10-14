@@ -11,7 +11,8 @@ from requests.exceptions import ReadTimeout
 from src.analysis_errors import ProviderAPIError, ProviderConfigurationError
 from src.llm_providers import PROVIDERS
 from src.research import MAX_RESPONSE_CHARS, ResearchError, prepare_sources
-from src.research_workflow import generate_research_workflow
+from src.research_quality import build_research_brief
+from src.research_workflow import ResearchEvidenceError, generate_research_workflow
 
 
 KEY = "synthetic-workflow-key"
@@ -72,6 +73,19 @@ def client_with(*responses):
     client = MagicMock()
     client.chat.completions.create.side_effect = list(responses)
     return client
+
+
+def numeric_evidence():
+    evidence = sources()
+    quotes = ["Gross financing for US industry was 20 USD billion in 2026-08.",
+              "Gross financing for US industry was 30 USD billion in 2026-09."]
+    evidence[0]["content"] = " ".join(quotes)
+    observations = [{"source_id": "S1", "requirement_id": "generic_data", "metric": "Gross financing",
+                     "value": value, "unit": "USD billion", "period": period, "scope": "US industry",
+                     "evidence_text": quote}
+                    for value, period, quote in zip(("20", "30"), ("2026-08", "2026-09"), quotes)]
+    return evidence, build_research_brief("US industry financing growth", evidence,
+                                         observations=observations, as_of="2026-10-14")
 
 
 class ResearchWorkflowTests(unittest.TestCase):
@@ -346,6 +360,85 @@ class ResearchWorkflowTests(unittest.TestCase):
         generate_research_workflow("topic", evidence, api_key=KEY, as_of="2026-10-14", client=client)
         self.assertEqual(evidence, previous)
         self.assertNotIn("synthetic-db-secret", str(client.chat.completions.create.call_args_list))
+
+    def test_full_research_rebuilds_gate_and_rejects_forged_ready_before_model(self):
+        client = client_with(Stream(draft()))
+        forged = {"ready": True, "requirements": [], "missing_required": [],
+                  "comparisons": [{"source_ids": ["S999"], "change": "999"}],
+                  "private_metadata": "synthetic-brief-secret", "observations": []}
+        with self.assertRaisesRegex(ResearchEvidenceError, "必要證據"):
+            self.generate(client, research_brief=forged, report_mode="research")
+        client.chat.completions.create.assert_not_called()
+
+    def test_gap_brief_missing_evidence_cannot_be_passed_by_model_empty_findings(self):
+        client = client_with(Stream(draft()), Stream(review()))
+        saved = []
+        result = self.generate(client, research_brief={"ready": True, "observations": []},
+                               report_mode="gap", on_draft=saved.append)
+        self.assertTrue(result["title"].startswith("證據缺口簡報｜"))
+        self.assertIn("尚不構成完整研究結論", result["body"])
+        self.assertIn("研究證據檢查與數據比較", result["body"])
+        self.assertEqual(result["metadata"]["quality_status"], "evidence_gap")
+        self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertFalse(result["metadata"]["research_brief"]["ready"])
+        self.assertTrue(any(item["severity"] == "error" for item in result["metadata"]["review_findings"]))
+        self.assertEqual(saved[0]["metadata"]["quality_status"], "evidence_gap")
+        writer_packet = json.loads(client.chat.completions.create.call_args_list[0].kwargs["messages"][1]["content"])
+        reviewer_packet = json.loads(client.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual(writer_packet["research_brief"], reviewer_packet["research_brief"])
+        self.assertTrue(reviewer_packet["program_findings"])
+        self.assertIn("實質審稿", client.chat.completions.create.call_args_list[1].kwargs["messages"][0]["content"])
+
+    def test_full_research_renders_trusted_data_and_arithmetic_even_if_model_omits_it(self):
+        evidence, brief = numeric_evidence()
+        self.assertTrue(brief["ready"])
+        supplied = {**brief, "comparisons": [{"change": "999", "source_ids": ["S999"]}],
+                    "extra_url": "https://unknown.example/injected", "api_key": "synthetic-brief-secret"}
+        client = client_with(Stream(draft()), Stream(review()))
+        saved = []
+        result = generate_research_workflow("US industry financing growth", evidence, api_key=KEY,
+            as_of="2026-10-14", client=client, research_brief=supplied, report_mode="research", on_draft=saved.append)
+        for snapshot in (saved[0], result):
+            self.assertIn("| 2026-08：20 | 2026-09：30 | 10 | 50% | [S1] |", snapshot["body"])
+            self.assertIn("統計範圍／分母", snapshot["body"])
+            self.assertEqual(snapshot["metadata"]["research_brief"]["comparisons"][0]["change"], "10")
+            self.assertNotIn("unknown.example", snapshot["body"])
+            self.assertNotIn("S999", snapshot["body"])
+        self.assertEqual(result["metadata"]["quality_status"], "reviewed_snapshot")
+        self.assertNotIn("synthetic-brief-secret", str(client.chat.completions.create.call_args_list))
+        packet = json.loads(client.chat.completions.create.call_args_list[0].kwargs["messages"][1]["content"])
+        self.assertEqual(packet["research_brief"]["comparisons"][0]["percent_change"], "50")
+        self.assertNotIn("extra_url", packet["research_brief"])
+        self.assertNotIn("evidence_text", packet["research_brief"]["observations"][0])
+        self.assertIn("evidence_text", result["metadata"]["research_brief"]["observations"][0])
+        self.assertIn(brief["observations"][0]["evidence_text"], packet["sources"][0]["content"])
+
+    def test_calculated_prose_needs_operand_values_and_citations(self):
+        evidence, brief = numeric_evidence()
+        complete = draft(executive_findings=[{"text": "Gross financing for US industry increased from 20 USD billion in 2026-08 to 30 USD billion in 2026-09; change = 30 - 20 = 10 USD billion; relative change = 10 / 20 * 100 = 50%.", "source_ids": ["S1"]}])
+        result = generate_research_workflow("US industry financing growth", evidence, api_key=KEY,
+            as_of="2026-10-14", client=client_with(Stream(complete), Stream(review(complete))), research_brief=brief)
+        self.assertEqual(result["metadata"]["review_status"], "reviewed")
+        unsupported = draft(executive_findings=[{"text": "Gross financing rose 50%.", "source_ids": ["S1"]}])
+        result = generate_research_workflow("US industry financing growth", evidence, api_key=KEY,
+            as_of="2026-10-14", client=client_with(Stream(unsupported), Stream(review(unsupported))), research_brief=brief)
+        self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertIn("calculation_missing_operands", {item["code"] for item in result["metadata"]["validation_warnings"]})
+
+    def test_gap_tables_and_findings_survive_review_failure_and_persistence_precedes_review(self):
+        client = client_with(Stream(draft()), RuntimeError("provider secret " + KEY))
+        saved = []
+
+        def save(result):
+            self.assertEqual(client.chat.completions.create.call_count, 1)
+            self.assertIn("研究證據檢查與數據比較", result["body"])
+            saved.append(result)
+
+        result = self.generate(client, report_mode="gap", on_draft=save)
+        self.assertEqual(result["metadata"]["review_status"], "review_failed")
+        self.assertEqual(result["metadata"]["research_brief"], saved[0]["metadata"]["research_brief"])
+        self.assertIn("必要證據未齊", result["body"])
+        self.assertNotIn(KEY, result["body"])
 
 
 if __name__ == "__main__":

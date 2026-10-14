@@ -31,6 +31,21 @@ class ResearchStoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_quality_brief_and_observation_provenance_survive_save_review_and_edit(self):
+        brief = {"ready": False, "requirements": [{"id": "margin", "status": "candidate"}],
+                 "observations": [{"source_id": "S1", "metric": "Borrowing", "value": "20",
+                                   "evidence_text": "Borrowing was 20 billion", "api_key": "never-save-this"}],
+                 "comparisons": [], "token": "never-save-this-either"}
+        created = self.store.create_report(**report_args(metadata={"research_brief": brief,
+            "report_mode": "gap", "quality_status": "evidence_gap"}))
+        reviewed = self.store.save_review(created["id"], title="Gap brief", body="Editable gap brief",
+            expected_version=1, metadata={"review_status": "needs_review", "quality_status": "evidence_gap"})
+        edited = self.store.save_revision(created["id"], title="My title", body="My text", expected_version=2)
+        self.assertEqual(edited["metadata"]["report_mode"], "gap")
+        self.assertEqual(edited["metadata"]["quality_status"], "evidence_gap")
+        self.assertEqual(edited["metadata"]["research_brief"]["observations"][0]["evidence_text"], "Borrowing was 20 billion")
+        self.assertNotIn("never-save-this", json.dumps(edited))
+
     def test_original_snapshot_and_generation_metadata_persist_after_reopen(self):
         args = report_args()
         created = self.store.create_report(**args)
