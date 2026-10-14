@@ -22,7 +22,7 @@ Windows 安裝依賴後，雙擊專案根目錄的 **`Start-News.cmd`** 即可�
 ## 抓取新聞
 
 ```bash
-# 抓取 18 個已設定來源，預設不呼叫 AI
+# 抓取 26 個已設定來源，預設不呼叫 AI
 python -m src.rss_pipeline
 
 # 列出來源 ID，或只抓指定來源
@@ -34,6 +34,22 @@ python -m src.rss_pipeline --export data/news.jsonl
 ```
 
 設定檔是 `config/news_sources.json`。預設只收 feed 中最近 30 天的項目，每個來源最多 50 則；無日期項目會保留並標示日期未知。用 `--max-age-days 0` 關閉日期篩選，`--limit-per-source` 調整上限。這不是歷史新聞回補：來源 feed 本身可能只保留最近數十條。
+
+### 融資、監管與機構研究 RSS
+
+以下 8 個新增 RSS 已接入共用新聞庫，預設啟用，可在「新聞來源」及「研究報告」選擇。訂閱提供新聞、節目文字與更新通知；完整統計、持倉和圖表仍使用「公開核對資料」中的原頁／PDF。
+
+| 機構 | 來源 ID 與用途 | 官方訂閱說明 |
+|---|---|---|
+| FINRA | `finra_news` 新聞與演講；`finra_notices` 監管公告 | [Follow FINRA](https://www.finra.org/media-center/follow-finra) |
+| SEC | `sec_press` 新聞公告 | [SEC 新聞公告](https://www.sec.gov/newsroom/press-releases) |
+| 聯儲 | `fed_scoos` SCOOS 的 DDP 更新通知；`fed_z1` Z.1 金融帳戶發布與修訂；`fed_notes` FEDS Notes 研究 | [聯儲 RSS](https://www.federalreserve.gov/feeds/feeds.htm) |
+| CFTC | `cftc_press` 新聞稿通知 | [CFTC RSS](https://www.cftc.gov/RSS/index.htm) |
+| State Street | `state_street_signals` Street Signals 官方播客提供的節目文字 | [Street Signals](https://www.statestreet.com/us/en/insights/street-signals-podcast) |
+
+FINRA 的官方新聞及公告訂閱目前使用 HTTP；實際核驗時 HTTPS 同路徑未能通過 TLS 驗證，因此保留官方公布的 URL，沒有關閉憑證驗證。FINRA 公告中的 `Oct 09, 2026` 等發布日按紐約時區解析，不以擷取時間代替。其[保證金統計](https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics)明確不提供 data feed；SEC 私募基金統計亦仍從 PDF／Excel 讀取。
+
+SCOOS 訂閱是 DDP 的更新通知，未必逐季刊出調查發布，且通知日不是資料觀測日；本次核驗其最新通知為 2026-07-16。預設 30 日篩選會略過較舊通知，需要時可用 `--source fed_scoos --max-age-days 0` 收集現有 feed 歷史。CFTC 新聞稿 feed 本次只提供標題和連結，會標示為「僅標題」並排除於報告研究正文；每週 COT 數字仍讀取官方報表。State Street RSS 只收節目提供的文字，不下載音頻、不生成音頻轉錄，也不代替行業圖表月報。
 
 | 類型 | 已設定來源 |
 | --- | --- |

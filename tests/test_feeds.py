@@ -67,6 +67,31 @@ class FeedTests(unittest.TestCase):
         self.assertIsNone(article.published_at)
         self.assertEqual(article.content_scope, "title_only")
 
+    def test_finra_publication_day_uses_source_zone_and_rejects_invalid_days(self):
+        source = Source("finra_notices", "FINRA Notices", SOURCE.url, "official", "us",
+                        timezone="America/New_York")
+        for published, expected in (("Oct 09, 2026", "2026-10-09T04:00:00+00:00"),
+                                    ("Jan 09, 2026", "2026-01-09T05:00:00+00:00"),
+                                    ("Oct 32, 2026", None)):
+            with self.subTest(published=published):
+                article = parse_feed(source, rss(f'<item><title>Margin notice</title><link>/notice</link>'
+                                                f'<pubDate>{published}</pubDate></item>'))[0]
+                self.assertEqual(article.published_at, expected)
+
+    def test_fed_rdf_preserves_release_date_and_summary_scope(self):
+        body = b'''<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+          xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <channel rdf:about="https://example.com/feed"><title>SCOOS</title>
+            <link>https://example.com/scoos</link><description>Updates</description>
+            <items><rdf:Seq><rdf:li rdf:resource="https://example.com/update"/></rdf:Seq></items></channel>
+          <item rdf:about="https://example.com/update"><title>DDP update</title>
+            <link>https://example.com/update</link><dc:date>2026-07-16T14:00:00Z</dc:date>
+            <description>Update notice; observation periods remain in the data tables.</description></item></rdf:RDF>'''
+        article = parse_feed(SOURCE, body)[0]
+        self.assertEqual(article.published_at, "2026-07-16T14:00:00+00:00")
+        self.assertEqual(article.content_scope, "summary")
+        self.assertEqual(article.content, "")
+
     def test_invalid_entries_skipped(self):
         body = rss('''<item><title>Bad URL</title><link>javascript:alert(1)</link></item>
           <item><title>Credentials</title><link>https://user:secret@example.com/</link></item>
@@ -111,11 +136,15 @@ class FeedTests(unittest.TestCase):
                 parse_hkma(SOURCE, body)
             self.assertNotIn("secret", str(ctx.exception))
 
-    def test_catalog_has_18_sources_and_is_cwd_independent(self):
+    def test_catalog_includes_regulators_and_state_street_and_is_cwd_independent(self):
         sources = load_sources()
-        self.assertEqual(len(sources), 18)
+        self.assertEqual(len(sources), 26)
         self.assertTrue(all(source.enabled for source in sources))
         self.assertEqual(next(source for source in sources if source.id == "hkma").format, "hkma_json")
+        by_id = {source.id: source for source in sources}
+        self.assertEqual(by_id["finra_notices"].timezone, "America/New_York")
+        self.assertTrue({"fed_scoos", "fed_z1", "fed_notes", "finra_news", "finra_notices",
+                         "sec_press", "cftc_press", "state_street_signals"}.issubset(by_id))
 
     def test_configuration_rejects_duplicates_and_non_http(self):
         valid = {"id":"test", "name":"Test", "url":"https://example.com/", "kind":"media", "region":"global"}
