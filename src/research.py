@@ -486,11 +486,13 @@ def _transport_timed_out(error: Exception) -> bool:
 
 def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = None,
                     register_cancel: Callable[[Callable[[], None]], None] | None = None,
-                    deadline: float | None = None) -> str:
+                    deadline: float | None = None, max_chunks: int = MAX_STREAM_CHUNKS) -> str:
     pieces = []
     size = 0
     chunks = 0
     finished = False
+    if not isinstance(max_chunks, int) or isinstance(max_chunks, bool) or not 1 <= max_chunks <= 100000:
+        raise ResearchError("source_budget")
     if deadline is None:
         deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
     try:
@@ -501,7 +503,7 @@ def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = 
             chunks += 1
             if time.monotonic() > deadline:
                 raise ResearchError("generation_timeout")
-            if chunks > MAX_STREAM_CHUNKS:
+            if chunks > max_chunks:
                 raise ProviderAPIError()
             choices = getattr(chunk, "choices", None)
             if choices == []:  # Usage-only final chunks have no choices.

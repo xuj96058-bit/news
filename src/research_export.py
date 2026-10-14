@@ -36,8 +36,9 @@ def _fields(report: Mapping[str, Any]) -> tuple[str, str, list[str]]:
         if value is not None and value != "":
             metadata.append(f"{label}：{str(value).replace(chr(13), ' ').replace(chr(10), ' ')}")
     workflow = report.get("metadata", {})
-    if isinstance(workflow, Mapping) and workflow.get("report_mode") in {"research", "gap"}:
-        metadata.append("報告類型：" + ("資料缺口簡報" if workflow["report_mode"] == "gap" else "研究草稿"))
+    if isinstance(workflow, Mapping) and workflow.get("report_mode") in {"research", "gap", "argumentative"}:
+        metadata.append("報告類型：" + {"gap":"資料缺口簡報", "research":"研究草稿",
+            "argumentative":"議論文研究草稿"}[workflow["report_mode"]])
     if isinstance(workflow, Mapping) and isinstance(workflow.get("review_status"), str) and workflow["review_status"]:
         reviewed = workflow.get("reviewed_version")
         if not isinstance(reviewed, int) or isinstance(reviewed, bool) or reviewed < 1:
@@ -49,6 +50,11 @@ def _fields(report: Mapping[str, Any]) -> tuple[str, str, list[str]]:
                      "needs_review": "有待核對項目", "review_failed": "審稿未完成，初稿保留"}.get(
                          workflow["review_status"], "草稿待核對")
         metadata.append("草稿狀態：" + label)
+    # The export already owns the title. Remove just an identical opening H1,
+    # preserving all other user-authored headings and the stored original body.
+    first, separator, rest = body.lstrip().partition("\n")
+    if first.startswith("# ") and first[2:].strip() == title.strip():
+        body = rest.lstrip("\r\n") if separator else ""
     return title, body, metadata
 
 

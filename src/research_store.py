@@ -19,6 +19,10 @@ METADATA_FIELDS = frozenset({
     "workflow_stage", "review_status", "structured_draft", "review_findings", "review_summary",
     "review_error", "parent_report_id", "reviewed_version", "workflow_schema_version", "validation_warnings",
     "research_brief", "report_mode", "quality_status",
+    "writing_style", "argument_plan", "quality", "retrieval_outcomes", "api_call_count",
+    "daily_selection", "input_sources", "manually_verified",
+    "review_error_reason",
+    "data_preparation",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",

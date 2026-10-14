@@ -472,7 +472,8 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
                                on_progress: Callable[[str, int], None] | None = None,
                                register_cancel: Callable[[Callable[[], None]], None] | None = None,
                                on_draft: Callable[[dict], None] | None = None, client=None,
-                               research_brief: dict | None = None, report_mode: str = "legacy") -> dict:
+                               research_brief: dict | None = None, report_mode: str = "legacy",
+                               writing_style: str = "legacy", retrieve_sources: bool = True) -> dict:
     """Write, acknowledge persistence, then review with at most two AI calls.
 
     Invalid citation evidence never discards generated text. Partial writer
@@ -483,6 +484,14 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
     calculations are always rebuilt from source-anchored observations. Explicit
     gap mode permits a labelled evidence-gap brief while evidence is incomplete.
     """
+    if writing_style == "argumentative" or report_mode == "argumentative":
+        from .argumentative_workflow import generate_argumentative_report
+        return generate_argumentative_report(topic, sources, api_key=api_key, provider=provider,
+            model=model, as_of=as_of, instructions=instructions, on_progress=on_progress,
+            register_cancel=register_cancel, on_draft=on_draft, client=client,
+            research_brief=research_brief, retrieve_sources=retrieve_sources)
+    if writing_style != "legacy":
+        raise ValueError("不支援的寫作方式。")
     _progress(on_progress, "preparing")
     checked = _validated_sources(sources)
     topic = _text(topic)

@@ -4,7 +4,7 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 from src.analyzer import AnalysisResult, EventExtraction, ImpactItem, post_process_impacts
-from src.report import generate_daily_report
+from src.report import generate_daily_report, load_report_events
 from src.news_store import NewsStore
 from src.rss_pipeline import analyze_pending
 
@@ -32,7 +32,9 @@ class IntegrationTests(unittest.TestCase):
     def test_report_includes_only_completed_rss_analysis_with_source(self):
         complete = {"status": "analyzed", "analysis": result().model_dump(),
                     "sources": [{"source_name": "Test source"}],
-                    "url": "https://example.org/article", "content_scope": "summary"}
+                    "url": "https://example.org/article", "content_scope": "summary",
+                    "title": "Earnings update", "summary": "Original earnings summary",
+                    "published_at": "2026-10-14T00:00:00Z"}
         pending = {"status": "pending", "analysis": None}
         inbox = MagicMock()
         inbox.export_articles.return_value = [complete, pending]
@@ -41,7 +43,10 @@ class IntegrationTests(unittest.TestCase):
              patch("src.report.NewsStore") as store:
             db_path.exists.return_value = True
             store.return_value.__enter__.return_value = inbox
-            report = generate_daily_report()
+            events = load_report_events()
+            report = generate_daily_report(as_of="2026-10-14")
+        self.assertEqual(events[0]["published_at"], complete["published_at"])
+        self.assertEqual(events[0]["summary"], complete["summary"])
         self.assertIn("共 1 則", report)
         self.assertIn("Test source", report)
         self.assertIn("https://example.org/article", report)
@@ -67,7 +72,7 @@ class IntegrationTests(unittest.TestCase):
             with patch("src.report.load_events", return_value=[]), \
                  patch("src.report.DEFAULT_DB_PATH", database), \
                  patch("src.report.NewsStore", side_effect=lambda: NewsStore(database)):
-                report = generate_daily_report()
+                report = generate_daily_report(as_of="2026-10-13")
         self.assertIn("共 1 則", report)
         self.assertIn("Investat institutional research", report)
         self.assertIn("Source-based summary", report)
