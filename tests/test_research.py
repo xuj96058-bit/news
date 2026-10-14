@@ -233,6 +233,7 @@ class ResearchReportTests(unittest.TestCase):
         self.assertEqual(request["max_tokens"], MAX_REPORT_TOKENS)
         self.assertEqual(request["extra_body"], {"thinking": {"type": "disabled"}})
         self.assertNotIn(KEY, json.dumps(request))
+        client.chat.completions.create.assert_called_once()
 
     def test_progress_tracks_stream_lifecycle_without_response_text_or_credentials(self):
         client, stream = fake_client()
@@ -451,26 +452,275 @@ class ResearchReportTests(unittest.TestCase):
                 generate_research_report("Topic", bad, api_key=KEY, as_of="2026-10-14", client=client)
         client.chat.completions.create.assert_not_called()
 
-    def test_invented_or_grouped_source_refs_are_rejected(self):
-        for citation in ("[S999]", "[S0]", "[S1, S2]", "[s1]", "[S 1]", "[S999", "S999", "S1"):
+    def test_unknown_and_malformed_source_refs_have_distinct_safe_errors(self):
+        for citation, reason in (("[S999]", "unknown_citations"), ("[S0]", "unknown_citations"),
+                                 ("[S1, S2]", "unknown_citations"), ("[S999", "unknown_citations"),
+                                 ("S999", "unknown_citations"), ("S1", "invalid_citations"),
+                                 ("[S1-S1]", "invalid_citations")):
             with self.subTest(citation=citation):
                 client, _ = fake_client(payload(executive_findings="Claim. " + citation))
                 with self.assertRaises(ResearchError) as caught:
+                    self.generate(client, repair_citations=False)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertNotIn("S999", str(caught.exception))
+                client.chat.completions.create.assert_called_once()
+
+    def test_explicit_grouped_and_localized_citations_are_normalized_without_another_request(self):
+        self.sources = prepare_sources([article(), article(id="news-2", summary="A second supplied excerpt.")])
+        for citation in ("[S1, S2]", "[S1、S2]", "[S1，S2]", "[S1；S2]", "[S1 S2]",
+                         "［Ｓ１，Ｓ２］", "【S1、S2】", "[s1, s2]", "[S 1, S 2]"):
+            with self.subTest(citation=citation):
+                client, _ = fake_client(payload(executive_findings="Supplied evidence. " + citation))
+                result = self.generate(client)
+                self.assertIn("Supplied evidence. [S1][S2]", result["body"])
+                client.chat.completions.create.assert_called_once()
+                self.assertNotIn("citation_repaired", result["metadata"])
+        client, _ = fake_client(payload(executive_findings="Supplied evidence. [s1] ［S 2］"))
+        self.assertIn("Supplied evidence. [S1] [S2]", self.generate(client)["body"])
+        client.chat.completions.create.assert_called_once()
+
+    def test_normalization_preserves_unknown_ids_instead_of_remapping_them(self):
+        for citation in ("[S01]", "［Ｓ９９９］", "【S1、S999】", "Ｓ９９９. [S1]"):
+            with self.subTest(citation=citation):
+                client, _ = fake_client(payload(executive_findings="Claim. " + citation))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client, repair_citations=False)
+                self.assertEqual(caught.exception.reason, "unknown_citations")
+
+    def test_structural_headings_do_not_need_citations_but_factual_headings_do(self):
+        client, _ = fake_client(payload(executive_findings=(
+            "### 原文事實\n\nReported financing of 20 billion. [S1]\n\n"
+            "### 分析推論\nThe excerpt cannot determine net flows. [S1]")))
+        result = self.generate(client)
+        self.assertIn("### 原文事實", result["body"])
+        client.chat.completions.create.assert_called_once()
+        for heading in ("### Financing was 500 billion.", "### 所有融資均流入股票市場", "### 原文事實"):
+            with self.subTest(heading=heading):
+                # A heading-only section is insufficient even if its label is structural.
+                client, _ = fake_client(payload(executive_findings=heading))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client, repair_citations=False)
+                self.assertEqual(caught.exception.reason, "missing_citations")
+
+    def test_heading_boundaries_cannot_merge_uncited_claims_with_a_cited_block(self):
+        for content in ("Uncited claim.\n### 原文事實\nCited excerpt. [S1]",
+                        "### 所有融資均流入股票市場\nCited excerpt. [S1]",
+                        "### 融資升至500億元\nCited excerpt. [S1]"):
+            with self.subTest(content=content):
+                client, _ = fake_client(payload(executive_findings=content))
+                with self.assertRaises(ResearchError) as caught:
+                    self.generate(client, repair_citations=False)
+                self.assertEqual(caught.exception.reason, "missing_citations")
+                self.assertIn("核心結論，第 1 段", str(caught.exception))
+                self.assertNotIn("Uncited claim", str(caught.exception))
+                self.assertNotIn("所有融資", str(caught.exception))
+
+    def test_one_citation_repair_uses_same_sources_provider_schema_and_safe_progress(self):
+        first = FakeStream(json.dumps(payload(executive_findings="Uncited factual paragraph.")))
+        second = FakeStream(json.dumps(payload()))
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [first, second]
+        events, callbacks = [], []
+        original_sources = copy.deepcopy(self.sources)
+        result = self.generate(client, on_progress=lambda stage, size: events.append((stage, size)),
+                               register_cancel=callbacks.append)
+        self.assertTrue(result["metadata"]["citation_repaired"])
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        requests = [call.kwargs for call in client.chat.completions.create.call_args_list]
+        initial, repair = [json.loads(request["messages"][1]["content"]) for request in requests]
+        self.assertEqual(initial["sources"], repair["sources"])
+        self.assertEqual(self.sources, original_sources)
+        self.assertEqual(repair["citation_repair"]["failure"], "missing_citations")
+        self.assertEqual(repair["citation_repair"]["draft"]["executive_findings"], "Uncited factual paragraph.")
+        self.assertEqual(requests[0]["model"], requests[1]["model"])
+        self.assertEqual(requests[1]["response_format"], {"type": "json_object"})
+        self.assertIn("不得猜測未知來源編號", requests[1]["messages"][0]["content"])
+        self.assertEqual(callbacks, [first.close, second.close])
+        self.assertTrue(first.closed and second.closed)
+        client.close.assert_not_called()
+        repair_start = [stage for stage, _ in events].index("repairing")
+        self.assertTrue(all(stage == "repairing" for stage, _ in events[repair_start:-1]))
+        self.assertEqual(events[-1], ("ready", len(second.raw)))
+        for secret in (KEY, OTHER_KEY, first.raw, second.raw, self.sources[0]["content"]):
+            self.assertNotIn(secret, json.dumps(events))
+        self.assertNotIn(KEY, json.dumps(requests))
+        self.assertNotIn(OTHER_KEY, json.dumps(requests))
+
+    def test_failed_citation_repair_does_not_try_a_third_request_or_signal_ready(self):
+        first = FakeStream(json.dumps(payload(executive_findings="Claim. [S999]")))
+        second = FakeStream(json.dumps(payload(executive_findings="Still uncited.")))
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [first, second]
+        events = []
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client, on_progress=lambda stage, size: events.append((stage, size)))
+        self.assertEqual(caught.exception.reason, "missing_citations")
+        self.assertIn("核心結論，第 1 段", str(caught.exception))
+        self.assertIn("已嘗試一次自動修正", str(caught.exception))
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertTrue(first.closed and second.closed)
+        self.assertNotIn("ready", [stage for stage, _ in events])
+
+    def test_repaired_response_must_pass_all_link_and_shape_validation(self):
+        for repaired, error_type, reason in ((payload(watchlist="Read https://invented.example/table. [S1]"),
+                                             ResearchError, "invented_url"),
+                                            (payload(title=7), ModelResponseError, "invalid_schema"),
+                                            (payload(watchlist="Claim. [S999]"), ResearchError, "unknown_citations")):
+            with self.subTest(reason=reason):
+                first = FakeStream(json.dumps(payload(executive_findings="Uncited claim.")))
+                second = FakeStream(json.dumps(repaired))
+                client = MagicMock()
+                client.chat.completions.create.side_effect = [first, second]
+                with self.assertRaises(error_type) as caught:
                     self.generate(client)
-                self.assertEqual(caught.exception.reason, "invalid_citations")
-                self.assertNotIn(citation, str(caught.exception))
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(client.chat.completions.create.call_count, 2)
+                self.assertTrue(first.closed and second.closed)
+
+    def test_invented_url_even_with_bad_citations_is_not_a_repairable_failure(self):
+        client, _ = fake_client(payload(watchlist="Read https://invented.example/table. [S999]"))
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.reason, "invented_url")
+        client.chat.completions.create.assert_called_once()
+
+    def test_transport_failures_never_trigger_a_citation_retry(self):
+        client, _ = fake_client()
+        client.chat.completions.create.side_effect = RuntimeError(KEY + " private body")
+        with self.assertRaises(ProviderAPIError):
+            self.generate(client)
+        client.chat.completions.create.assert_called_once()
+        first = FakeStream(json.dumps(payload(executive_findings="Uncited claim.")))
+        client.chat.completions.create.reset_mock()
+        client.chat.completions.create.side_effect = [first, ReadTimeout(KEY)]
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertNotIn(KEY, str(caught.exception))
+
+    def test_repair_retains_owned_client_until_done_and_registers_both_streams(self):
+        client = MagicMock()
+        first = FakeStream(json.dumps(payload(executive_findings="Uncited claim.")))
+        second = FakeStream(json.dumps(payload()))
+        callbacks = []
+
+        def create(**_kwargs):
+            client.close.assert_not_called()
+            return first if client.chat.completions.create.call_count == 1 else second
+
+        client.chat.completions.create.side_effect = create
+        with patch("src.research.OpenAI", return_value=client):
+            result = self.generate(None, register_cancel=callbacks.append)
+        self.assertTrue(result["metadata"]["citation_repaired"])
+        self.assertEqual(callbacks, [client.close, first.close, second.close])
+        client.close.assert_called_once()
+
+    def test_repair_uses_remaining_shared_deadline_instead_of_resetting_it(self):
+        clock = {"now": 0.0}
+
+        class SlowFirstStream(FakeStream):
+            def __iter__(self):
+                yield from super().__iter__()
+                clock["now"] = 179.0
+
+        class LateRepairStream(FakeStream):
+            def __iter__(self):
+                clock["now"] = 181.0
+                yield from super().__iter__()
+
+        first = SlowFirstStream(json.dumps(payload(executive_findings="Uncited claim.")))
+        second = LateRepairStream(json.dumps(payload()))
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [first, second]
+        with patch("src.research.time.monotonic", side_effect=lambda: clock["now"]):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(client)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["timeout"], 1.0)
+        self.assertTrue(first.closed and second.closed)
+
+    def test_late_stream_termination_and_late_validation_never_return_a_draft(self):
+        clock = {"now": 0.0}
+
+        class LateTermination(FakeStream):
+            def __iter__(self):
+                yield from super().__iter__()
+                clock["now"] = 181.0
+
+        client = MagicMock()
+        stream = LateTermination(json.dumps(payload()))
+        client.chat.completions.create.return_value = stream
+        with patch("src.research.time.monotonic", side_effect=lambda: clock["now"]):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(client)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertTrue(stream.closed)
+        from src.research import _parse_draft
+        client, _ = fake_client()
+        clock["now"] = 0.0
+
+        def late_parse(*args):
+            result = _parse_draft(*args)
+            clock["now"] = 181.0
+            return result
+
+        with patch("src.research.time.monotonic", side_effect=lambda: clock["now"]), \
+             patch("src.research._parse_draft", side_effect=late_parse):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(client)
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        client.chat.completions.create.assert_called_once()
+
+    def test_repair_prompt_budget_is_checked_before_a_second_request(self):
+        client, _ = fake_client()
+        self.generate(client)
+        request = client.chat.completions.create.call_args.kwargs
+        initial_size = sum(len(message["content"]) for message in request["messages"])
+        client, _ = fake_client(payload(executive_findings="Uncited claim."))
+        with patch("src.research.MAX_PROMPT_CHARS", initial_size):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(client)
+        self.assertEqual(caught.exception.reason, "missing_citations")
+        client.chat.completions.create.assert_called_once()
+
+    def test_claude_repair_respects_existing_adapter_and_remaining_timeout_budget(self):
+        first = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+            content=json.dumps(payload(executive_findings="Uncited claim."))))])
+        second = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+            content=json.dumps(payload())))])
+        with patch("src.research.claude_completion", side_effect=[first, second]) as adapter:
+            result = self.generate(None, provider="anthropic")
+        self.assertEqual(adapter.call_count, 2)
+        self.assertTrue(result["metadata"]["citation_repaired"])
+        self.assertEqual(adapter.call_args.kwargs["api_key"], KEY)
+        with patch("src.research.claude_completion", return_value=first) as adapter, \
+             patch("src.research.time.monotonic", side_effect=[0.0, 81.0, 81.0]):
+            with self.assertRaises(ResearchError) as caught:
+                self.generate(None, provider="anthropic")
+        self.assertEqual(caught.exception.reason, "missing_citations")
+        adapter.assert_called_once()
+
+    def test_evidence_only_report_body_describes_actual_scope(self):
+        self.sources = prepare_evidence([], [{"title": "Manual", "content": "A supplied excerpt.",
+                                            "source_type": "manual"}])
+        client, _ = fake_client()
+        result = self.generate(client)
+        self.assertEqual(result["metadata"]["report_scope"], "with_explicit_evidence")
+        self.assertIn("未選入 RSS／Investat 新聞", result["body"])
 
     def test_report_with_no_citations_is_rejected(self):
         client, _ = fake_client({key: value.replace(" [S1]", "") for key, value in payload().items()})
         with self.assertRaises(ResearchError) as caught:
             self.generate(client)
-        self.assertEqual(caught.exception.reason, "invalid_citations")
+        self.assertEqual(caught.exception.reason, "missing_citations")
 
     def test_number_in_uncited_paragraph_is_rejected(self):
         client, _ = fake_client(payload(chart_data_interpretation="Uncited financing was 500 billion.\n\nThe cited excerpt is partial. [S1]"))
         with self.assertRaises(ResearchError) as caught:
             self.generate(client)
-        self.assertEqual(caught.exception.reason, "untraceable_numbers")
+        self.assertEqual(caught.exception.reason, "missing_citations")
 
     def test_literal_number_mismatches_trigger_review_without_claiming_factcheck(self):
         for claim in ("Financing was 500 billion. [S1]", "融資五百億元。 [S1]"):
@@ -496,7 +746,7 @@ class ResearchReportTests(unittest.TestCase):
                 client, _ = fake_client(payload(chart_data_interpretation=claim + "\n\nThe excerpt is partial. [S1]"))
                 with self.assertRaises(ResearchError) as caught:
                     self.generate(client)
-                self.assertEqual(caught.exception.reason, "invalid_citations")
+                self.assertEqual(caught.exception.reason, "missing_citations")
 
     def test_uncited_plus_and_parenthesis_list_items_are_rejected(self):
         for claim in ("1) Cited claim. [S1]\n2) An uncited factual claim.",

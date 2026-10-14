@@ -44,6 +44,7 @@ def _generation_progress(bar, stage, received_chars=0, elapsed=0):
         "requesting": (0.20, "2/5 等待AI回應"),
         "receiving": (0.40, f"2/5 正在接收AI草稿（已收到{received_chars:,}個字元）"),
         "validating": (0.75, "3/5 檢查報告格式與來源引用"),
+        "repairing": (0.75, "3/5 AI正在修正來源引用（最多一次）"),
         "ready": (0.85, "3/5 草稿檢查完成"),
         "saving": (0.95, "4/5 保存報告"),
         "saved": (1.0, "5/5 報告已保存"),
@@ -62,9 +63,10 @@ def _remember_editor(report_id, title_key, body_key, base_key):
 
 
 def _sources_preview(sources):
+    labels = {"rss": "RSS新聞", "investat": "Investat研究", "official": "公開核對資料", "manual": "手動證據"}
     for source in sources:
         with st.expander(f"[{source['id']}] {source['title']}"):
-            st.caption(f"來源類型：{source.get('source_type')} · 內容範圍：{source.get('content_scope', '補充資料')} · 發布日：{source.get('publication_date') or source.get('published_at') or '未知'}")
+            st.caption(f"來源類型：{labels.get(source.get('source_type'), '補充資料')} · 內容範圍：{source.get('content_scope', '補充資料')} · 發布日：{source.get('publication_date') or source.get('published_at') or '未知'}")
             st.caption(f"資料觀測期：{source.get('observation_date') or '原文未明確提供'} · 擷取日：{source.get('retrieved_at') or source.get('retrieved_date') or '未知'}")
             st.write(source.get("content", ""))
             if source.get("url"):
@@ -174,10 +176,17 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
     except ResearchError as error:
         st.warning(str(error))
         sources = []
+    counts = {kind: sum(source.get("source_type") == kind for source in sources)
+              for kind in ("rss", "investat", "official", "manual")}
+    st.caption(f"本次送給AI：RSS新聞{counts['rss']}篇 · Investat研究{counts['investat']}篇 · 公開核對資料{counts['official']}份 · 手動證據{counts['manual']}份。")
+    if sources and not counts["rss"] and not counts["investat"]:
+        st.info("本次只使用公開核對資料或手動證據，尚未選入RSS／Investat新聞。若希望結合新聞分析，請先選取上方的報告選材。")
     with st.expander(f"預覽即將送給AI的資料（{len(sources)}個來源）", expanded=False):
         _sources_preview(sources)
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
+    repair_citations = st.checkbox("引用不完整時自動修正一次（可能額外調用AI）", value=True,
+                                   key="research_repair_citations")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
     if not sources:
         st.info("請先在「確認報告選材」選擇新聞，可點「選取前8篇候選」；也可加入補充證據。預覽至少有1個來源後才能生成。")
@@ -199,7 +208,8 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             draft = run_generation(
                 lambda **kwargs: generate_research_report(topic, sources, api_key=api_key, provider=provider,
-                    model=model, as_of=today.isoformat(), instructions=instructions, **kwargs), update)
+                    model=model, as_of=today.isoformat(), instructions=instructions,
+                    repair_citations=repair_citations, **kwargs), update)
             metadata = {**draft["metadata"], "source_count": len(sources),
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
@@ -275,6 +285,8 @@ def _library():
     if st.session_state[base_key] != report["version"]:
         st.warning("其他頁面已保存新版本。你的編輯仍保留；先複製需要的文字，再載入最新版本合併修改。")
     st.caption(f"已保存版本v{report['version']} · {report['provider']}／{report['model']} · 修改不會調用AI或覆蓋原始草稿。")
+    if report.get("metadata", {}).get("citation_repaired"):
+        st.caption("生成時已經過一次AI引用修正；仍請核對正文與來源是否相符。")
     for warning in report.get("metadata", {}).get("review_warnings", []):
         st.warning(warning)
     with st.expander("歷史版本與還原"):

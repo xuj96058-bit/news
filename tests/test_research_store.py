@@ -68,6 +68,15 @@ class ResearchStoreTests(unittest.TestCase):
             self.assertEqual(history[0]["restored_from_revision_id"], created["revision_id"])
             self.assertEqual(reopened.get_report(created["id"])["original_title"], created["title"])
 
+    def test_citation_repair_status_persists_without_provider_request_settings(self):
+        created = self.store.create_report(**report_args(metadata={
+            "citation_repaired": True, "request": {"api_key": "SYNTHETIC_PRIVATE_SETTING"},
+        }))
+        with ResearchStore(self.path) as reopened:
+            saved = reopened.get_report(created["id"])
+            self.assertEqual(saved["metadata"], {"citation_repaired": True})
+        self.assertNotIn(b"SYNTHETIC_PRIVATE_SETTING", self.path.read_bytes())
+
     def test_second_editor_cannot_overwrite_newer_version_or_restore_over_it(self):
         created = self.store.create_report(**report_args())
         with ResearchStore(self.path) as second_editor:

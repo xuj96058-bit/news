@@ -15,7 +15,7 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "research_repor
 # Deliberately store report facts, not client settings or provider request arguments.
 METADATA_FIELDS = frozenset({
     "article_count", "source_count", "warnings", "limitations", "coverage",
-    "selection", "generated_at", "duration_seconds", "usage", "report_scope", "review_warnings",
+    "selection", "generated_at", "duration_seconds", "usage", "report_scope", "review_warnings", "citation_repaired",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",

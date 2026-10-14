@@ -32,6 +32,7 @@ class ResearchUiTests(unittest.TestCase):
         self.patch('src.feeds.load_sources', return_value=[source])
         self.patch('src.research_ui.load_sources', return_value=[source])
         inbox = MagicMock()
+        self.inbox = inbox
         inbox.stats.return_value = {'total': 1, 'analyzed': 0}
         inbox.export_articles.return_value = [{'id': 1, 'title': '科技AI持倉', 'summary': '機構科技持倉上升。',
             'content': '', 'content_scope': 'summary', 'url': 'https://example.org/article',
@@ -74,6 +75,7 @@ class ResearchUiTests(unittest.TestCase):
         stages = [call.args[1] for call in progress.call_args_list]
         self.assertIn('saving', stages)
         self.assertEqual(stages[-1], 'saved')
+        self.assertIs(self.generator.call_args.kwargs['repair_citations'], True)
         with ResearchStore(self.db) as store:
             report = store.list_reports()[0]
         identifier = report['id']
@@ -117,6 +119,46 @@ class ResearchUiTests(unittest.TestCase):
         self.assertEqual(app.multiselect(key='research_article_ids').value, ['1'])
         self.assertTrue(app.button(key='research_generate').disabled)
         self.assertTrue(any('API key並按Enter' in item.value for item in app.info))
+        self.generator.assert_not_called()
+
+    def test_evidence_only_selection_shows_source_counts_and_news_hint(self):
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_clear_articles').click().run()
+        app.session_state['research_official_evidence'] = [{
+            'title': ui.CATALOG['finra'][0], 'content': 'Synthetic official excerpt.',
+            'source_type': 'official', 'publisher': 'Synthetic official publisher'}]
+        app.session_state['research_manual_evidence'] = [{
+            'title': 'Synthetic manual evidence', 'content': 'Synthetic manual excerpt.',
+            'source_type': 'manual', 'publisher': 'Synthetic analyst'}]
+        app.checkbox(key='research_use_evidence').check().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(item.value == '本次送給AI：RSS新聞0篇 · Investat研究0篇 · 公開核對資料1份 · 手動證據1份。'
+                            for item in app.caption))
+        self.assertTrue(any('本次只使用公開核對資料或手動證據' in item.value for item in app.info))
+        self.assertTrue(any(item.label == '預覽即將送給AI的資料（2個來源）' for item in app.expander))
+        self.assertFalse(app.button(key='research_generate').disabled)
+        self.generator.assert_not_called()
+
+    def test_rss_and_investat_counts_use_selected_sources_without_double_counting_origins(self):
+        rss = self.inbox.export_articles.return_value[0]
+        rss['sources'].append({'source_id': 'investat', 'source_name': 'Investat',
+                               'source_kind': 'research', 'title': rss['title'], 'url': rss['url']})
+        self.inbox.export_articles.return_value.append({
+            'id': 2, 'title': 'AI科技融資研究', 'summary': 'Synthetic distinct financing excerpt.',
+            'content': '', 'content_scope': 'snippet', 'url': 'https://example.org/investat-study',
+            'published_at': datetime.now(timezone.utc).isoformat(), 'source_id': 'investat',
+            'source_name': 'Investat', 'source_kind': 'research', 'sources': []})
+        app = self.app()
+        app.multiselect(key='research_news_sources').set_value(['test', 'investat']).run()
+        app.button(key='research_select_articles').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(item.value == '本次送給AI：RSS新聞1篇 · Investat研究1篇 · 公開核對資料0份 · 手動證據0份。'
+                            for item in app.caption))
+        app.multiselect(key='research_article_ids').set_value(['1']).run()
+        self.assertTrue(any(item.value == '本次送給AI：RSS新聞1篇 · Investat研究0篇 · 公開核對資料0份 · 手動證據0份。'
+                            for item in app.caption))
+        self.assertFalse(any('本次只使用公開核對資料或手動證據' in item.value for item in app.info))
         self.generator.assert_not_called()
 
     def test_generation_failure_preserves_selection_and_saves_no_report(self):
@@ -172,6 +214,48 @@ class ResearchUiTests(unittest.TestCase):
         self.assertNotIn('saved', stages)
         with ResearchStore(self.db) as store:
             self.assertEqual(store.list_reports(), [])
+
+    def test_citation_repair_can_be_disabled_for_generation(self):
+        app = self.app()
+        self.assertTrue(app.checkbox(key='research_repair_citations').value)
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.checkbox(key='research_repair_citations').uncheck().run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIs(self.generator.call_args.kwargs['repair_citations'], False)
+        with ResearchStore(self.db) as store:
+            self.assertEqual(len(store.list_reports()), 1)
+
+    def test_citation_repair_updates_generation_progress_label(self):
+        release = Event()
+        self.addCleanup(release.set)
+        draft = self.generator.return_value
+        bar = MagicMock()
+        self.patch('src.research_ui.st.progress', return_value=bar)
+        render_progress = ui._generation_progress
+
+        def track_progress(progress_bar, stage, *args, **kwargs):
+            render_progress(progress_bar, stage, *args, **kwargs)
+            if stage == 'repairing':
+                release.set()
+
+        self.patch('src.research_ui._generation_progress', side_effect=track_progress)
+
+        def repaired_draft(*args, on_progress, **kwargs):
+            on_progress('repairing', 50)
+            if not release.wait(2):
+                raise AssertionError('Citation repair progress was never displayed.')
+            return draft
+
+        self.generator.side_effect = repaired_draft
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any('AI正在修正來源引用（最多一次）' in call.kwargs.get('text', '')
+                            for call in bar.progress.call_args_list))
+        with ResearchStore(self.db) as store:
+            self.assertEqual(len(store.list_reports()), 1)
 
     def test_switching_reports_keeps_unsaved_editor_buffer(self):
         first = self.create('報告A', 'A正文')
