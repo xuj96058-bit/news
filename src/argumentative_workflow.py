@@ -226,8 +226,8 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
         if provider == "openai":
             params["max_completion_tokens"] = 16000
         elif provider == "deepseek":
-            params.update(max_tokens=32768 if stage in {"reviewing", "revising"} else 24000, reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}})
+            params.update(max_tokens=32768 if stage in {"reviewing", "revising"} else 24000,
+                extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
         else:
             params.update(max_tokens=8000, temperature=0.2)
         captured = _CapturedStream(client.chat.completions.create(**params))
