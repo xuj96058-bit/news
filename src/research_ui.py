@@ -34,8 +34,54 @@ def _origins(article):
     return {article.get("source_id"), *(item.get("source_id") for item in article.get("sources", []))}
 
 
-def _flash(message):
+def _flash(message, *, level="success"):
     st.session_state["research_flash"] = message
+    st.session_state["research_flash_level"] = level
+
+
+def _report_has_body(report):
+    """Recognize preparation checkpoints without misclassifying legacy reports."""
+    metadata = report.get("metadata") or {}
+    if isinstance(metadata.get("report_has_body"), bool):
+        return metadata["report_has_body"]
+    if metadata.get("workflow_stage") in {"research_prepared", "preparation_failed"}:
+        return False
+    if metadata.get("structured_draft") or metadata.get("workflow_stage") in {"writer_saved", "review_complete"}:
+        return True
+    # Older failed checkpoints were marked review_failed despite containing only
+    # a preparation memo. Restrict compatibility detection to its exact marker.
+    return "研究準備紀錄；正文尚未生成。" not in report.get("body", "")
+
+
+def _preparation_messages(metadata):
+    stages = {"preparing": "研究準備", "preparation": "研究準備", "designing": "研究設計",
+              "organizing": "資料整理", "calculating": "數據計算", "planning": "論點規劃",
+              "writing": "正文寫作", "auditing": "逐項核驗", "reviewing": "獨立審稿", "revising": "正文修訂"}
+    reasons = {"writing_budget_reserved": "已保留正文寫作所需預算，準備步驟提前停止",
+               "generation_timeout": "已達等待時間上限", "provider_configuration": "AI服務設定未能使用",
+               "provider_or_processing_error": "AI服務或資料處理未完成", "invalid_json": "AI回覆不是有效JSON",
+               "invalid_schema": "AI回覆不符合所需資料格式", "invalid_shape": "AI回覆不符合所需資料格式",
+               "truncated": "AI回覆遭截斷", "empty_content": "AI未回傳內容",
+               "source_budget": "來源超出本次資料上限", "empty_sources": "沒有可用來源",
+               "evidence_extraction_incomplete": "部分來源尚未完成證據提取",
+               "evidence_capacity": "已達本次證據記錄容量，部分資料尚未納入"}
+    warnings = metadata.get("preparation_warnings")
+    items = list(warnings) if isinstance(warnings, list) else []
+    if metadata.get("failure_reason"):
+        items.append({"stage": metadata.get("failure_stage"), "reason": metadata["failure_reason"]})
+    messages = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage") if isinstance(item.get("stage"), str) else None
+        reason = item.get("reason") if isinstance(item.get("reason"), str) else None
+        reason_label = reasons.get(reason, "服務或資料處理未完成")
+        if isinstance(reason, str) and re.fullmatch(r"provider_http_\d{3}", reason):
+            reason_label = "AI服務回應錯誤（HTTP " + reason.rsplit("_", 1)[1] + "）"
+        message = stages.get(stage, "研究準備") + "：" + reason_label + "。"
+        if message not in messages:
+            messages.append(message)
+    return messages
 
 
 def _select_articles(identifiers):
@@ -58,6 +104,8 @@ def _generation_progress(bar, stage, received_chars=0, elapsed=0):
         "receiving": (0.35, f"5/5 接收初稿（已收到{received_chars:,}個字元）"),
         "validating": (0.40, "5/5 核對正文與來源清單"),
         "saving_initial": (0.45, "5/5 保存初稿"),
+        "saving_preparation": (0.45, "保存研究準備紀錄（正文尚未生成）"),
+        "preparation_saved": (1.0, "研究準備紀錄已保存（正文尚未生成）"),
         "reviewing": (0.65, f"5/5 實質審稿：核對證據、比較與結論（已收到{received_chars:,}個字元）"),
         "ready": (0.85, "5/5 準備保存審稿結果"),
         "saving": (0.95, "5/5 保存審稿版本"),
@@ -464,6 +512,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             def metadata_for(draft):
                 return {**draft.get("metadata", {}), "source_count": len(sources),
+                        "report_has_body": _report_has_body(draft),
                         "report_mode": draft.get("metadata", {}).get("report_mode", report_mode), "research_brief": draft.get("metadata", {}).get("research_brief", brief),
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
@@ -472,7 +521,8 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
             def save_writer(draft):
                 nonlocal initial, sources
                 sources = draft.get("sources", sources)
-                _generation_progress(bar, "saving_initial", elapsed=elapsed)
+                has_body = _report_has_body(draft)
+                _generation_progress(bar, "saving_initial" if has_body else "saving_preparation", elapsed=elapsed)
                 with ResearchStore() as store:
                     if initial is None:
                         initial = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
@@ -481,7 +531,10 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                         initial = store.save_review(initial["id"], title=draft["title"], body=draft["body"],
                             expected_version=initial["version"], metadata=metadata_for(draft), sources=sources, note="研究階段保存")
                 st.session_state["research_active_report"] = initial["id"]
-                st.success("研究資料已保存，正在生成正文。" if draft.get("metadata", {}).get("workflow_stage") == "research_prepared" else "初稿已保存，正在逐項核驗及審稿。")
+                if has_body:
+                    st.success("初稿已保存，正在逐項核驗及審稿。")
+                else:
+                    st.info("研究準備紀錄已保存；正文尚未生成。")
                 return initial["id"]
 
             draft = run_generation(
@@ -493,13 +546,15 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 update, on_artifact=save_writer, timeout=wait_limit)
             if initial is None:
                 save_writer(draft)
-            _generation_progress(bar, "saving", elapsed=elapsed)
+            has_body = _report_has_body(draft)
+            _generation_progress(bar, "saving" if has_body else "saving_preparation", elapsed=elapsed)
             sources = draft.get("sources", sources)
             conflict = False
             with ResearchStore() as store:
                 try:
                     saved = store.save_review(initial["id"], title=draft["title"], body=draft["body"],
-                        expected_version=initial["version"], metadata=metadata_for(draft), sources=sources, note="AI獨立審稿結果")
+                        expected_version=initial["version"], metadata=metadata_for(draft), sources=sources,
+                        note="AI獨立審稿結果" if has_body else "研究準備未完成；正文尚未生成")
                 except ResearchConflictError:
                     # Another page may already be editing the saved initial draft.
                     # Keep that text and save the review as a separate suggestion.
@@ -507,12 +562,16 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                     suggestion_metadata = {**metadata_for(draft), "parent_report_id": initial["id"]}
                     if suggestion_metadata.get("review_status") in {"reviewed", "needs_review"}:
                         suggestion_metadata["reviewed_version"] = 1
-                    saved = store.create_report(topic=topic, title=draft["title"] + "（審稿建議）", body=draft["body"],
+                    saved = store.create_report(topic=topic,
+                        title=draft["title"] + ("（審稿建議）" if has_body else "（準備紀錄）"), body=draft["body"],
                         sources=sources, provider=provider, model=model, as_of=today.isoformat(),
                         metadata=suggestion_metadata)
-            _generation_progress(bar, "saved", elapsed=elapsed)
+            _generation_progress(bar, "saved" if has_body else "preparation_saved", elapsed=elapsed)
             st.session_state["research_active_report"] = initial["id"] if conflict else saved["id"]
-            if conflict:
+            if not has_body:
+                _flash("正文尚未生成；研究準備紀錄已另存，已有修改仍保留。請在報告庫查看資料並重新生成。" if conflict else
+                       "研究準備未完成，正文尚未生成；已保留研究資料，可在報告庫查看並重新生成。", level="warning")
+            elif conflict:
                 _flash("你的修改已保留；AI審稿結果另存為「審稿建議」，可在報告清單選取比較。")
             elif draft.get("metadata", {}).get("review_status") == "review_failed":
                 _flash("初稿已保存；獨立審稿未完成，可直接修改與匯出。")
@@ -523,17 +582,24 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
             bar.empty()
             st.error(_safe_message(error))
             if initial is not None:
+                has_body = _report_has_body(initial)
+                failure_metadata = {"workflow_stage": "review_failed" if has_body else "preparation_failed",
+                    "report_has_body": has_body, "review_status": "review_failed" if has_body else "preparation_failed",
+                    "review_error": _safe_message(error)}
+                if not has_body:
+                    failure_metadata.update(failure_stage="preparation",
+                        failure_reason=error.reason if isinstance(error, ResearchError) else "provider_or_processing_error")
                 try:
                     with ResearchStore() as store:
                         store.save_review(initial["id"], title=initial["title"], body=initial["body"],
-                            expected_version=initial["version"], metadata={"workflow_stage": "review_failed",
-                                "review_status": "review_failed", "review_error": _safe_message(error)},
-                            note="審稿未完成；初稿保留")
+                            expected_version=initial["version"], metadata=failure_metadata,
+                            note="審稿未完成；初稿保留" if has_body else "研究準備未完成；正文尚未生成")
                 except ResearchConflictError:
                     pass
                 except ResearchStoreError as save_error:
                     st.error(_safe_message(save_error))
-                st.warning("初稿已保存，審稿未完成；可到「報告庫與編輯」修改或匯出。")
+                st.warning("初稿已保存，審稿未完成；可到「報告庫與編輯」修改或匯出。" if has_body else
+                           "研究準備紀錄已保存，正文尚未生成；可到「報告庫與編輯」查看資料，再回到「生成新報告」重新生成。")
 
 
 def _import_report():
@@ -552,15 +618,46 @@ def _import_report():
                 if not isinstance(title, str):
                     raise ValueError()
                 as_of = item.get("as_of") or datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                has_body = _report_has_body(item)
+                metadata = {"report_scope": "imported"}
+                if not has_body:
+                    metadata = {**(item.get("metadata") or {}), **metadata, "report_has_body": False}
                 with ResearchStore() as store:
                     saved = store.create_report(topic=str(item.get("topic") or title), title=title, body=item["body"],
                                                 sources=item.get("sources", []), provider="import", model="", as_of=as_of,
-                                                metadata={"report_scope": "imported"})
+                                                metadata=metadata)
                 st.session_state["research_active_report"] = saved["id"]
-                _flash("已匯入為可編輯報告，原始內容會保留。")
+                _flash("已匯入為可編輯報告，原始內容會保留。" if has_body else "已匯入研究準備紀錄；正文尚未生成。",
+                       level="success" if has_body else "warning")
                 st.rerun()
             except Exception:
                 st.error("無法匯入；請使用有效UTF-8 Markdown，或含title、body及可選sources的JSON報告。")
+
+
+def _preparation_record(report):
+    metadata = report.get("metadata", {})
+    st.warning("研究準備紀錄｜正文尚未生成。這份紀錄保留已取得的資料，研究報告尚未完成。")
+    st.caption(f"已保存準備紀錄v{report['version']} · {report['provider']}／{report['model']}")
+    if metadata.get("review_error"):
+        st.text(metadata["review_error"])
+    for message in _preparation_messages(metadata):
+        st.text(message)
+    st.info("請參照下方保存的主題、來源與研究資料，切換到「生成新報告」核對選材或補充證據後重新生成。")
+    with st.expander("研究準備紀錄與中斷原因", expanded=True):
+        st.markdown(report["body"])
+        st.json({key: metadata.get(key) for key in (
+            "failure_stage", "failure_reason", "preparation_warnings", "research_packet",
+            "research_execution", "research_budget", "research_brief")})
+    with st.expander("已保存的來源快照"):
+        _sources_preview(report.get("sources", []))
+    with st.expander("歷史研究紀錄"):
+        with ResearchStore() as store:
+            snapshots = store.list_research_snapshots(report["id"])
+        st.json(snapshots)
+    st.caption("可下載JSON備份研究資料；這份準備紀錄尚無報告正文，未提供報告格式下載。")
+    st.download_button("下載研究準備紀錄JSON", json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+                       file_name=f"research-preparation-{report['id']}-v{report['version']}.json",
+                       mime="application/json", key="research_download_json")
 
 
 def _library():
@@ -573,10 +670,14 @@ def _library():
     records = {item["id"]: item for item in reports}
     if st.session_state.get("research_active_report") not in records:
         st.session_state["research_active_report"] = reports[0]["id"]
-    selected = st.selectbox("選擇報告", list(records),
-                            format_func=lambda key: f"{records[key]['title']}｜v{records[key]['version']}｜{records[key]['as_of']}",
+    selected = st.selectbox("選擇報告或準備紀錄", list(records),
+                            format_func=lambda key: ("" if _report_has_body(records[key]) else "準備紀錄｜") +
+                            f"{records[key]['title']}｜v{records[key]['version']}｜{records[key]['as_of']}",
                             key="research_active_report")
     report = records[selected]
+    if not _report_has_body(report):
+        _preparation_record(report)
+        return
     base_key, title_key, body_key = (f"research_editor_{name}_{selected}" for name in ("base", "title", "body"))
     drafts = st.session_state.setdefault("research_editor_drafts", {})
     draft = drafts.setdefault(selected, {"base": report["version"], "title": report["title"], "body": report["body"]})
@@ -595,6 +696,8 @@ def _library():
         st.warning("其他頁面已保存新版本。你的編輯仍保留；先複製需要的文字，再載入最新版本合併修改。")
     st.caption(f"已保存版本v{report['version']} · {report['provider']}／{report['model']} · 修改不會調用AI或覆蓋原始草稿。")
     metadata = report.get("metadata", {})
+    for message in _preparation_messages(metadata):
+        st.warning("研究準備提示｜" + message)
     if metadata.get("deep_research"):
         answer = {"full": "研究設計所需證據已具備可追溯紀錄", "limited": "部分問題可回答", "unanswered": "現有資料不足以回答"}
         st.info("深度研究｜" + answer.get(metadata.get("answer_status"), "核驗尚未完成") + "；不代表已獨立核實。")
@@ -704,8 +807,9 @@ def render_research_tab(*, provider, model, api_key, investat_token, analysis_av
     st.subheader("研究報告")
     st.caption("按主題篩選來源 → 檢查必要證據 → 補充資料 → 整理數據與比較 → 寫作及實質審稿")
     message = st.session_state.pop("research_flash", None)
+    level = st.session_state.pop("research_flash_level", "success")
     if message:
-        st.success(message)
+        (st.warning if level == "warning" else st.success)(message)
     generate, library = st.tabs(["生成新報告", "報告庫與編輯"])
     with generate:
         _generate(provider=provider, model=model, api_key=api_key, investat_token=investat_token,

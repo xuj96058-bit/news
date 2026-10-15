@@ -25,6 +25,7 @@ METADATA_FIELDS = frozenset({
     "data_preparation",
     "deep_research", "research_packet", "research_budget", "research_execution",
     "answer_status", "claim_audit", "restoration",
+    "report_has_body", "failure_stage", "failure_reason", "preparation_warnings",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",

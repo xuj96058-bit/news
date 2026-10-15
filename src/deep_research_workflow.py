@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import time
+from threading import Event
 
 from openai import OpenAI
 
@@ -22,6 +23,26 @@ class ResearchBudgetError(ResearchError):
     def __init__(self):
         super().__init__("generation_timeout")
         self.args = ("深度研究已達設定的時間或模型調用上限；已完成資料及草稿保留。",)
+
+
+class PreparationBudgetError(ResearchBudgetError):
+    """Stop optional preparation while there is still budget to write and review."""
+
+
+def _failure_reason(error):
+    """Only application-owned categories may enter persisted diagnostics."""
+    if isinstance(error, PreparationBudgetError):
+        return "writing_budget_reserved"
+    if _transport_timed_out(error) or isinstance(error, ResearchBudgetError):
+        return "generation_timeout"
+    if isinstance(error, (ResearchError, ModelResponseError)):
+        return error.reason
+    status = getattr(error, "status_code", None)
+    if type(status) is int and status in {400, 401, 402, 403, 404, 408, 429, 500, 502, 503, 504}:
+        return f"provider_http_{status}"
+    if isinstance(error, ProviderConfigurationError):
+        return "provider_configuration"
+    return "provider_or_processing_error"
 
 
 def research_budget(value=None):
@@ -133,21 +154,42 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
     calls, usage_stages = 0, []
     owned, saved, packet = False, None, None
     persistence_error = None
+    active_stage = "preparing"
+    failures = []
+    cancelled = Event()
+    writer_calls = 3 if style == "argumentative" else 2
+    writer_seconds = min(720 if style == "argumentative" else 360, limits["timeout_seconds"] * 0.6)
+    preparation_deadline = deadline - writer_seconds
+    preparing = True
+
+    def record_failure(error):
+        item = {"stage": active_stage, "reason": _failure_reason(error)}
+        if item not in failures:
+            failures.append(item)
+        return item
 
     def guard(stage):
-        nonlocal calls
+        nonlocal calls, active_stage
+        active_stage = stage
+        if cancelled.is_set():
+            raise ResearchError("generation_timeout")
         if time.monotonic() >= deadline or calls >= limits["max_calls"]:
             raise ResearchBudgetError()
+        if preparing and (time.monotonic() >= preparation_deadline
+                or calls >= limits["max_calls"] - writer_calls):
+            raise PreparationBudgetError()
         calls += 1
         usage_stages.append({"stage": stage, "attempt": calls})
 
     def request(system, payload, stage):
+        nonlocal active_stage
+        active_stage = stage
         user = json.dumps(payload, ensure_ascii=False)
         if len(system) + len(user) > MAX_PROMPT_CHARS:
             raise ResearchError("source_budget")
         guard(stage)
         _progress(on_progress, stage)
-        stage_deadline = min(deadline, time.monotonic() + 240)
+        stage_deadline = min(preparation_deadline if preparing else deadline, time.monotonic() + 240)
         if provider == "anthropic":
             value = _nonstream_content(claude_completion(model=model, api_key=key, system=system, user=user))
             if time.monotonic() >= stage_deadline:
@@ -167,11 +209,16 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
             on_progress=lambda _stage, size: _progress(on_progress, stage, size))
 
     def metadata():
+        packet["packet_hash"] = hashlib.sha256(json.dumps({key: value for key, value in packet.items()
+            if key != "packet_hash"}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        warnings = [*packet.get("preparation_warnings", []), *failures]
         return {"deep_research": True, "research_packet": packet, "research_budget": limits,
             "research_execution": {"api_call_count": calls, "stages": list(usage_stages),
                 "duration_seconds": round(time.monotonic()-started, 2)},
             "api_call_count": calls, "answer_status": packet["answer_status"],
-            "workflow_schema_version": 2, "manually_verified": False}
+            "workflow_schema_version": 2, "manually_verified": False,
+            "preparation_warnings": warnings,
+            **({"failure_stage": failures[-1]["stage"], "failure_reason": failures[-1]["reason"]} if failures else {})}
 
     def persist(draft):
         nonlocal saved, persistence_error
@@ -186,12 +233,15 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
                 raise
         saved = draft
 
-    def audit(draft):
+    def audit(draft, *, reserve_calls=0, reserve_seconds=0):
         paragraphs = audit_paragraphs(draft, style)
         if not paragraphs:
             return {"claims": [], "summary": "草稿格式尚未通過，無法逐項核驗。", "complete": False,
                     "unresolved_count": 1, "independently_verified": False}
         try:
+            # An optional first-pass audit must not consume the review's slot.
+            if calls >= limits["max_calls"] - reserve_calls or deadline - time.monotonic() <= reserve_seconds:
+                raise ResearchBudgetError()
             raw = request(AUDIT_SYSTEM, {"paragraphs": paragraphs, "research_design": packet["design"],
                 "evidence_items": packet["evidence"]["items"], "calculations": packet["calculations"]}, "auditing")
             result = parse_claim_audit(raw, paragraphs, packet["evidence"]["items"], packet["calculations"])
@@ -207,8 +257,10 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         return result
 
     def writer_checkpoint(draft):
+        draft["metadata"]["report_has_body"] = True
         persist(draft)  # Never spend an audit call before durable acknowledgement.
-        packet["claim_audit"] = audit(draft.get("metadata", {}).get("structured_draft"))
+        packet["claim_audit"] = audit(draft.get("metadata", {}).get("structured_draft"),
+            reserve_calls=1, reserve_seconds=min(240, limits["timeout_seconds"] * 0.2))
 
     def preparation_checkpoint(value):
         nonlocal packet
@@ -217,10 +269,13 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         memo = {"title": (topic + "｜研究資料準備")[:180], "sources": packet["sources"],
             "body": f"# {_markdown_text(topic)}\n\n資料截至：{as_of}\n\n> 研究準備紀錄；正文尚未生成。\n" + render_packet_appendix(packet),
             "metadata": {"workflow_stage": "research_prepared", "review_status": "pending",
-                "quality_status": "pending", "report_mode": report_mode, "writing_style": style}}
+                "quality_status": "pending", "report_mode": report_mode, "writing_style": style,
+                "report_has_body": False}}
         persist(memo)
 
     try:
+        if register_cancel:
+            register_cancel(cancelled.set)
         if provider != "anthropic":
             if client is None:
                 client = OpenAI(api_key=key, base_url=selected.base_url, timeout=60, max_retries=0)
@@ -229,9 +284,30 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
                     register_cancel(client.close)
             elif isinstance(client, OpenAI) and (client.api_key != key or str(client.base_url).rstrip("/") != selected.base_url.rstrip("/")):
                 raise ProviderConfigurationError("invalid_model")
-        packet = prepare_research_packet(topic, checked, as_of=as_of, request=request,
-            retrieve_sources=retrieve_sources, max_rounds=limits["max_rounds"], deadline=deadline,
-            on_progress=on_progress, on_checkpoint=preparation_checkpoint)
+        try:
+            packet = prepare_research_packet(topic, checked, as_of=as_of, request=request,
+                retrieve_sources=retrieve_sources, max_rounds=limits["max_rounds"], deadline=preparation_deadline,
+                on_progress=on_progress, on_checkpoint=preparation_checkpoint)
+        except Exception as error:
+            if error is persistence_error or cancelled.is_set() or time.monotonic() >= deadline:
+                raise
+            if isinstance(error, ProviderConfigurationError) or getattr(error, "status_code", None) in {401, 402, 403, 404}:
+                raise
+            failure = record_failure(error)
+            if packet is None:
+                # Design failure still leaves the supplied sources available to
+                # the writer. Build an honest empty packet without a paid call.
+                from .research_design import fallback_design
+                packet = prepare_research_packet(topic, checked, as_of=as_of,
+                    request=lambda _system, _payload, stage: fallback_design(topic, _date_label(as_of))
+                        if stage == "designing" else {"items": []},
+                    retrieve_sources=False, max_rounds=0)
+            packet["stop_reason"] = "preparation_interrupted"
+            packet["retrieval_outcomes"].append({**failure, "status": "incomplete"})
+            if packet["answer_status"] == "full":
+                packet["answer_status"] = "limited"
+        finally:
+            preparing = False
         preparation_checkpoint(packet)
         from .research_workflow import generate_research_workflow
         result = generate_research_workflow(topic, packet["sources"], api_key=key, provider=provider,
@@ -250,14 +326,16 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         packet["packet_hash"] = hashlib.sha256(json.dumps({key: value for key, value in packet.items()
             if key != "packet_hash"}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         findings = [*result["metadata"].get("review_findings", []), *packet_findings(packet), *_audit_findings(final_audit)]
-        unresolved = (packet["answer_status"] != "full" or not final_audit.get("complete")
+        unresolved = (bool(failures) or bool(packet.get("preparation_warnings"))
+            or packet["answer_status"] != "full" or not final_audit.get("complete")
             or final_audit.get("unresolved_count", 0) or result["metadata"].get("validation_warnings")
             or any(row.get("severity") in {"warning", "error"} for row in findings))
         status = result["metadata"].get("review_status")
         if status != "review_failed":
             status = "needs_review" if unresolved else "reviewed"
         result["metadata"].update(metadata(), claim_audit=final_audit, review_findings=findings[:100],
-            review_status=status, quality_status="reviewed_snapshot" if status == "reviewed" else status)
+            review_status=status, quality_status="reviewed_snapshot" if status == "reviewed" else status,
+            report_has_body=True)
         if unresolved:
             result["body"] = "> 深度核驗仍有缺口；請結合文末研究紀錄閱讀，不能視為已獨立核實。\n\n" + result["body"]
         result["body"] += render_packet_appendix(packet)
@@ -267,10 +345,15 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
     except Exception as error:
         if error is persistence_error:
             raise
+        record_failure(error)
         if saved is not None:
-            saved["metadata"].update(metadata(), workflow_stage="review_failed", review_status="review_failed",
-                quality_status="review_failed", review_error="研究未完成；已保留最後成功保存的資料或草稿。")
-            saved["body"] = "> 研究未完成，以下為最後成功保存的資料或草稿。\n\n" + saved["body"]
+            has_body = saved["metadata"].get("report_has_body", False)
+            status = "review_failed" if has_body else "preparation_failed"
+            message = ("研究未完成；已保留最後成功保存的正文草稿。" if has_body else
+                "研究準備中斷，尚未生成正文；已保留來源與研究紀錄。")
+            saved["metadata"].update(metadata(), workflow_stage=status, review_status=status,
+                quality_status=status, review_error=message, report_has_body=has_body)
+            saved["body"] = "> " + message + "\n\n" + saved["body"]
             return saved
         if isinstance(error, (ResearchError, ModelResponseError, ProviderConfigurationError, ProviderAPIError)):
             raise

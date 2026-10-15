@@ -114,7 +114,17 @@ class DeepResearchTests(unittest.TestCase):
         result = self.generate(self.client(fail_at=7))
         self.assertFalse(result["metadata"]["claim_audit"]["complete"])
         self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertTrue(result["metadata"]["report_has_body"])
         self.assertNotIn("synthetic-secret-provider-failure", json.dumps(result))
+
+    def test_reviewer_failure_never_reclassifies_saved_body_as_preparation(self):
+        saved = []
+        result = self.generate(self.client(fail_at=6), on_draft=saved.append)
+        self.assertEqual(result["metadata"]["review_status"], "review_failed")
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertTrue(saved[-1]["metadata"]["report_has_body"])
+        self.assertTrue(saved[-1]["metadata"]["structured_draft"])
+        self.assertNotIn("正文尚未生成", result["body"])
 
     def test_call_budget_stops_before_additional_paid_audit(self):
         client = self.client()
@@ -124,13 +134,113 @@ class DeepResearchTests(unittest.TestCase):
         self.assertFalse(result["metadata"]["claim_audit"]["complete"])
         self.assertEqual(result["metadata"]["review_status"], "needs_review")
 
-    def test_evidence_api_failure_preserves_design_checkpoint(self):
+    def test_evidence_api_failure_preserves_design_and_continues_to_prose(self):
         saved = []
         result = self.generate(self.client(fail_at=2), on_draft=saved.append)
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(result["metadata"]["review_status"], "review_failed")
+        self.assertFalse(saved[0]["metadata"]["report_has_body"])
+        self.assertTrue(saved[-1]["metadata"]["report_has_body"])
+        self.assertTrue(result["metadata"]["structured_draft"])
+        self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertEqual(result["metadata"]["failure_stage"], "organizing")
+        self.assertEqual(result["metadata"]["failure_reason"], "provider_or_processing_error")
+        self.assertEqual(result["metadata"]["answer_status"], "unanswered")
+        self.assertNotIn("正文尚未生成", result["body"])
         self.assertEqual(result["metadata"]["research_packet"]["design"]["questions"], design()["questions"])
         self.assertNotIn("synthetic-secret-provider-failure", json.dumps(result))
+
+    def test_design_api_failure_uses_sources_without_claiming_completed_research(self):
+        result = self.generate(self.client(fail_at=1))
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertEqual(result["metadata"]["failure_stage"], "designing")
+        self.assertEqual(result["metadata"]["answer_status"], "unanswered")
+        self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertNotIn("正文尚未生成", result["body"])
+
+    def test_repeated_provider_failure_keeps_memo_separate_from_a_draft(self):
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def fail_after_design(**kwargs):
+            if len(self.payloads):
+                raise RuntimeError("synthetic-secret-token")
+            return original(**kwargs)
+        client.chat.completions.create.side_effect = fail_after_design
+        result = self.generate(client)
+        self.assertFalse(result["metadata"]["report_has_body"])
+        self.assertEqual(result["metadata"]["workflow_stage"], "preparation_failed")
+        self.assertEqual(result["metadata"]["review_status"], "preparation_failed")
+        self.assertEqual(result["metadata"]["failure_stage"], "planning")
+        self.assertNotIn("synthetic-secret-token", json.dumps(result))
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+
+    def test_preparation_call_budget_reserves_plan_writer_and_reviewer(self):
+        packet = prepare_research_packet(TOPIC, sources(), as_of=AS_OF,
+            request=lambda _s, _p, stage: design() if stage == "designing" else evidence(),
+            retrieve_sources=False)
+        def busy_preparation(*_args, request, on_checkpoint, **_kwargs):
+            on_checkpoint(packet)
+            for _ in range(10):
+                request("Extraction", {"previous_items": []}, "organizing")
+            return packet
+        client = self.client()
+        with patch("src.deep_research_workflow.prepare_research_packet", side_effect=busy_preparation):
+            result = self.generate(client, budget={"max_calls": 6})
+        stages = [row["stage"] for row in result["metadata"]["research_execution"]["stages"]]
+        self.assertEqual(stages, ["organizing"] * 3 + ["planning", "writing", "reviewing"])
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertEqual(result["metadata"]["failure_reason"], "writing_budget_reserved")
+        self.assertEqual(client.chat.completions.create.call_count, 6)
+
+    def test_preparation_timeout_leaves_time_for_body_and_review(self):
+        from src.research import ResearchError
+        now = [0.0]
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def slow_extraction(**kwargs):
+            value = original(**kwargs)
+            if "previous_items" in self.payloads[-1]:
+                # With a 120-second overall budget, preparation stops at 48s.
+                now[0] = 49.0
+                raise ResearchError("generation_timeout")
+            return value
+        client.chat.completions.create.side_effect = slow_extraction
+        with patch("src.deep_research_workflow.time.monotonic", side_effect=lambda: now[0]):
+            result = self.generate(client, budget={"timeout_seconds": 120})
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertEqual(result["metadata"]["failure_reason"], "generation_timeout")
+        self.assertTrue(any("writer_draft" in payload for payload in self.payloads))
+        self.assertLess(result["metadata"]["research_execution"]["duration_seconds"], 120)
+
+    def test_cancelled_preparation_does_not_start_another_request(self):
+        callbacks = []
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def cancel_during_extraction(**kwargs):
+            value = original(**kwargs)
+            if "previous_items" in self.payloads[-1]:
+                callbacks[0]()
+                raise RuntimeError("closed transport")
+            return value
+        client.chat.completions.create.side_effect = cancel_during_extraction
+        result = self.generate(client, register_cancel=callbacks.append)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertFalse(result["metadata"]["report_has_body"])
+        self.assertEqual(result["metadata"]["workflow_stage"], "preparation_failed")
+
+    def test_thirty_source_failure_shape_still_generates_evidence_bounded_body(self):
+        # The real regression saved a design for 30 sources, then failed on the
+        # first organizing request with no rounds or evidence saved.
+        rows = [copy.deepcopy(sources()[index % 2]) for index in range(30)]
+        for index, row in enumerate(rows, 1):
+            row["id"] = f"S{index}"
+        client = self.client(fail_at=2)
+        result = generate_research_workflow(TOPIC, rows, api_key="synthetic-key", as_of=AS_OF,
+            deep_research=True, writing_style="argumentative", report_mode="argumentative",
+            retrieve_sources=False, client=client)
+        self.assertEqual(len(result["sources"]), 30)
+        self.assertEqual(result["metadata"]["research_packet"]["evidence"]["items"], [])
+        self.assertTrue(result["metadata"]["structured_draft"])
+        self.assertEqual(result["metadata"]["answer_status"], "unanswered")
+        self.assertNotIn("正文尚未生成", result["body"])
 
     def test_durable_save_failure_stops_before_next_model_request(self):
         client = self.client()
@@ -199,7 +309,7 @@ class PreparationTests(unittest.TestCase):
         snapshots = []
         def request(system, payload, stage):
             if stage == "designing": return design()
-            if len(payload["sources"]) > 2: raise RuntimeError("extraction unavailable")
+            if any(row["id"] == "S3" for row in payload["sources"]): raise RuntimeError("extraction unavailable")
             return {"items": []}
         with patch("src.research_discovery.supplement_sources", return_value={
                 "sources": [*sources(), added], "outcomes": [], "attempted_urls": [], "added_count": 1}):
