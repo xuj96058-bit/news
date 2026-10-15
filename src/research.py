@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from requests.exceptions import Timeout as RequestsTimeout
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 
 
 MAX_ARTICLES = 30
@@ -749,7 +749,7 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
             if remaining <= 0:
                 raise ResearchError("generation_timeout")
             request["timeout"] = min(60.0, remaining)
-        return _stream_content(client.chat.completions.create(**request), on_progress=progress,
+        return _stream_content(client.chat.completions.create(**configure_provider_request(provider, request)), on_progress=progress,
                                register_cancel=register_cancel, deadline=deadline)
 
     try:

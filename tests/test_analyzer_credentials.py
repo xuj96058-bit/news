@@ -57,7 +57,7 @@ class AnalyzerCredentialsTests(unittest.TestCase):
         }
         client = MagicMock()
         client.chat.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(data)))],
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps(data)))],
         )
         with patch("src.analyzer.get_client", return_value=client) as get, \
              patch("src.analyzer.post_process_impacts", side_effect=lambda result, **_: result) as process:

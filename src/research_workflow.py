@@ -17,7 +17,7 @@ from collections.abc import Callable
 from openai import OpenAI
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research_quality import build_research_brief
 from .research import (
     MAX_PROMPT_CHARS, MAX_REPORT_TOKENS, MAX_RESPONSE_CHARS, ResearchError,
@@ -623,7 +623,7 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
             request.update(temperature=0.2, max_tokens=MAX_REPORT_TOKENS)
         if provider == "deepseek":
             request["extra_body"] = {"thinking": {"type": "disabled"}}
-        captured = _CapturedStream(client.chat.completions.create(**request))
+        captured = _CapturedStream(client.chat.completions.create(**configure_provider_request(provider, request)))
         try:
             return _stream_content(captured, on_progress=progress,
                                    register_cancel=register_cancel, deadline=deadline)

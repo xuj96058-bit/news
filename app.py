@@ -60,7 +60,7 @@ with st.sidebar:
         st.session_state["ai_model"] = provider.models[0]
     model_choice = st.selectbox("AI 模型", model_options, key="ai_model")
     selected_model = (st.text_input("自訂模型 ID", key="ai_custom_model",
-                                   placeholder="填入此服務商的完整模型 ID").strip()
+                                   placeholder="例如 deepseek/deepseek-v4-pro" if provider_id == "openrouter" else "填入此服務商的完整模型 ID").strip()
                       if model_choice == "自訂模型 ID" else model_choice)
     try:
         validate_provider_model(provider_id, selected_model)
@@ -85,6 +85,11 @@ with st.sidebar:
     else:
         st.info("請先輸入 API key 才能分析；抓取新聞不需要 key。")
     st.caption("模型是否可用取決於你的 API 帳戶權限；選單不會發出付費請求。")
+    if provider_id == "openrouter":
+        st.caption("同一把 OpenRouter key 可選 Grok、GPT、Gemini、Claude 或 DeepSeek；也可填寫完整的「發行者/模型」ID。新聞及報告會透過 OpenRouter 調用此模型，費用由 OpenRouter 帳戶計算。")
+        st.caption("報告流程需要支援 JSON 回覆的模型／端點；自訂 ID 會在實際生成時確認可用。切換到 OpenRouter 後請重新貼上它的 key 並按 Enter。")
+        st.link_button("取得 OpenRouter API key", "https://openrouter.ai/settings/keys")
+        st.link_button("查看 OpenRouter 模型 ID", "https://openrouter.ai/models")
 
     st.subheader("Investat 設定")
     entered_investat_token = st.text_input(

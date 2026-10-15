@@ -1,4 +1,4 @@
-"""Five-provider routing and credential isolation without external requests."""
+"""Provider routing and credential isolation without external requests."""
 
 import json
 import os
@@ -11,7 +11,7 @@ import requests
 with patch("dotenv.load_dotenv"):
     from src.analyzer import analyze_news
     from src.analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError, analysis_error_message
-    from src.llm_providers import PROVIDERS, provider_environment_key, validate_provider_model
+    from src.llm_providers import PROVIDERS, configure_provider_request, provider_environment_key, validate_provider_model
 
 
 KEY = "synthetic-session-key"
@@ -106,6 +106,50 @@ class ProviderEnvironmentTests(unittest.TestCase):
         with self.assertRaises(ProviderConfigurationError):
             provider_environment_key("unknown")
 
+    def test_openrouter_namespaced_models_and_aliases_only_validate_for_router(self):
+        for model in ("deepseek/deepseek-v4-pro", "anthropic/claude-custom:free", "~publisher/latest"):
+            with self.subTest(model=model):
+                self.assertEqual(validate_provider_model("openrouter", "  " + model + "  "), model)
+                for native in ("deepseek", "openai", "anthropic", "gemini", "xai"):
+                    with self.assertRaises(ProviderConfigurationError):
+                        validate_provider_model(native, model)
+        for model in (None, "", "gpt-custom", "/model", "publisher/", "publisher/model/extra",
+                      "https://example.org/model", "publisher/bad model", "publisher/bad\nmodel",
+                      "publisher/bad\tmodel", "publisher/" + "a" * 201):
+            with self.subTest(invalid=model), self.assertRaises(ProviderConfigurationError):
+                validate_provider_model("openrouter", model)
+
+    def test_openrouter_never_borrows_an_openai_or_upstream_environment_key(self):
+        for endpoint in ("", "https://openrouter.ai/api/v1", "https://api.openai.com/v1"):
+            with self.subTest(endpoint=endpoint), patch.dict(os.environ, {
+                "LLM_PROVIDER": "openrouter", "OPENAI_BASE_URL": endpoint,
+                "OPENAI_API_KEY": OTHER_KEY, "ANTHROPIC_API_KEY": OTHER_KEY,
+                "DEEPSEEK_API_KEY": OTHER_KEY,
+            }, clear=True):
+                self.assertEqual(provider_environment_key("openrouter"), "")
+                os.environ["OPENROUTER_API_KEY"] = "  " + KEY + "  "
+                self.assertEqual(provider_environment_key("openrouter"), KEY)
+
+    def test_router_request_keeps_json_stream_timeout_and_does_not_mutate_native_request(self):
+        request = {"model": "deepseek/deepseek-v4-pro", "messages": [],
+                   "response_format": {"type": "json_object"}, "stream": True, "timeout": 17,
+                   "max_tokens": 2000, "temperature": 0.2,
+                   "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}}
+        original = json.loads(json.dumps(request))
+        configured = configure_provider_request("openrouter", request)
+        self.assertEqual(request, original)
+        self.assertEqual(configured["model"], request["model"])
+        self.assertEqual(configured["response_format"], {"type": "json_object"})
+        self.assertTrue(configured["stream"])
+        self.assertEqual(configured["timeout"], 17)
+        self.assertEqual(configured["max_tokens"], 8192)
+        self.assertNotIn("temperature", configured)
+        self.assertEqual(configured["extra_body"], {"provider": {"require_parameters": True}})
+        self.assertEqual(configure_provider_request("openrouter", dict(request, max_tokens=16000))["max_tokens"], 16000)
+        for provider in PROVIDERS:
+            if provider != "openrouter":
+                self.assertEqual(configure_provider_request(provider, request), original)
+
 
 class ProviderRoutingTests(unittest.TestCase):
     def setUp(self):
@@ -137,7 +181,7 @@ class ProviderRoutingTests(unittest.TestCase):
         return response
 
     def test_compatible_providers_pin_official_endpoint_and_parameters(self):
-        for identifier in ("deepseek", "openai", "xai", "gemini"):
+        for identifier in ("deepseek", "openai", "xai", "gemini", "openrouter"):
             provider = PROVIDERS[identifier]
             with self.subTest(provider=identifier):
                 self.get_client.reset_mock()
@@ -159,6 +203,10 @@ class ProviderRoutingTests(unittest.TestCase):
                     self.assertIn("max_tokens", request)
                 if identifier == "deepseek":
                     self.assertEqual(request["extra_body"], {"thinking": {"type": "disabled"}})
+                elif identifier == "openrouter":
+                    self.assertEqual(request["extra_body"], {"provider": {"require_parameters": True}})
+                    self.assertGreaterEqual(request["max_tokens"], 8192)
+                    self.assertNotIn("temperature", request)
                 else:
                     self.assertNotIn("extra_body", request)
         self.post.assert_not_called()
@@ -177,6 +225,25 @@ class ProviderRoutingTests(unittest.TestCase):
         os.environ["GEMINI_API_KEY"] = KEY
         analyze_news("Synthetic news", provider="gemini")
         self.get_client.assert_called_once_with(api_key=KEY, base_url=PROVIDERS["gemini"].base_url)
+
+    def test_openrouter_claude_namespace_stays_on_compatible_sdk_and_router_key(self):
+        os.environ.update(OPENROUTER_API_KEY=KEY, ANTHROPIC_API_KEY=OTHER_KEY)
+        analyze_news("Synthetic news", provider="openrouter", model="anthropic/claude-custom:free")
+        self.get_client.assert_called_once_with(api_key=KEY, base_url=PROVIDERS["openrouter"].base_url)
+        self.assertEqual(self.client.chat.completions.create.call_args.kwargs["model"], "anthropic/claude-custom:free")
+        self.post.assert_not_called()
+
+    def test_openrouter_error_finish_reason_never_accepts_even_valid_json(self):
+        for reason in ("error", "content_filter"):
+            with self.subTest(reason=reason):
+                self.client.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+                    finish_reason=reason, message=SimpleNamespace(content=json.dumps(PAYLOAD)),
+                )])
+                with self.assertRaises(ModelResponseError) as caught:
+                    analyze_news("Synthetic news", provider="openrouter", api_key=KEY,
+                                 model="x-ai/grok-4.7")
+                self.assertEqual(caught.exception.reason, "invalid_shape")
+        self.post.assert_not_called()
 
     def test_invalid_model_is_rejected_before_client_or_http_request(self):
         for identifier in PROVIDERS:

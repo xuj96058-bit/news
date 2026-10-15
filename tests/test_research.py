@@ -345,7 +345,7 @@ class ResearchReportTests(unittest.TestCase):
         self.assertIn("manual\\_evidence", result["body"])
 
     def test_factory_pins_provider_endpoint_key_and_parameter_isolation(self):
-        for provider in ("deepseek", "openai", "xai", "gemini"):
+        for provider in ("deepseek", "openai", "xai", "gemini", "openrouter"):
             with self.subTest(provider=provider):
                 client, _ = fake_client()
                 with patch("src.research.OpenAI", return_value=client) as factory:
@@ -359,7 +359,11 @@ class ResearchReportTests(unittest.TestCase):
                     self.assertEqual(request["max_completion_tokens"], MAX_REPORT_TOKENS)
                     self.assertNotIn("temperature", request)
                     self.assertNotIn("max_tokens", request)
-                if provider != "deepseek":
+                if provider == "openrouter":
+                    self.assertEqual(request["extra_body"], {"provider": {"require_parameters": True}})
+                    self.assertNotIn("temperature", request)
+                    self.assertGreaterEqual(request["max_tokens"], 8192)
+                elif provider != "deepseek":
                     self.assertNotIn("extra_body", request)
                 client.close.assert_called_once()
                 self.assertEqual(set(result["metadata"]), {"provider", "model", "report_scope"})

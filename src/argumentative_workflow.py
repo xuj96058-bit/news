@@ -13,7 +13,7 @@ import time
 from openai import OpenAI
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research import (MAX_PROMPT_CHARS, MAX_RESPONSE_CHARS, ResearchError,
     _date_label, _markdown_text, _number_values, _nonstream_content, _progress,
     _stream_content, _transport_timed_out, _validated_sources, prepare_evidence)
@@ -235,7 +235,7 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
                 extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
         else:
             params.update(max_tokens=8000, temperature=0.2)
-        captured = _CapturedStream(client.chat.completions.create(**params))
+        captured = _CapturedStream(client.chat.completions.create(**configure_provider_request(provider, params)))
         try:
             return _stream_content(captured, deadline=stage_deadline, register_cancel=register_cancel,
                 max_chunks=50000,

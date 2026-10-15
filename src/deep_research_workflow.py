@@ -9,7 +9,7 @@ import time
 from openai import OpenAI
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research import (MAX_PROMPT_CHARS, ResearchError, _date_label, _nonstream_content,
     _progress, _stream_content, _transport_timed_out, _validated_sources)
 from .research_audit import AUDIT_SYSTEM, parse_claim_audit
@@ -162,7 +162,7 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
             params.update(max_tokens=24000, extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
         else:
             params.update(max_tokens=12000, temperature=0.2)
-        return _stream_content(client.chat.completions.create(**params), deadline=stage_deadline,
+        return _stream_content(client.chat.completions.create(**configure_provider_request(provider, params)), deadline=stage_deadline,
             register_cancel=register_cancel, max_chunks=50000,
             on_progress=lambda _stage, size: _progress(on_progress, stage, size))
 

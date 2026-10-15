@@ -22,10 +22,10 @@ INVESTAT_TOKEN = "synthetic-investat-session-token"
 SERVER_INVESTAT_TOKEN = "synthetic-investat-server-token"
 SERVER_URL = "https://synthetic-provider.example/v1"
 RSS_BUTTON = "AI 分析待處理新聞（最多 5 則）"
-PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini")
+PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini", "openrouter")
 PROVIDER_KEY_VARIABLES = (
     "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
 )
 
 
@@ -257,6 +257,70 @@ class ApiKeyUiTests(unittest.TestCase):
         app = self.app()
         self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "anthropic")
         self.assertNotEqual(app.sidebar.selectbox(key="ai_model").value, os.environ["LLM_MODEL"])
+
+    def test_openrouter_custom_model_keeps_namespace_and_resets_on_provider_change(self):
+        app = self.app()
+        default = self.select_provider(app, "openrouter")
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        app.sidebar.selectbox(key="ai_model").select("自訂模型 ID").run()
+        for invalid in ("claude-custom", "https://example.org/model", "publisher/model/extra", "publisher/bad model"):
+            with self.subTest(model=invalid):
+                app.sidebar.text_input(key="ai_custom_model").input(invalid).run()
+                self.assert_analysis_disabled(app)
+        model = "anthropic/claude-custom:free"
+        app.sidebar.text_input(key="ai_custom_model").input("  " + model + "  ").run()
+        self.assert_analysis_disabled(app, False)
+        app.text_area[0].input("Synthetic router news").run()
+        self.button(app, "分析").click().run()
+        self.analyze.assert_called_once_with(
+            "Synthetic router news", model=model, api_key=SESSION_KEY, provider="openrouter",
+        )
+        self.select_provider(app, "anthropic")
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assert_analysis_disabled(app)
+        self.select_provider(app, "openrouter")
+        self.assertEqual(app.sidebar.selectbox(key="ai_model").value, default)
+        app.sidebar.selectbox(key="ai_model").select("自訂模型 ID").run()
+        self.assertEqual(app.sidebar.text_input(key="ai_custom_model").value, "")
+        self.assert_analysis_disabled(app)
+
+    def test_openrouter_environment_key_is_hidden_and_not_shared(self):
+        os.environ.update(LLM_PROVIDER="openrouter", OPENROUTER_API_KEY=SERVER_KEY)
+        app = self.app()
+        self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "openrouter")
+        model = app.sidebar.selectbox(key="ai_model").value
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assert_analysis_disabled(app, False)
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        self.button(app, "清除輸入的 key").click().run()
+        app.text_area[0].input("Synthetic router fallback").run()
+        self.button(app, "分析").click().run()
+        self.analyze.assert_called_once_with(
+            "Synthetic router fallback", model=model, api_key=SERVER_KEY, provider="openrouter",
+        )
+        self.assertNotIn(SERVER_KEY, self.rendered_text(app))
+        for provider in PROVIDERS:
+            if provider != "openrouter":
+                with self.subTest(provider=provider):
+                    self.select_provider(app, provider)
+                    self.assert_analysis_disabled(app)
+                    self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assertEqual(os.environ["OPENROUTER_API_KEY"], SERVER_KEY)
+
+    def test_openrouter_grok_gpt_and_gemini_presets_forward_full_model_ids(self):
+        app = self.app()
+        self.select_provider(app, "openrouter")
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        for model in ("x-ai/grok-4.7", "openai/gpt-6.1-sol", "google/gemini-3.8-flash"):
+            with self.subTest(model=model):
+                self.assertIn(model, app.sidebar.selectbox(key="ai_model").options)
+                app.sidebar.selectbox(key="ai_model").select(model).run()
+                app.text_area[0].input("Synthetic routed news").run()
+                self.analyze.reset_mock()
+                self.button(app, "分析").click().run()
+                self.analyze.assert_called_once_with(
+                    "Synthetic routed news", model=model, api_key=SESSION_KEY, provider="openrouter",
+                )
 
     def test_sessions_are_isolated_and_clear_without_fallback_disables_analysis(self):
         first = self.app()

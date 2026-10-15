@@ -31,6 +31,9 @@ PROVIDERS = {
                           ("claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5"), "ANTHROPIC_API_KEY"),
     "gemini": Provider("gemini", "Google / Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
                        ("gemini-3.8-flash",), "GEMINI_API_KEY"),
+    "openrouter": Provider("openrouter", "OpenRouter", "https://openrouter.ai/api/v1",
+                           ("deepseek/deepseek-v4-pro", "openai/gpt-6.1-sol", "x-ai/grok-4.7",
+                            "anthropic/claude-sonnet-5", "google/gemini-3.8-flash"), "OPENROUTER_API_KEY"),
 }
 
 
@@ -84,9 +87,30 @@ def validate_provider_model(provider_id: str, model: str) -> str:
     if not isinstance(model, str):
         raise ProviderConfigurationError("invalid_model")
     model = model.strip()
+    if provider_id == "openrouter":
+        # Router IDs include the publisher. They are model names, never URLs.
+        if len(model) > 200 or not re.fullmatch(r"~?[A-Za-z0-9][A-Za-z0-9_-]{0,79}/[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", model):
+            raise ProviderConfigurationError("invalid_model")
+        return model
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", model) or not re.match(prefixes[provider_id], model):
         raise ProviderConfigurationError("invalid_model")
     return model
+
+
+def configure_provider_request(provider_id, request):
+    """Router-wide JSON routing; do not send upstream-specific sampling flags.
+
+    OpenRouter translates its normalized API to the chosen model provider.
+    Pin parameter support instead of silently routing to an endpoint that may
+    ignore response_format. This makes no model discovery or paid request.
+    """
+    if provider_id != "openrouter":
+        return request
+    result = dict(request)
+    result.pop("temperature", None)
+    result["max_tokens"] = max(result.get("max_tokens", 0), 8192)
+    result["extra_body"] = {"provider": {"require_parameters": True}}
+    return result
 
 
 def claude_completion(*, model: str, api_key: str, system: str, user: str):
