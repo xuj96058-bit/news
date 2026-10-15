@@ -44,6 +44,10 @@ def _select_articles(identifiers):
 
 def _generation_progress(bar, stage, received_chars=0, elapsed=0):
     steps = {
+        "designing": (0.07, "規劃研究問題、證據與分析方法"),
+        "supplementing": (0.18, "按證據缺口追溯公開原始資料"),
+        "calculating": (0.30, "檢查口徑並執行可重算分析"),
+        "auditing": (0.75, "逐項核對主張、證據與計算"),
         "preparing": (0.05, "5/5 核對研究資料與寫作範圍"),
         "retrieving": (0.08, "讀取相關原文與公開補證資料"),
         "organizing": (0.15, "整理可追溯數據"),
@@ -409,10 +413,20 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
     report_label = st.radio("報告模式", ["議論文式研究報告（建議）", "完整研究報告（建議）", "資料缺口簡報"], key="research_report_mode",
                             help="議論文模式會補讀相關原文、先規劃論點再撰稿與審查；資料不足會縮小結論。原有模式仍可使用。")
     report_mode = "argumentative" if report_label == "議論文式研究報告（建議）" else ("gap" if report_label == "資料缺口簡報" else "research")
+    deep_research = st.checkbox("深度研究：規劃、補證、計算與逐項核驗", value=True, key="research_deep",
+        help="按研究問題整理數值及文件證據，最多三輪定向補證。不同寫作形式使用同一研究流程；會增加時間與模型用量。")
+    budget = None
+    if deep_research:
+        with st.expander("研究時間與用量預算"):
+            minutes = st.number_input("最長研究時間（分鐘）", min_value=2, max_value=60, value=30, step=1, key="research_minutes")
+            max_calls = st.number_input("最多模型調用次數", min_value=6, max_value=24, value=16, step=1, key="research_calls")
+            rounds = st.number_input("最多補證輪次", min_value=0, max_value=3, value=3, step=1, key="research_rounds")
+            budget = {"timeout_seconds": int(minutes)*60, "max_calls": int(max_calls), "max_rounds": int(rounds)}
+        st.caption("先保存研究資料，再保存初稿與核驗結果。沒有新證據時提前停止；證據不足會保留有限結論。補證追溯已知公開連結、官方目錄及可識別公司的SEC申報，並非無限制網頁搜尋。")
     missing = [item["label"] for item in brief["requirements"] if item["id"] in brief["missing_required"]]
     if brief["ready"]:
         st.success("必要證據已具備可追溯觀測值，可進入寫作與實質審稿；結論仍須審查原始資料與適用範圍。")
-    elif report_mode == "research":
+    elif report_mode == "research" and not deep_research:
         st.warning("完整研究報告尚缺：" + "、".join(missing) + "。請回到補充資料及數據整理，或明確選擇「資料缺口簡報」。")
     elif report_mode == "gap":
         st.info("本次將保存為「資料缺口簡報」；尚缺：" + "、".join(missing) + "。正文會限制結論，並列出補充資料步驟。")
@@ -420,7 +434,9 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("生成時會讀取相關原文及建議公開資料，再決定可支持的論點。缺少直接證據的主張會縮小或列為待驗證假說。")
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
-    if report_mode == "argumentative":
+    if deep_research:
+        st.caption("將依題目組合財務、宏觀、政策或科技證據要求，先核對資料身份及口徑，再寫作並逐項核驗。模型評分不會消除程式發現的問題。")
+    elif report_mode == "argumentative":
         st.caption("議論文模式依序規劃論點、撰稿、實質審稿；需要時整理數據及進行一次修訂，最多5次AI調用。以選材準確、證據充分、判斷有用、讀起來清楚作為審查標準。")
     else:
         st.caption("數據整理通常調用1次AI；寫作並保存初稿，再獨立實質審稿，通常另調用2次AI。全文仍可修改和匯出。")
@@ -433,9 +449,9 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("請先填寫研究主題，才能生成報告。")
     button_label = "生成並保存議論文報告" if report_mode == "argumentative" else ("生成並保存資料缺口簡報" if report_mode == "gap" else "生成並保存完整研究報告")
     if st.button(button_label, type="primary", key="research_generate",
-                 disabled=not analysis_available or not sources or not topic.strip() or (report_mode == "research" and not brief["ready"])):
+                 disabled=not analysis_available or not sources or not topic.strip() or (report_mode == "research" and not deep_research and not brief["ready"])):
         bar = st.progress(0.0, text="5/5 準備寫作與實質審稿")
-        wait_limit = 720 if report_mode == "argumentative" else 360
+        wait_limit = budget["timeout_seconds"] if deep_research else (720 if report_mode == "argumentative" else 360)
         st.caption(f"本次整體等待上限為{wait_limit}秒。初稿會先保存，審稿失敗仍可繼續編輯。")
         initial = None
         try:
@@ -448,7 +464,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
 
             def metadata_for(draft):
                 return {**draft.get("metadata", {}), "source_count": len(sources),
-                        "report_mode": report_mode, "research_brief": draft.get("metadata", {}).get("research_brief", brief),
+                        "report_mode": draft.get("metadata", {}).get("report_mode", report_mode), "research_brief": draft.get("metadata", {}).get("research_brief", brief),
                         "selection": {"start": start.isoformat(), "end": end.isoformat(), "keywords": keywords,
                                       "source_ids": selected_sources},
                         "coverage": {"news": len(chosen_ids), "evidence": len(evidence)}}
@@ -458,26 +474,32 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 sources = draft.get("sources", sources)
                 _generation_progress(bar, "saving_initial", elapsed=elapsed)
                 with ResearchStore() as store:
-                    initial = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
-                        provider=provider, model=model, as_of=today.isoformat(), metadata=metadata_for(draft))
+                    if initial is None:
+                        initial = store.create_report(topic=topic, title=draft["title"], body=draft["body"], sources=sources,
+                            provider=provider, model=model, as_of=today.isoformat(), metadata=metadata_for(draft))
+                    else:
+                        initial = store.save_review(initial["id"], title=draft["title"], body=draft["body"],
+                            expected_version=initial["version"], metadata=metadata_for(draft), sources=sources, note="研究階段保存")
                 st.session_state["research_active_report"] = initial["id"]
-                st.success("初稿已保存，正在獨立審稿。")
+                st.success("研究資料已保存，正在生成正文。" if draft.get("metadata", {}).get("workflow_stage") == "research_prepared" else "初稿已保存，正在逐項核驗及審稿。")
                 return initial["id"]
 
             draft = run_generation(
                 lambda **kwargs: generate_research_workflow(topic, sources, api_key=api_key, provider=provider,
                     model=model, as_of=today.isoformat(), instructions=instructions,
                     research_brief=brief, report_mode=report_mode,
+                    deep_research=deep_research, budget=budget,
                     writing_style="argumentative" if report_mode == "argumentative" else "legacy", **kwargs),
                 update, on_artifact=save_writer, timeout=wait_limit)
             if initial is None:
                 save_writer(draft)
             _generation_progress(bar, "saving", elapsed=elapsed)
+            sources = draft.get("sources", sources)
             conflict = False
             with ResearchStore() as store:
                 try:
                     saved = store.save_review(initial["id"], title=draft["title"], body=draft["body"],
-                        expected_version=initial["version"], metadata=metadata_for(draft), note="AI獨立審稿結果")
+                        expected_version=initial["version"], metadata=metadata_for(draft), sources=sources, note="AI獨立審稿結果")
                 except ResearchConflictError:
                     # Another page may already be editing the saved initial draft.
                     # Keep that text and save the review as a separate suggestion.
@@ -573,6 +595,12 @@ def _library():
         st.warning("其他頁面已保存新版本。你的編輯仍保留；先複製需要的文字，再載入最新版本合併修改。")
     st.caption(f"已保存版本v{report['version']} · {report['provider']}／{report['model']} · 修改不會調用AI或覆蓋原始草稿。")
     metadata = report.get("metadata", {})
+    if metadata.get("deep_research"):
+        answer = {"full": "研究設計所需證據已具備可追溯紀錄", "limited": "部分問題可回答", "unanswered": "現有資料不足以回答"}
+        st.info("深度研究｜" + answer.get(metadata.get("answer_status"), "核驗尚未完成") + "；不代表已獨立核實。")
+        with st.expander("研究計劃、證據定位、計算與逐項核驗"):
+            st.json({"research_packet": metadata.get("research_packet"), "claim_audit": metadata.get("claim_audit"),
+                     "execution": metadata.get("research_execution"), "budget": metadata.get("research_budget")})
     if metadata.get("report_mode") == "gap":
         st.warning("報告模式：資料缺口簡報。必要證據尚未齊備，不可視為完整研究結論；修改標題或正文不會改變此保存狀態。")
     elif metadata.get("report_mode") == "research":
@@ -617,6 +645,11 @@ def _library():
         revision_id = st.selectbox("歷史版本", list(choices), key=f"research_revision_{selected}",
                                    format_func=lambda key: f"v{choices[key]['version']}｜{choices[key]['created_at']}｜{choices[key]['note']}")
         st.text(choices[revision_id]["body"])
+        if metadata.get("deep_research"):
+            with st.expander("此歷史版本的來源與研究紀錄"):
+                with ResearchStore() as store:
+                    snapshot = store.get_research_snapshot(selected, choices[revision_id]["version"])
+                st.json(snapshot)
         if st.button("還原為新的保存版本", key=f"research_restore_{selected}"):
             try:
                 with ResearchStore() as store:
@@ -649,7 +682,7 @@ def _library():
         st.markdown(report["body"])
     with st.expander("原始AI草稿與來源快照"):
         st.text(report["original_body"])
-        st.json(report["sources"])
+        st.json(report.get("original_sources", report["sources"]))
     st.caption("下載的是已保存版本。編輯器中的未保存文字不會自動替換匯出內容。JSON可在另一份news中匯入；data目錄請自行備份。")
     base = f"research-{selected}-v{report['version']}"
     cols = st.columns(4)

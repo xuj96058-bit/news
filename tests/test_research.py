@@ -276,7 +276,10 @@ class ResearchReportTests(unittest.TestCase):
                     with self.assertRaises(ResearchError) as caught:
                         self.generate(None, on_progress=lambda stage, size: events.append((stage, size)))
                 self.assertEqual(caught.exception.reason, "generation_timeout")
-                self.assertIn("180 秒", str(caught.exception))
+                # Shared diagnostics also serve configurable deep-research
+                # budgets; they must describe timeout without a fixed limit.
+                self.assertIn("逾時", str(caught.exception))
+                self.assertIn("時限", str(caught.exception))
                 self.assertNotIn(KEY, str(caught.exception))
                 self.assertTrue(caught.exception.__suppress_context__)
                 self.assertEqual(events, [("preparing", 0), ("requesting", 0)])

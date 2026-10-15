@@ -36,6 +36,14 @@ PUBLIC_HOSTS = frozenset({
     "news.rthk.hk", "rthk.hk", "www.rthk.hk", "www.ft.com", "nvidianews.nvidia.com",
     "www.apple.com", "www.cboe.com", "ir.aboutamazon.com", "investor.fb.com",
     "investor.atmeta.com", "investor.nvidia.com", "www.microsoft.com",
+    "data.sec.gov", "www.hkexnews.hk", "www1.hkexnews.hk", "www.cninfo.com.cn",
+    "static.cninfo.com.cn", "investor.apple.com", "abc.xyz", "investors.broadcom.com",
+    "investor.tsmc.com", "pr.tsmc.com", "www.gov.cn", "english.www.gov.cn",
+    "www.miit.gov.cn", "www.ndrc.gov.cn", "www.mofcom.gov.cn", "www.gov.uk",
+    "www.whitehouse.gov", "www.federalregister.gov", "www.energy.gov",
+    "www.commerce.gov", "www.bis.gov", "www.nist.gov", "ec.europa.eu",
+    "commission.europa.eu", "eur-lex.europa.eu", "www.imf.org", "www.worldbank.org",
+    "www.oecd.org", "arxiv.org",
 })
 MAX_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 250000
@@ -208,9 +216,9 @@ class _ArticleDocument(HTMLParser):
         return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
-def _capture(url, get=None):
+def _capture(url, get=None, *, deadline=None, user_agent=None):
     response, client = None, None
-    deadline = time.monotonic() + FETCH_SECONDS
+    deadline = min(time.monotonic() + FETCH_SECONDS, deadline) if deadline is not None else time.monotonic() + FETCH_SECONDS
     if get is None:
         client = requests.Session()
         client.trust_env = False  # No .netrc, ambient proxy, cookies or auth.
@@ -222,9 +230,10 @@ def _capture(url, get=None):
             current = _safe_url(current)
             if time.monotonic() >= deadline:
                 raise RetrievalError("timeout")
-            response = get(current, headers={"User-Agent": "news-research-reader/2.0",
+            remaining = deadline - time.monotonic()
+            response = get(current, headers={"User-Agent": user_agent or "news-research-reader/2.0",
                 "Accept": "text/html,application/pdf;q=0.9,text/plain;q=0.8"},
-                timeout=(3, 8), allow_redirects=False, stream=True)
+                timeout=(min(3, remaining / 2), min(8, remaining / 2)), allow_redirects=False, stream=True)
             status = response.status_code
             # Injected clients also cannot silently return an unchecked redirect.
             if getattr(response, "history", ()):

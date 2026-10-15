@@ -137,6 +137,32 @@ def _computed_numbers(brief, identifiers, text, evidence):
                 allowed.update(_number_values("100"))
         elif set(comparison["source_ids"]).intersection(identifiers):
             missing_operands = True
+    for calculation in brief.get("calculations", []):
+        if calculation.get("status") != "computed":
+            continue
+        values = _number_values(json.dumps(calculation.get("result", {}), ensure_ascii=False)) - _number_values(evidence)
+        if not values.intersection(numbers):
+            continue
+        source_ids = set(calculation.get("source_ids", []))
+        # Detailed operand identity and scenario status are checked again in
+        # the claim audit; numerical coincidence alone never marks a pass.
+        inputs = calculation.get("inputs", {})
+        operand_values = set()
+        def collect(value):
+            if isinstance(value, dict):
+                if "value" in value:
+                    operand_values.update(_number_values(str(value["value"])))
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+        collect(inputs)
+        if source_ids.issubset(identifiers) and operand_values.issubset(numbers):
+            allowed.update(values)
+        else:
+            missing_operands = True
     return allowed, missing_operands
 
 
@@ -363,9 +389,9 @@ def _review_result(raw, sources, research_brief=None):
     cleaned_findings = []
     for finding in findings:
         if (not isinstance(finding, dict) or set(finding) != {"section", "paragraph", "severity", "message", "source_ids"}
-                or finding["section"] not in _FIELDS
+                or finding["section"] not in (*_FIELDS, "title")
                 or not isinstance(finding["paragraph"], int) or isinstance(finding["paragraph"], bool)
-                or not 1 <= finding["paragraph"] <= len(draft[finding["section"]])
+                or not 1 <= finding["paragraph"] <= (1 if finding["section"] == "title" else len(draft[finding["section"]]))
                 or finding["severity"] not in {"info", "warning", "error"}
                 or not isinstance(finding["message"], str) or not 1 <= len(finding["message"].strip()) <= 1200
                 or not isinstance(finding["source_ids"], list) or len(finding["source_ids"]) > 40):
@@ -473,7 +499,9 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
                                register_cancel: Callable[[Callable[[], None]], None] | None = None,
                                on_draft: Callable[[dict], None] | None = None, client=None,
                                research_brief: dict | None = None, report_mode: str = "legacy",
-                               writing_style: str = "legacy", retrieve_sources: bool = True) -> dict:
+                               writing_style: str = "legacy", retrieve_sources: bool = True,
+                               deep_research: bool = False, budget=None, prepared_research=None,
+                               request_guard=None, overall_deadline=None) -> dict:
     """Write, acknowledge persistence, then review with at most two AI calls.
 
     Invalid citation evidence never discards generated text. Partial writer
@@ -484,12 +512,19 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
     calculations are always rebuilt from source-anchored observations. Explicit
     gap mode permits a labelled evidence-gap brief while evidence is incomplete.
     """
+    if deep_research:
+        from .deep_research_workflow import generate_deep_research_report
+        return generate_deep_research_report(topic, sources, api_key=api_key, provider=provider,
+            model=model, as_of=as_of, instructions=instructions, on_progress=on_progress,
+            register_cancel=register_cancel, on_draft=on_draft, client=client,
+            report_mode=report_mode, writing_style=writing_style, retrieve_sources=retrieve_sources, budget=budget)
     if writing_style == "argumentative" or report_mode == "argumentative":
         from .argumentative_workflow import generate_argumentative_report
         return generate_argumentative_report(topic, sources, api_key=api_key, provider=provider,
             model=model, as_of=as_of, instructions=instructions, on_progress=on_progress,
             register_cancel=register_cancel, on_draft=on_draft, client=client,
-            research_brief=research_brief, retrieve_sources=retrieve_sources)
+            research_brief=research_brief, retrieve_sources=retrieve_sources,
+            prepared_research=prepared_research, request_guard=request_guard, overall_deadline=overall_deadline)
     if writing_style != "legacy":
         raise ValueError("不支援的寫作方式。")
     _progress(on_progress, "preparing")
@@ -509,22 +544,35 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
     if research_brief is not None and report_mode == "legacy":
         report_mode = "research"
     brief = None
-    if report_mode != "legacy":
+    if prepared_research is not None:
+        from .research_packet import packet_brief
+        brief = packet_brief(prepared_research)
+        if not brief["ready"]:
+            report_mode = "gap"
+    elif report_mode != "legacy":
         # Caller-supplied ready flags, requirement IDs, references, computed
         # results and extra keys are never authorization to skip the gate.
         brief = build_research_brief(topic, checked, observations=(research_brief or {}).get("observations"), as_of=as_of_date)
         if report_mode == "research" and not brief["ready"]:
             raise ResearchEvidenceError()
     program_findings = _program_findings(brief, topic)
+    if prepared_research is not None:
+        from .research_packet import packet_findings
+        program_findings = packet_findings(prepared_research)
     render_options = {"research_brief": brief, "report_mode": report_mode}
     writer_system = _WRITER_SYSTEM
     reviewer_system = _REVIEWER_SYSTEM
     if brief is not None:
-        writer_system += _RESEARCH_WRITER
+        writer_system += (_RESEARCH_WRITER.replace("只能使用 comparisons 內的可比計算", "只能使用 comparisons 或 research_packet.calculations 內已由程式完成的可比計算")
+                          if prepared_research is not None else _RESEARCH_WRITER)
         reviewer_system += _SUBSTANTIVE_REVIEW
         if report_mode == "gap":
             writer_system += _GAP_WRITER
             reviewer_system += _GAP_WRITER
+    if prepared_research is not None:
+        from .research_packet import DEEP_WRITING_RULES
+        writer_system += DEEP_WRITING_RULES
+        reviewer_system += DEEP_WRITING_RULES
     selected = get_provider(provider)
     selected_model = validate_provider_model(provider, model or selected.models[0])
     if not isinstance(api_key, str) or not api_key.strip() or "\n" in api_key or "\r" in api_key:
@@ -533,6 +581,9 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
     scope = "with_explicit_evidence" if any(source["source_type"] in {"official", "manual"} for source in checked) else "rss_investat_only"
     request_data = {"topic": topic, "as_of_hong_kong_date": as_of_date, "report_scope": scope,
                     "additional_instructions": instructions, "sources": checked}
+    if prepared_research is not None:
+        from .research_packet import prompt_packet
+        request_data["research_packet"] = prompt_packet(prepared_research)
     if brief is not None:
         # The source snapshot already contains every retained quote. Repeating
         # a long excerpt once per observation can exhaust the request budget
@@ -545,7 +596,7 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
     user = json.dumps(request_data, ensure_ascii=False)
     if len(user) + len(writer_system) > MAX_PROMPT_CHARS:
         raise ResearchError("source_budget")
-    overall_deadline = time.monotonic() + WORKFLOW_DEADLINE_SECONDS
+    overall_deadline = overall_deadline or time.monotonic() + WORKFLOW_DEADLINE_SECONDS
     owned_client = False
     writer_response_incomplete = False
 
@@ -553,6 +604,8 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
         nonlocal writer_response_incomplete
         if time.monotonic() >= deadline:
             raise ResearchError("generation_timeout")
+        if request_guard is not None:
+            request_guard("reviewing" if reviewing else "writing")
         progress = (lambda _stage, size: _progress(on_progress, "reviewing", size)) if reviewing else on_progress
         _progress(progress, "requesting")
         if provider == "anthropic":
@@ -616,6 +669,8 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
         if report_mode == "gap":
             title = ("證據缺口簡報｜" + title.removeprefix("證據缺口簡報｜"))[:180]
         program_findings = _program_findings(brief, topic, draft)
+        if prepared_research is not None:
+            program_findings = packet_findings(prepared_research)
         metadata = {"provider": provider, "model": selected_model, "report_scope": scope,
                     "workflow_stage": "writer_saved", "review_status": "needs_review" if warnings or program_findings else "pending",
                     "structured_draft": draft, "validation_warnings": warnings,
@@ -638,6 +693,8 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
             on_draft(copy.deepcopy(writer))
         _progress(on_progress, "reviewing")
         try:
+            if prepared_research is not None:
+                request_data["claim_audit"] = prepared_research.get("claim_audit")
             review_user = json.dumps({**request_data, "writer_draft": draft if draft else {"raw_text": raw[:MAX_RESPONSE_CHARS]},
                                       "validation_warnings": warnings, **({"program_findings": program_findings} if brief is not None else {})}, ensure_ascii=False)
             if len(review_user) + len(reviewer_system) > MAX_PROMPT_CHARS:
@@ -646,6 +703,8 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
             review_raw = request_raw(reviewer_system, review_user, deadline=review_deadline, reviewing=True)
             revised, revised_warnings, findings, summary = _review_result(review_raw, checked, brief)
             deterministic_findings = _program_findings(brief, topic, revised)
+            if prepared_research is not None:
+                deterministic_findings = packet_findings(prepared_research)
             findings = deterministic_findings + [finding for finding in findings if finding not in deterministic_findings]
             if time.monotonic() > review_deadline:
                 raise ResearchError("generation_timeout")

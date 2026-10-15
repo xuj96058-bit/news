@@ -70,6 +70,8 @@ def _review(raw, sources, brief, plan):
     draft, warnings = _checked_essay(payload["draft"], sources, brief)
     locations = {(section, index) for section, index, _p in essay_paragraphs(draft)}
     locations.add(("thesis", 1))
+    locations.add(("title", 1))
+    locations.update((f"arguments.{number}.heading", 1) for number in range(1, len(draft["arguments"]) + 1))
     allowed = {source["id"] for source in sources}
     findings = payload["findings"]
     if not isinstance(findings, list) or len(findings) > 40:
@@ -146,7 +148,8 @@ def _body(draft, sources, as_of, *, plan, warnings=(), findings=(), summary="", 
 
 def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek", model=None,
         as_of, instructions="", on_progress=None, register_cancel=None, on_draft=None,
-        client=None, research_brief=None, retrieve_sources=True):
+        client=None, research_brief=None, retrieve_sources=True, prepared_research=None,
+        request_guard=None, overall_deadline=None):
     from .argumentation import (PLAN_SYSTEM, ESSAY_WRITER_SYSTEM, ESSAY_REVIEWER_SYSTEM,
         parse_plan, essay_findings)
     checked = _validated_sources(sources)
@@ -164,7 +167,7 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
     selected = get_provider(provider)
     model = validate_provider_model(provider, model or selected.models[0])
     key = api_key.strip()
-    deadline = time.monotonic() + ESSAY_DEADLINE_SECONDS
+    deadline = overall_deadline or time.monotonic() + ESSAY_DEADLINE_SECONDS
     retrieval = []
     brief = build_research_brief(topic, checked,
         observations=(research_brief or {}).get("observations", []), as_of=date)
@@ -212,6 +215,8 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
         user = json.dumps(packet, ensure_ascii=False)
         if len(user) + len(system) > MAX_PROMPT_CHARS:
             raise ResearchError("source_budget")
+        if request_guard is not None:
+            request_guard(stage)
         _progress(on_progress, stage)
         calls += 1
         stage_deadline = min(deadline, time.monotonic() + ESSAY_STAGE_SECONDS)
@@ -266,11 +271,25 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
                 retrieval.append({"status": "error", "name": "數據整理", "error": "數據回覆未通過格式檢查；保留來源供論點規劃。"})
         packet = {"topic": topic, "as_of": date, "additional_instructions": instructions,
             "sources": checked, "research_brief": brief}
+        if prepared_research is not None:
+            from .research_packet import DEEP_WRITING_RULES, packet_brief, prompt_packet
+            brief = packet_brief(prepared_research)
+            packet.update(research_brief=brief, research_packet=prompt_packet(prepared_research))
+            PLAN_SYSTEM += DEEP_WRITING_RULES
+            ESSAY_WRITER_SYSTEM += DEEP_WRITING_RULES
+            ESSAY_REVIEWER_SYSTEM += DEEP_WRITING_RULES
         plan = parse_plan(request(PLAN_SYSTEM, packet, "planning"), checked, topic)
-        checked = [source for source in checked if source["id"] in plan["source_ids"]]
+        if prepared_research is None:
+            checked = [source for source in checked if source["id"] in plan["source_ids"]]
+        else:
+            # Keep evidence/calculation references stable and make omitted
+            # counter-evidence visible to the reviewer, even if not cited.
+            required_ids = {row["source_id"] for row in prepared_research["evidence"]["items"] if row.get("eligible")}
+            plan["source_ids"] = list(dict.fromkeys([*plan["source_ids"], *sorted(required_ids)]))
         if not checked:
             raise ResearchError("empty_sources")
-        brief = build_research_brief(topic, checked, observations=brief["observations"], as_of=date)
+        if prepared_research is None:
+            brief = build_research_brief(topic, checked, observations=brief["observations"], as_of=date)
         if brief["profile"]["key"] != "generic" and not brief["ready"]:
             if plan["answer_scope"] == "full":
                 plan["answer_scope"] = "narrowed"
@@ -309,6 +328,8 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
         try:
             reviewer_packet = {**packet, "writer_draft": draft or {"raw_text": raw[:MAX_RESPONSE_CHARS]},
                 "validation_warnings": warnings, "program_findings": findings}
+            if prepared_research is not None:
+                reviewer_packet["claim_audit"] = prepared_research.get("claim_audit")
             review_raw = request(ESSAY_REVIEWER_SYSTEM, reviewer_packet, "reviewing")
             revised, warnings, findings, summary, quality = _review(review_raw, checked, brief, plan)
             # One bounded rewrite/review pass; do not spin on poor evidence.

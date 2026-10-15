@@ -75,8 +75,13 @@ class ResearchUiHarness:
             return store.create_report(topic=title, title=title, body=body, sources=[],
                                        provider='deepseek', model='deepseek-v4-pro', as_of='2026-10-14')
 
-    def app(self, report_mode='gap'):
-        app = AppTest.from_file(str(APP), default_timeout=10).run()
+    def app(self, report_mode='gap', *, deep_research=False):
+        # Existing tests exercise the legacy provider call order explicitly.
+        # None leaves session state untouched to test the product's default.
+        app = AppTest.from_file(str(APP), default_timeout=10)
+        if deep_research is not None:
+            app.session_state['research_deep'] = deep_research
+        app.run()
         self.assertEqual(len(app.exception), 0)
         if report_mode == 'gap':
             app.radio(key='research_report_mode').set_value('資料缺口簡報').run()
@@ -88,6 +93,95 @@ class ResearchUiHarness:
 
 
 class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
+    def test_deep_research_is_enabled_by_default_with_bounded_budget(self):
+        app = self.app(report_mode='argumentative', deep_research=None)
+        self.assertTrue(app.checkbox(key='research_deep').value)
+        self.assertEqual(app.number_input(key='research_minutes').value, 30)
+        self.assertEqual(app.number_input(key='research_calls').value, 16)
+        self.assertEqual(app.number_input(key='research_rounds').value, 3)
+        self.generator.assert_not_called()
+
+    def test_legacy_toggle_hides_deep_budget_and_reaches_legacy_generation(self):
+        app = self.app(report_mode='argumentative', deep_research=None)
+        app.checkbox(key='research_deep').uncheck().run()
+        self.assertFalse(app.checkbox(key='research_deep').value)
+        self.assertFalse(any(item.key == 'research_rounds' for item in app.number_input))
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertFalse(self.generator.call_args.kwargs['deep_research'])
+
+    def test_deep_checkpoints_preserve_each_source_and_metadata_snapshot(self):
+        checkpoints_seen = []
+        expected = []
+
+        def checkpoint_workflow(_topic, input_sources, *, on_draft, on_progress, **kwargs):
+            self.assertTrue(kwargs['deep_research'])
+            original = copy.deepcopy(input_sources)
+            supplemented = [*copy.deepcopy(original), {
+                **copy.deepcopy(original[0]), 'id': 'S2', 'title': '補充的原始文件',
+                'content': 'Synthetic supplementary original disclosure.',
+                'url': 'https://example.org/supplement', 'content_scope': 'provided_text'}]
+            stages = [('research_prepared', original), ('research_prepared', supplemented),
+                      ('writer_saved', supplemented)]
+            for index, (stage, stage_sources) in enumerate(stages, 1):
+                draft = {'title': f'研究階段{index}', 'body': f'階段{index}保存正文[S1]。',
+                    'sources': copy.deepcopy(stage_sources),
+                    'metadata': {**self.initial_draft['metadata'], 'deep_research': True,
+                        'workflow_stage': stage, 'source_count': len(stage_sources),
+                        'input_sources': copy.deepcopy(original),
+                        'answer_status': 'limited',
+                        'research_packet': {'version': 1, 'checkpoint': index,
+                            'sources': copy.deepcopy(stage_sources), 'input_sources': copy.deepcopy(original)}}}
+                expected.append(copy.deepcopy(draft))
+                on_draft(draft)
+                with ResearchStore(self.db) as store:
+                    report = store.list_reports()[0]
+                    checkpoints_seen.append(store.get_research_snapshot(report['id'], index))
+                # Later worker changes must not rewrite a saved snapshot.
+                draft['sources'][0]['content'] = 'Mutated after the acknowledged checkpoint.'
+                draft['metadata']['research_packet']['checkpoint'] = 999
+                on_progress('reviewing', index)
+            final = {'title': '最終核驗正文', 'body': '最終核驗正文[S1][S2]。',
+                'sources': copy.deepcopy(supplemented),
+                'metadata': {**self.reviewed_draft['metadata'], 'deep_research': True,
+                    'input_sources': copy.deepcopy(original), 'answer_status': 'limited',
+                    'claim_audit': {'status': 'partial', 'claims': []},
+                    'research_packet': {'version': 1, 'checkpoint': 4,
+                        'sources': copy.deepcopy(supplemented), 'input_sources': copy.deepcopy(original)}}}
+            expected.append(copy.deepcopy(final))
+            return final
+
+        self.generator.side_effect = checkpoint_workflow
+        app = self.app(report_mode='argumentative', deep_research=True)
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.error), 0)
+        self.assertEqual(len(checkpoints_seen), 3)
+        with ResearchStore(self.db) as store:
+            reports = store.list_reports()
+            self.assertEqual(len(reports), 1)
+            current = store.get_report(reports[0]['id'])
+            snapshots = list(reversed(store.list_research_snapshots(current['id'])))
+        self.assertEqual(current['version'], 4)
+        self.assertEqual([item['version'] for item in snapshots], [1, 2, 3, 4])
+        self.assertEqual(current['sources'], expected[-1]['sources'])
+        self.assertEqual(current['original_sources'], expected[0]['sources'])
+        self.assertEqual(current['original_body'], expected[0]['body'])
+        self.assertEqual(current['metadata']['source_count'], 2)
+        self.assertEqual(current['metadata']['research_packet']['checkpoint'], 4)
+        self.assertEqual([source['id'] for source in current['metadata']['input_sources']], ['S1'])
+        for version, (snapshot, draft) in enumerate(zip(snapshots, expected), 1):
+            self.assertEqual(snapshot['sources'], draft['sources'])
+            self.assertEqual(snapshot['body'], draft['body'])
+            self.assertEqual(snapshot['metadata']['research_packet']['checkpoint'], version)
+            self.assertEqual(snapshot['metadata']['source_count'], len(draft['sources']))
+            self.assertEqual(snapshot['snapshot_status'], 'captured')
+            self.assertTrue(snapshot['historical_metadata_available'])
+        self.assertEqual(checkpoints_seen, snapshots[:3])
+        self.generator.assert_called_once()
+
     def test_generate_edit_restore_and_export_without_additional_generation(self):
         progress = self.patch('src.research_ui._generation_progress', wraps=ui._generation_progress)
         app = self.app()

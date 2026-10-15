@@ -151,6 +151,7 @@ class ArgumentativeUiTests(ResearchUiHarness, unittest.TestCase):
         self.generator.side_effect=real_flow
         app=self.app(report_mode="argumentative")
         self.assertEqual(app.radio(key="research_report_mode").value,"議論文式研究報告（建議）")
+        self.assertFalse(app.checkbox(key="research_deep").value)
         app.sidebar.text_input(key="ai_api_key").input("synthetic-ui-key").run()
         self.assertFalse(app.button(key="research_generate").disabled)
         app.button(key="research_generate").click().run()
