@@ -91,47 +91,89 @@ class DeepResearchTests(unittest.TestCase):
         saved = []
         client = self.client()
         result = self.generate(client, on_draft=saved.append)
-        self.assertEqual(client.chat.completions.create.call_count, 7, result["metadata"])
+        self.assertEqual(client.chat.completions.create.call_count, 6, result["metadata"])
         self.assertTrue(any(p.get("claim_audit") for p in self.payloads if "writer_draft" in p))
         self.assertTrue(any(p.get("research_packet") for p in self.payloads if "argument_plan" in p))
         self.assertEqual(saved[0]["metadata"]["workflow_stage"], "research_prepared")
         self.assertTrue(any(p["metadata"].get("structured_draft") for p in saved))
         self.assertEqual(result["metadata"]["answer_status"], "limited")  # narrowed original question
         self.assertEqual(result["metadata"]["review_status"], "needs_review")
-        self.assertEqual(result["metadata"]["research_execution"]["api_call_count"], 7)
+        self.assertEqual(result["metadata"]["research_execution"]["api_call_count"], 6)
         self.assertIn("研究設計與證據紀錄", result["body"])
         self.assertNotIn("synthetic-key", json.dumps(result))
 
     def test_final_audit_uses_revised_title_and_body(self):
-        result = self.generate(self.client(revise=True))
+        saved = []
+        result = self.generate(self.client(revise=True), on_draft=saved.append)
         audits = [p for p in self.payloads if "paragraphs" in p]
-        self.assertEqual(len(audits), 2)
+        self.assertEqual(len(audits), 1)
         self.assertEqual(audits[-1]["paragraphs"][0]["text"], "Revised operating outlook")
-        self.assertNotEqual(audits[0]["paragraphs"][0]["text"], audits[-1]["paragraphs"][0]["text"])
+        initial = next(row for row in saved if row["metadata"]["workflow_stage"] == "writer_saved")
+        self.assertNotEqual(initial["metadata"]["structured_draft"]["title"], audits[-1]["paragraphs"][0]["text"])
         self.assertEqual(result["metadata"]["claim_audit"]["draft_hash"], result["metadata"]["research_packet"]["claim_audit"]["draft_hash"])
 
+    def test_completed_review_is_saved_before_final_audit_request(self):
+        saved = []
+        client = self.client(revise=True)
+        original = client.chat.completions.create.side_effect
+        def check_audit_checkpoint(**kwargs):
+            value = original(**kwargs)
+            if "paragraphs" in self.payloads[-1]:
+                self.assertEqual(saved[-1]["metadata"]["workflow_stage"], "review_complete")
+                self.assertEqual(saved[-1]["title"], "Revised operating outlook")
+                self.assertTrue(saved[-1]["metadata"]["report_has_body"])
+                self.assertEqual(saved[-1]["metadata"]["review_history"][-1]["verdict"], "pass")
+            return value
+        client.chat.completions.create.side_effect = check_audit_checkpoint
+        self.generate(client, on_draft=saved.append)
+
     def test_audit_failure_never_promotes_report(self):
-        result = self.generate(self.client(fail_at=7))
+        result = self.generate(self.client(fail_at=6))
         self.assertFalse(result["metadata"]["claim_audit"]["complete"])
         self.assertEqual(result["metadata"]["review_status"], "needs_review")
         self.assertTrue(result["metadata"]["report_has_body"])
         self.assertNotIn("synthetic-secret-provider-failure", json.dumps(result))
 
+    def test_final_audit_handles_partial_overlap_with_packet_findings(self):
+        from src.research_packet import prepare_research_packet, packet_findings
+        client = self.client()
+        original_response = client.chat.completions.create.side_effect
+        warnings = [{"message": "First evidence gap."}, {"message": "Second evidence gap."}]
+        def prepare(*args, **kwargs):
+            packet = prepare_research_packet(*args, **kwargs)
+            packet["evidence"]["warnings"].extend(warnings)
+            return packet
+        def respond(**kwargs):
+            value = original_response(**kwargs)
+            if "writer_draft" in self.payloads[-1]:
+                value.value["findings"] = [{"section": "limitations", "paragraph": 1,
+                    "severity": "warning", "message": warnings[0]["message"], "source_ids": []}]
+            return value
+        client.chat.completions.create.side_effect = respond
+        with patch("src.deep_research_workflow.prepare_research_packet", side_effect=prepare):
+            result = self.generate(client)
+        self.assertEqual(result["metadata"]["workflow_stage"], "review_complete")
+        self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+        for finding in packet_findings(result["metadata"]["research_packet"]):
+            self.assertEqual(result["metadata"]["review_findings"].count(finding), 1)
+
     def test_reviewer_failure_never_reclassifies_saved_body_as_preparation(self):
         saved = []
-        result = self.generate(self.client(fail_at=6), on_draft=saved.append)
+        result = self.generate(self.client(fail_at=5), on_draft=saved.append)
         self.assertEqual(result["metadata"]["review_status"], "review_failed")
         self.assertTrue(result["metadata"]["report_has_body"])
         self.assertTrue(saved[-1]["metadata"]["report_has_body"])
         self.assertTrue(saved[-1]["metadata"]["structured_draft"])
         self.assertNotIn("正文尚未生成", result["body"])
 
-    def test_call_budget_stops_before_additional_paid_audit(self):
+    def test_minimum_call_budget_prioritizes_review_and_final_audit(self):
         client = self.client()
         result = self.generate(client, budget={"max_calls": 6})
         self.assertEqual(client.chat.completions.create.call_count, 6)
         self.assertEqual(result["metadata"]["research_execution"]["api_call_count"], 6)
-        self.assertFalse(result["metadata"]["claim_audit"]["complete"])
+        self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+        self.assertEqual([row["stage"] for row in result["metadata"]["research_execution"]["stages"]],
+            ["designing", "organizing", "planning", "writing", "reviewing", "auditing"])
         self.assertEqual(result["metadata"]["review_status"], "needs_review")
 
     def test_evidence_api_failure_preserves_design_and_continues_to_prose(self):
@@ -201,7 +243,7 @@ class DeepResearchTests(unittest.TestCase):
         with patch("src.deep_research_workflow.prepare_research_packet", side_effect=busy_preparation):
             result = self.generate(client, budget={"max_calls": 6})
         stages = [row["stage"] for row in result["metadata"]["research_execution"]["stages"]]
-        self.assertEqual(stages, ["organizing"] * 3 + ["planning", "writing", "reviewing"])
+        self.assertEqual(stages, ["organizing"] * 2 + ["planning", "writing", "reviewing", "auditing"])
         self.assertTrue(result["metadata"]["report_has_body"])
         self.assertEqual(result["metadata"]["failure_reason"], "writing_budget_reserved")
         self.assertEqual(client.chat.completions.create.call_count, 6)
@@ -214,7 +256,7 @@ class DeepResearchTests(unittest.TestCase):
         def slow_extraction(**kwargs):
             value = original(**kwargs)
             if "previous_items" in self.payloads[-1]:
-                # With a 120-second overall budget, preparation stops at 48s.
+                # Preparation has at most one quarter of this short budget.
                 now[0] = 49.0
                 raise ResearchError("generation_timeout")
             return value
@@ -225,6 +267,262 @@ class DeepResearchTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["failure_reason"], "generation_timeout")
         self.assertTrue(any("writer_draft" in payload for payload in self.payloads))
         self.assertLess(result["metadata"]["research_execution"]["duration_seconds"], 120)
+
+    def test_slow_extraction_is_allowed_beyond_old_four_minute_limit(self):
+        now = [0.0]
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def slow_extraction(**kwargs):
+            value = original(**kwargs)
+            if "previous_items" in self.payloads[-1]:
+                now[0] += 400
+            return value
+        client.chat.completions.create.side_effect = slow_extraction
+        with patch("src.deep_research_workflow.time.monotonic", side_effect=lambda: now[0]):
+            result = self.generate(client)
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertNotIn("failure_reason", result["metadata"])
+        self.assertTrue(result["metadata"]["research_packet"]["evidence"]["items"])
+
+    def test_review_checkpoints_do_not_spend_calls_and_revision_reserves_final_audit(self):
+        from src.deep_research_workflow import ResearchBudgetError, generate_deep_research_report
+        client = self.client()
+        saved = []
+        def writer(_topic, _sources, *, request_guard, on_draft, **_kwargs):
+            from src.argumentative_workflow import _body
+            request_guard("planning")
+            request_guard("writing")
+            value = {"title": essay()["title"], "body": _body(essay(), _sources, AS_OF,
+                plan=plan(), stage="writer_saved"),
+                "metadata": {"workflow_stage": "writer_saved", "structured_draft": essay(),
+                    "review_status": "pending", "writing_style": "argumentative", "argument_plan": plan()}}
+            on_draft(copy.deepcopy(value))
+            self.assertEqual(client.chat.completions.create.call_count, 2)
+            request_guard("reviewing")
+            value["metadata"].update(workflow_stage="review_saved", review_status="needs_review")
+            on_draft(copy.deepcopy(value))
+            self.assertEqual(client.chat.completions.create.call_count, 2)
+            with self.assertRaises(ResearchBudgetError):
+                request_guard("revising")
+            return value
+        with patch("src.research_workflow.generate_research_workflow", side_effect=writer):
+            result = generate_deep_research_report(TOPIC, sources(), api_key="synthetic-key", as_of=AS_OF,
+                retrieve_sources=False, client=client, budget={"max_calls": 6}, on_draft=saved.append)
+        self.assertTrue(any(row["metadata"]["workflow_stage"] == "review_saved" for row in saved))
+        self.assertEqual([row["stage"] for row in result["metadata"]["research_execution"]["stages"]],
+            ["designing", "organizing", "planning", "writing", "reviewing", "auditing"])
+        self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+
+    def test_fatal_reviewer_status_prevents_final_paid_audit(self):
+        from src.analysis_errors import ProviderAPIError
+        for status in (401, 402, 403, 404):
+            for sse in (False, True):
+                with self.subTest(status=status, sse=sse):
+                    client = self.client()
+                    original = client.chat.completions.create.side_effect
+                    def rejected_review(**kwargs):
+                        value = original(**kwargs)
+                        if "writer_draft" in self.payloads[-1]:
+                            if sse:
+                                error = RuntimeError("synthetic-provider-secret")
+                                error.body = {"code": status, "message": "synthetic-provider-secret"}
+                                raise error
+                            raise ProviderAPIError(status)
+                        return value
+                    client.chat.completions.create.side_effect = rejected_review
+                    result = self.generate(client)
+                    self.assertEqual(client.chat.completions.create.call_count, 5)
+                    self.assertTrue(result["metadata"]["report_has_body"])
+                    self.assertFalse(result["metadata"]["claim_audit"]["complete"])
+                    self.assertEqual(result["metadata"]["claim_audit"]["error_reason"], f"provider_http_{status}")
+                    self.assertEqual(result["metadata"]["review_status"], "review_failed")
+                    self.assertNotIn("synthetic-provider-secret", json.dumps(result))
+
+    def test_denied_optional_revision_uses_reserved_final_audit_with_real_writer(self):
+        client = self.client(revise=True)
+        original = client.chat.completions.create.side_effect
+        saved = []
+        def low_score_review(**kwargs):
+            value = original(**kwargs)
+            if "writer_draft" in self.payloads[-1]:
+                value.value["quality"]["reasoning"] = 2
+            return value
+        client.chat.completions.create.side_effect = low_score_review
+        result = self.generate(client, budget={"max_calls": 6}, on_draft=saved.append)
+        self.assertEqual(client.chat.completions.create.call_count, 6)
+        self.assertEqual(result["metadata"]["review_error_reason"], "generation_timeout")
+        self.assertEqual(result["metadata"]["review_history"][0]["verdict"], "revise")
+        self.assertTrue(any(row["metadata"]["workflow_stage"] == "review_saved" for row in saved))
+        self.assertEqual(result["metadata"]["structured_draft"]["title"], "Revised operating outlook")
+        self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+        self.assertEqual([row["stage"] for row in result["metadata"]["research_execution"]["stages"]],
+            ["designing", "organizing", "planning", "writing", "reviewing", "auditing"])
+
+    def test_review_stage_timeout_still_uses_available_final_audit(self):
+        from src.research import ResearchError
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def timed_out_review(**kwargs):
+            value = original(**kwargs)
+            if "writer_draft" in self.payloads[-1]:
+                raise ResearchError("generation_timeout")
+            return value
+        client.chat.completions.create.side_effect = timed_out_review
+        result = self.generate(client, budget={"max_calls": 6})
+        self.assertEqual(client.chat.completions.create.call_count, 6)
+        self.assertEqual(result["metadata"]["review_error_reason"], "generation_timeout")
+        self.assertEqual(result["metadata"]["review_status"], "review_failed")
+        self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+        self.assertTrue(result["metadata"]["report_has_body"])
+
+    def test_review_retry_keeps_audit_slot_and_uses_spare_call_only(self):
+        from src.analysis_errors import ProviderAPIError
+        for max_calls in (6, 7):
+            with self.subTest(max_calls=max_calls):
+                client = self.client()
+                original = client.chat.completions.create.side_effect
+                failed = [False]
+                def fail_review_once(**kwargs):
+                    value = original(**kwargs)
+                    if "writer_draft" in self.payloads[-1] and not failed[0]:
+                        failed[0] = True
+                        raise ProviderAPIError(503)
+                    return value
+                client.chat.completions.create.side_effect = fail_review_once
+                result = self.generate(client, budget={"max_calls": max_calls})
+                stages = [row["stage"] for row in result["metadata"]["research_execution"]["stages"]]
+                self.assertEqual(stages, ["designing", "organizing", "planning", "writing"]
+                    + ["reviewing"] * (max_calls - 5) + ["auditing"])
+                self.assertEqual(client.chat.completions.create.call_count, max_calls)
+                self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+                self.assertEqual(result["metadata"]["review_status"],
+                    "review_failed" if max_calls == 6 else "needs_review")
+
+    def test_writer_retry_preserves_first_review_and_audit_calls(self):
+        from src.analysis_errors import ProviderAPIError
+        for max_calls in (6, 7):
+            with self.subTest(max_calls=max_calls):
+                client = self.client()
+                original = client.chat.completions.create.side_effect
+                failed = [False]
+                def fail_writer_once(**kwargs):
+                    value = original(**kwargs)
+                    payload = self.payloads[-1]
+                    if "argument_plan" in payload and "writer_draft" not in payload and not failed[0]:
+                        failed[0] = True
+                        raise ProviderAPIError(503)
+                    return value
+                client.chat.completions.create.side_effect = fail_writer_once
+                result = self.generate(client, budget={"max_calls": max_calls})
+                stages = [row["stage"] for row in result["metadata"]["research_execution"]["stages"]]
+                self.assertEqual(stages, ["designing", "organizing", "planning", "writing"]
+                    + (["writing", "reviewing", "auditing"] if max_calls == 7 else []))
+                self.assertEqual(client.chat.completions.create.call_count, 7 if max_calls == 7 else 4)
+                self.assertEqual(result["metadata"]["report_has_body"], max_calls == 7)
+                if max_calls == 7:
+                    self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+
+    def test_review_format_recovery_uses_only_a_spare_call_and_preserves_audit(self):
+        for max_calls in (6, 7):
+            with self.subTest(max_calls=max_calls):
+                client = self.client()
+                original = client.chat.completions.create.side_effect
+                failed = [False]
+                def invalid_review_once(**kwargs):
+                    value = original(**kwargs)
+                    if "writer_draft" in self.payloads[-1] and not failed[0]:
+                        failed[0] = True
+                        return Stream({})
+                    return value
+                client.chat.completions.create.side_effect = invalid_review_once
+                saved = []
+                result = self.generate(client, budget={"max_calls": max_calls}, on_draft=saved.append)
+                stages = [row["stage"] for row in result["metadata"]["research_execution"]["stages"]]
+                self.assertEqual(stages, ["designing", "organizing", "planning", "writing"]
+                    + ["reviewing"] * (max_calls - 5) + ["auditing"])
+                self.assertEqual(client.chat.completions.create.call_count, max_calls)
+                self.assertTrue(result["metadata"]["claim_audit"]["complete"])
+                self.assertTrue(result["metadata"]["report_has_body"])
+                self.assertEqual(result["metadata"]["review_status"],
+                    "review_failed" if max_calls == 6 else "needs_review")
+                self.assertEqual(saved[-1]["metadata"]["workflow_stage"],
+                    "review_failed" if max_calls == 6 else "review_complete")
+
+    def test_fatal_status_after_writer_text_saves_body_without_more_requests(self):
+        from src.analysis_errors import ProviderAPIError
+        for status in (401, 402, 403, 404):
+            for sse in (False, True):
+                with self.subTest(status=status, sse=sse):
+                    saved = []
+                    client = self.client()
+                    original = client.chat.completions.create.side_effect
+                    class FatalStream(Stream):
+                        def __iter__(self):
+                            yield SimpleNamespace(choices=[SimpleNamespace(
+                                delta=SimpleNamespace(content=json.dumps(self.value)), finish_reason=None)])
+                            if sse:
+                                error = RuntimeError("synthetic-fatal-secret")
+                                error.body = {"error": {"code": status, "message": "synthetic-fatal-secret"}}
+                                raise error
+                            raise ProviderAPIError(status)
+                    def fatal_writer(**kwargs):
+                        value = original(**kwargs)
+                        payload = self.payloads[-1]
+                        if "argument_plan" in payload and "writer_draft" not in payload:
+                            return FatalStream(value.value)
+                        return value
+                    client.chat.completions.create.side_effect = fatal_writer
+                    result = self.generate(client, on_draft=saved.append)
+                    self.assertEqual(client.chat.completions.create.call_count, 4)
+                    self.assertTrue(result["metadata"]["report_has_body"])
+                    self.assertEqual(result["metadata"]["structured_draft"]["title"], essay()["title"])
+                    self.assertEqual(result["metadata"]["review_error_reason"], f"provider_http_{status}")
+                    self.assertEqual(saved[-1]["metadata"]["review_status"], "review_failed")
+                    self.assertFalse(result["metadata"]["claim_audit"]["complete"])
+                    self.assertEqual(result["metadata"]["claim_audit"]["error_reason"], f"provider_http_{status}")
+                    self.assertNotIn("synthetic-fatal-secret", json.dumps(result))
+
+    def test_cancel_after_writer_text_saves_body_without_more_requests(self):
+        callbacks, saved = [], []
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        class CancelledStream(Stream):
+            def __iter__(self):
+                yield SimpleNamespace(choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=json.dumps(self.value)), finish_reason=None)])
+                for callback in callbacks:
+                    callback()
+                raise RuntimeError("synthetic-cancel-secret")
+        def cancelled_writer(**kwargs):
+            value = original(**kwargs)
+            payload = self.payloads[-1]
+            if "argument_plan" in payload and "writer_draft" not in payload:
+                return CancelledStream(value.value)
+            return value
+        client.chat.completions.create.side_effect = cancelled_writer
+        result = self.generate(client, register_cancel=callbacks.append, on_draft=saved.append)
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertEqual(saved[-1]["metadata"]["structured_draft"]["title"], essay()["title"])
+        self.assertEqual(result["metadata"]["review_error_reason"], "generation_timeout")
+        self.assertFalse(result["metadata"]["claim_audit"]["complete"])
+        self.assertNotIn("synthetic-cancel-secret", json.dumps(result))
+
+    def test_cancellation_after_review_does_not_start_final_audit(self):
+        callbacks = []
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def cancel_after_review(**kwargs):
+            value = original(**kwargs)
+            if "writer_draft" in self.payloads[-1]:
+                callbacks[0]()
+            return value
+        client.chat.completions.create.side_effect = cancel_after_review
+        result = self.generate(client, register_cancel=callbacks.append)
+        self.assertEqual(client.chat.completions.create.call_count, 5)
+        self.assertFalse(result["metadata"]["claim_audit"]["complete"])
+        self.assertEqual(result["metadata"]["claim_audit"]["error_reason"], "generation_timeout")
+        self.assertTrue(result["metadata"]["report_has_body"])
 
     def test_cancelled_preparation_does_not_start_another_request(self):
         callbacks = []

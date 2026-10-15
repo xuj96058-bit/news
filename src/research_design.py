@@ -59,6 +59,7 @@ document 完整欄位：
 {"id":"E2","kind":"document","requirement_id":"R2","source_id":"S2","quote":"連續原文摘錄",
 "statement":"quote 中逐字存在的短句","event_status":"unknown"}
 只用本次 source_id、requirement_id；kind 必須對應要求。不可增加欄位。
+document 摘錄也可包含有歸因的數字；未提取成 numeric 不代表原始材料沒有數據。不能為了湊 numeric 而補造期間或口徑，也不能因數字只保留於 document 就將它描述為原文缺失。
 quote 是本次來源 content 中逐字存在的連續文字，通常不超過600字，絕對上限800字；不要複製整篇來源。statement 是 quote 中的逐字短句，通常不超過240字；分析解釋留待寫作。
 entity、metric、unit、scope 使用原文精確短語，不翻譯、概括或改名；保留 gross/net、總額/淨額等區別。
 數值、實體、指標、單位、範圍須在同一明確原句或子句對應；多欄表格關係不明時省略，不可借用相鄰公司/指標/期間的值。

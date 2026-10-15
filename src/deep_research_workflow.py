@@ -11,13 +11,14 @@ from openai import OpenAI
 
 from .analysis_errors import (ModelResponseError, ProviderAPIError, ProviderConfigurationError,
                              provider_failure_reason, provider_status_code)
-from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
-from .research import (MAX_PROMPT_CHARS, ResearchError, _date_label, _nonstream_content,
-    _progress, _stream_content, _transport_timed_out, _validated_sources)
-from .research_audit import AUDIT_SYSTEM, parse_claim_audit
+from .llm_providers import get_provider, validate_provider_model
+from .research import ResearchError, _date_label, _progress, _transport_timed_out, _validated_sources
 from .research_packet import prepare_research_packet, render_packet_appendix, packet_findings
+from .research_timing import publication_reserves, stage_deadline
+from .research_audit_workflow import request_research_stage, run_claim_audit, finalize_deep_audit
 
-DEFAULT_BUDGET = {"max_rounds": 3, "max_calls": 16, "timeout_seconds": 1800}
+DEFAULT_BUDGET = {"max_rounds": 3, "max_calls": 16, "timeout_seconds": 3600}
+_DEEP_GAP_NOTICE = "> 深度核驗仍有缺口；請結合文末研究紀錄閱讀，不能視為已獨立核實。\n\n"
 
 
 class ResearchBudgetError(ResearchError):
@@ -127,6 +128,111 @@ def _audit_findings(audit):
             for row in audit.get("claims", []) if row["status"] != "supported"]
 
 
+def render_deep_research_body(report):
+    """Render a matching generated snapshot without changing prose or metadata.
+
+    Accept only a validated deep draft whose existing title/body still match
+    its generated snapshot. Human edits, restored reports and raw failed drafts
+    are rejected, never silently overwritten. This function performs no I/O.
+    """
+    from .research_packet import _render_packet_appendix
+
+    rejected = "報告與已保存的結構化生成快照不符；保留現有正文，不可自動重新渲染。"
+    if not isinstance(report, dict):
+        raise ValueError(rejected)
+    snapshot = copy.deepcopy(report)
+    metadata = snapshot.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(rejected)
+    packet, draft = metadata.get("research_packet"), metadata.get("structured_draft")
+    stage = metadata.get("workflow_stage")
+    if (metadata.get("deep_research") is not True or metadata.get("report_has_body") is not True
+            or metadata.get("manually_verified") is True or metadata.get("restoration")
+            or stage not in {"writer_saved", "review_saved", "review_complete", "review_failed"}
+            or not isinstance(packet, dict) or not isinstance(draft, dict)
+            or not isinstance(snapshot.get("body"), str)):
+        raise ValueError(rejected)
+    reviewed_version = metadata.get("reviewed_version")
+    if ("version" in snapshot and reviewed_version is not None
+            and snapshot["version"] != reviewed_version):
+        raise ValueError(rejected)
+    try:
+        packet_hash = hashlib.sha256(json.dumps({key: value for key, value in packet.items()
+            if key != "packet_hash"}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if packet.get("packet_hash") != packet_hash:
+            raise ValueError(rejected)
+        date = _date_label(packet["design"]["as_of"])
+        if not date or (snapshot.get("as_of") is not None and _date_label(snapshot["as_of"]) != date):
+            raise ValueError(rejected)
+        sources = snapshot["sources"]
+        if sources != packet["sources"]:
+            raise ValueError(rejected)
+        sources = _validated_sources(sources)
+        style = metadata.get("writing_style", "legacy")
+        if metadata.get("report_mode") == "argumentative":
+            style = "argumentative"
+        if style not in {"argumentative", "legacy"}:
+            raise ValueError(rejected)
+        expected_title = draft["title"]
+        if style == "legacy" and metadata.get("report_mode") == "gap":
+            expected_title = ("證據缺口簡報｜" + expected_title.removeprefix("證據缺口簡報｜"))[:180]
+        if snapshot.get("title") != expected_title:
+            raise ValueError(rejected)
+        if style == "argumentative":
+            from .argumentation import parse_essay
+            from .argumentative_workflow import _body
+            checked, _ = parse_essay(draft, sources, metadata.get("research_brief"))
+        else:
+            from .research_workflow import _body, _structured_draft
+            checked, _ = _structured_draft(draft, sources, metadata.get("research_brief"))
+        if checked != draft:
+            raise ValueError(rejected)
+
+        warnings = metadata.get("validation_warnings", [])
+        findings = metadata.get("review_findings", [])
+        audit = metadata.get("claim_audit", packet.get("claim_audit", {}))
+        summary = metadata.get("review_summary", "")
+        error = metadata.get("review_error", "")
+
+        def core(current_findings):
+            if style == "argumentative":
+                return _body(draft, sources, date, plan=metadata["argument_plan"], warnings=warnings,
+                    findings=current_findings, summary=error if stage == "review_failed" else summary, stage=stage)
+            from .research_workflow import _FIELDS
+            # Title audit findings do not belong to a legacy prose section.
+            # Keep their message while mapping the display location safely.
+            displayed = [row if row.get("section") in _FIELDS else {**row,
+                "section": "executive_findings", "paragraph": 1,
+                "message": str(row.get("section", "報告")) + "：" + row["message"]}
+                for row in current_findings]
+            return _body(expected_title, draft, sources, date, stage=stage, warnings=warnings,
+                findings=displayed, summary=summary, error=error or None,
+                research_brief=metadata.get("research_brief"), report_mode=metadata.get("report_mode", "legacy"))
+
+        # Earlier generators appended audit findings to metadata after rendering
+        # the publication body. Rebuild those known variants for exact matching;
+        # no arbitrary body prefix/suffix or user-edited section is accepted.
+        audit_findings = _audit_findings(audit)
+        generated_findings = [*packet_findings(packet), *audit_findings]
+        core_variants = {core(findings),
+            core([row for row in findings if row not in audit_findings]),
+            core([row for row in findings if row not in generated_findings])}
+        appendix = render_packet_appendix(packet)
+        old_appendix = _render_packet_appendix(packet, historical_calculation_notes=True)
+        existing = snapshot["body"]
+        if not any(existing == notice + body + suffix
+                for notice in ("", _DEEP_GAP_NOTICE)
+                for body in core_variants for suffix in ("", appendix, old_appendix)):
+            raise ValueError(rejected)
+        unresolved = (metadata.get("preparation_warnings") or packet.get("preparation_warnings")
+            or packet["answer_status"] != "full" or not audit.get("complete")
+            or audit.get("unresolved_count", 0) or warnings
+            or any(row.get("severity") in {"warning", "error"} for row in findings))
+        return (_DEEP_GAP_NOTICE if unresolved else "") + core(findings) + appendix
+    except (KeyError, TypeError, ModelResponseError, ResearchError) as error:
+        raise ValueError(rejected) from None
+
+
 def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek", model=None,
         as_of, instructions="", on_progress=None, register_cancel=None, on_draft=None,
         client=None, report_mode="argumentative", writing_style="argumentative",
@@ -158,9 +264,9 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
     active_stage = "preparing"
     failures = []
     cancelled = Event()
-    writer_calls = 3 if style == "argumentative" else 2
-    writer_seconds = min(720 if style == "argumentative" else 360, limits["timeout_seconds"] * 0.6)
-    preparation_deadline = deadline - writer_seconds
+    reserves = publication_reserves(limits["timeout_seconds"], style)
+    writer_calls = 4 if style == "argumentative" else 3
+    preparation_deadline = deadline - sum(reserves.values())
     preparing = True
 
     def record_failure(error):
@@ -179,35 +285,33 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         if preparing and (time.monotonic() >= preparation_deadline
                 or calls >= limits["max_calls"] - writer_calls):
             raise PreparationBudgetError()
+        protected_stages = {
+            "planning": ("writing", "reviewing", "auditing"),
+            "writing": ("reviewing", "auditing"),
+            "reviewing": ("auditing",),
+            "revising": ("auditing",),
+        }
+        # Every attempt, including transport retries, must leave the calls for
+        # the required later stages. Optional revisions keep the audit slot.
+        required_later_calls = {"planning": 3, "writing": 2, "reviewing": 1, "revising": 1}
+        if calls >= limits["max_calls"] - required_later_calls.get(stage, 0):
+            raise ResearchBudgetError()
+        limit = stage_deadline(stage, deadline,
+            phase_deadline=preparation_deadline if preparing else None,
+            reserve_seconds=sum(reserves.get(name, 0) for name in protected_stages.get(stage, ())))
+        if time.monotonic() >= limit:
+            raise ResearchBudgetError()
         calls += 1
-        usage_stages.append({"stage": stage, "attempt": calls})
+        usage_stages.append({"stage": stage, "attempt": calls,
+            "deadline_seconds": round(limit - started, 2)})
+        return limit
 
     def request(system, payload, stage):
         nonlocal active_stage
         active_stage = stage
-        user = json.dumps(payload, ensure_ascii=False)
-        if len(system) + len(user) > MAX_PROMPT_CHARS:
-            raise ResearchError("source_budget")
-        guard(stage)
-        _progress(on_progress, stage)
-        stage_deadline = min(preparation_deadline if preparing else deadline, time.monotonic() + 240)
-        if provider == "anthropic":
-            value = _nonstream_content(claude_completion(model=model, api_key=key, system=system, user=user))
-            if time.monotonic() >= stage_deadline:
-                raise ResearchBudgetError()
-            return value
-        params = {"model": model, "messages": [{"role": "system", "content": system},
-            {"role": "user", "content": user}], "response_format": {"type": "json_object"},
-            "stream": True, "timeout": min(60, stage_deadline - time.monotonic())}
-        if provider == "openai":
-            params["max_completion_tokens"] = 16000
-        elif provider == "deepseek":
-            params.update(max_tokens=24000, extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
-        else:
-            params.update(max_tokens=12000, temperature=0.2)
-        return _stream_content(client.chat.completions.create(**configure_provider_request(provider, params)), deadline=stage_deadline,
-            register_cancel=register_cancel, max_chunks=50000,
-            on_progress=lambda _stage, size: _progress(on_progress, stage, size))
+        return request_research_stage(system, payload, stage, api_key=key, provider=provider,
+            model=model, client=client, request_guard=guard, on_progress=on_progress,
+            register_cancel=register_cancel)
 
     def metadata():
         packet["packet_hash"] = hashlib.sha256(json.dumps({key: value for key, value in packet.items()
@@ -215,7 +319,7 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         warnings = [*packet.get("preparation_warnings", []), *failures]
         return {"deep_research": True, "research_packet": packet, "research_budget": limits,
             "research_execution": {"api_call_count": calls, "stages": list(usage_stages),
-                "duration_seconds": round(time.monotonic()-started, 2)},
+                "duration_seconds": round(time.monotonic()-started, 2), "stage_reserves": dict(reserves)},
             "api_call_count": calls, "answer_status": packet["answer_status"],
             "workflow_schema_version": 2, "manually_verified": False,
             "preparation_warnings": warnings,
@@ -234,34 +338,22 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
                 raise
         saved = draft
 
-    def audit(draft, *, reserve_calls=0, reserve_seconds=0):
-        paragraphs = audit_paragraphs(draft, style)
-        if not paragraphs:
-            return {"claims": [], "summary": "草稿格式尚未通過，無法逐項核驗。", "complete": False,
-                    "unresolved_count": 1, "independently_verified": False}
-        try:
-            # An optional first-pass audit must not consume the review's slot.
+    def audit(draft, *, reserve_calls=0, reserve_seconds=0, blocked_reason=None):
+        def audit_request(system, payload, stage):
             if calls >= limits["max_calls"] - reserve_calls or deadline - time.monotonic() <= reserve_seconds:
                 raise ResearchBudgetError()
-            raw = request(AUDIT_SYSTEM, {"paragraphs": paragraphs, "research_design": packet["design"],
-                "evidence_items": packet["evidence"]["items"], "calculations": packet["calculations"]}, "auditing")
-            result = parse_claim_audit(raw, paragraphs, packet["evidence"]["items"], packet["calculations"])
-        except Exception as error:
-            # A failed or exhausted audit is explicitly incomplete, not a pass.
-            result = {"claims": [{"section": p["section"], "paragraph": p["paragraph"],
-                "status": "unknown", "evidence_ids": [], "calculation_ids": [],
-                "reason": "逐項核驗未完成，保留待核對狀態。"} for p in paragraphs],
-                "summary": "逐項核驗未完成。", "complete": False, "unresolved_count": len(paragraphs),
-                "independently_verified": False, "error_kind": type(error).__name__}
-        result["draft_hash"] = hashlib.sha256(json.dumps(draft, ensure_ascii=False,
-            sort_keys=True).encode("utf-8")).hexdigest()
-        return result
+            return request(system, payload, stage)
+        return run_claim_audit(draft, style, packet, request=audit_request, blocked_reason=blocked_reason)
 
     def writer_checkpoint(draft):
         draft["metadata"]["report_has_body"] = True
-        persist(draft)  # Never spend an audit call before durable acknowledgement.
-        packet["claim_audit"] = audit(draft.get("metadata", {}).get("structured_draft"),
-            reserve_calls=1, reserve_seconds=min(240, limits["timeout_seconds"] * 0.2))
+        persist(draft)
+        if draft["metadata"].get("workflow_stage") == "writer_saved":
+            # The reviewer gets the complete sources and evidence packet. Do
+            # not spend its protected call/time on a redundant pre-review audit.
+            packet["claim_audit"] = {"claims": [], "summary": "逐項核驗安排於實質審稿後，尚未完成。",
+                "complete": False, "unresolved_count": 1, "independently_verified": False,
+                "status": "scheduled_after_review"}
 
     def preparation_checkpoint(value):
         nonlocal packet
@@ -322,25 +414,16 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
             packet["answer_status"] = "unanswered"
         elif answer_scope == "narrowed" and packet["answer_status"] == "full":
             packet["answer_status"] = "limited"
-        final_audit = audit(draft)
-        packet["claim_audit"] = final_audit
-        packet["packet_hash"] = hashlib.sha256(json.dumps({key: value for key, value in packet.items()
-            if key != "packet_hash"}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-        findings = [*result["metadata"].get("review_findings", []), *packet_findings(packet), *_audit_findings(final_audit)]
-        unresolved = (bool(failures) or bool(packet.get("preparation_warnings"))
-            or packet["answer_status"] != "full" or not final_audit.get("complete")
-            or final_audit.get("unresolved_count", 0) or result["metadata"].get("validation_warnings")
-            or any(row.get("severity") in {"warning", "error"} for row in findings))
-        status = result["metadata"].get("review_status")
-        if status != "review_failed":
-            status = "needs_review" if unresolved else "reviewed"
-        result["metadata"].update(metadata(), claim_audit=final_audit, review_findings=findings[:100],
-            review_status=status, quality_status="reviewed_snapshot" if status == "reviewed" else status,
-            report_has_body=True)
-        if unresolved:
-            result["body"] = "> 深度核驗仍有缺口；請結合文末研究紀錄閱讀，不能視為已獨立核實。\n\n" + result["body"]
-        result["body"] += render_packet_appendix(packet)
-        result["sources"] = packet["sources"]
+        # Preserve the latest successful review before another paid call. The
+        # final audit can take several minutes or be interrupted independently.
+        result["metadata"]["report_has_body"] = True
+        persist(result)
+        # A stage timeout or a denied optional revision may leave the reserved
+        # audit slot usable. The request guard checks actual cancellation and
+        # the overall deadline; only fatal provider status blocks it here.
+        final_audit = audit(draft, blocked_reason=result["metadata"].get("review_error_reason"))
+        result = finalize_deep_audit(saved, packet, final_audit,
+            metadata_update=metadata(), allow_unstructured=True)
         _progress(on_progress, "ready")
         return result
     except Exception as error:
@@ -367,3 +450,14 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
                 client.close()
             except Exception:
                 pass
+
+
+def resume_deep_research_audit(saved_report, *, api_key, provider=None, model=None,
+        on_progress=None, register_cancel=None, on_draft=None, client=None,
+        request_guard=None, overall_deadline=None, max_calls=1, timeout_seconds=None):
+    """Continue only a saved draft's audit through the normal audit pipeline."""
+    from .deep_research_resume import resume_audit
+    return resume_audit(saved_report, api_key=api_key, provider=provider, model=model,
+        on_progress=on_progress, register_cancel=register_cancel, on_draft=on_draft,
+        client=client, request_guard=request_guard, overall_deadline=overall_deadline,
+        max_calls=max_calls, timeout_seconds=timeout_seconds)

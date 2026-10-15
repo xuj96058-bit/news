@@ -744,8 +744,38 @@ def _parse_draft(raw: str, sources: list[dict]) -> tuple[ResearchDraft, list[str
     return result, list(dict.fromkeys(review_warnings))
 
 
+_NAMED_INDEX_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"S\s*&\s*P\s*500|Standard\s*&\s*Poor['’]s\s*500|"
+    r"標普\s*500|标普\s*500|標準普爾\s*500|标准普尔\s*500|"
+    r"Russell\s*1000|羅素\s*1000|罗素\s*1000"
+    r")(?:\s*(?:index|指數|指数))?(?![A-Za-z0-9]|[.,]\d)", re.I)
+_NUMBER_LABEL_UNIT = re.compile(
+    r"\s*(?:[%％]|倍|點|点|元|美元|港元|人民幣|人民币|億|亿|萬|万|千|百|家|人|項|项|"
+    r"(?:USD|HKD|CNY|RMB|EUR|GBP|percent|percentage|million|billion|trillion|"
+    r"dollars?|points?|times|bps?|basis\s+points?)\b)", re.I)
+
+
+def _without_named_index_numbers(text: str) -> str:
+    """Mask complete known index labels, never every occurrence of their value.
+
+    Ambiguous quantity suffixes remain numerical claims. A masked label only
+    says its digits name an entity; source support for that entity still needs
+    semantic review. Unknown labels are deliberately not exempted.
+    """
+    def replace(match):
+        if _NUMBER_LABEL_UNIT.match(text, match.end()):
+            return match.group()
+        return " " * len(match.group())
+    return _NAMED_INDEX_NUMBER.sub(replace, text)
+
+
 def _number_values(text: str) -> set[Decimal]:
-    values = {Decimal(number.replace(",", "")) for number in re.findall(r"(?<![A-Za-z])\d+(?:,\d{3})*(?:\.\d+)?", text)}
+    text = _without_named_index_numbers(unicodedata.normalize("NFKC", text))
+    # Recognize whole numeric tokens, including unknown alphanumeric labels.
+    # A letter before 500 must not make the regex restart at its trailing 00.
+    values = {Decimal(number.replace(",", "")) for number in
+              re.findall(r"(?<![\d.])\d+(?:,\d{3})*(?:\.\d+)?(?!\d)", text)}
     # Translation of a supplied month name is a date label, not new evidence.
     for month, value in enumerate(("january", "february", "march", "april", "may", "june",
                                     "july", "august", "september", "october", "november", "december"), 1):

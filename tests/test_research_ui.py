@@ -150,7 +150,7 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         self.assertEqual(report['metadata']['workflow_stage'], 'preparation_failed')
         self.assertFalse(report['metadata']['report_has_body'])
         self.assertTrue(any('正文尚未生成' in item.value for item in app.warning))
-        self.assertFalse(any('初稿已保存' in item.value for item in [*app.warning, *app.success, *app.info]))
+        self.assertFalse(any('正文已保存' in item.value for item in [*app.warning, *app.success, *app.info]))
         self.assertFalse(any(item.key == 'research_prepare_pdf' for item in app.button))
 
     def test_legacy_preparation_memo_is_not_a_report_but_old_reports_remain_editable(self):
@@ -209,10 +209,88 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
     def test_deep_research_is_enabled_by_default_with_bounded_budget(self):
         app = self.app(report_mode='argumentative', deep_research=None)
         self.assertTrue(app.checkbox(key='research_deep').value)
-        self.assertEqual(app.number_input(key='research_minutes').value, 30)
-        self.assertEqual(app.number_input(key='research_calls').value, 16)
-        self.assertEqual(app.number_input(key='research_rounds').value, 3)
+        self.assertEqual(app.number_input(key='research_minutes').value, ui.DEFAULT_BUDGET['timeout_seconds'] // 60)
+        self.assertEqual(app.number_input(key='research_calls').value, ui.DEFAULT_BUDGET['max_calls'])
+        self.assertEqual(app.number_input(key='research_rounds').value, ui.DEFAULT_BUDGET['max_rounds'])
         self.generator.assert_not_called()
+
+    def test_sixty_minute_budget_reaches_worker_and_ui_wait_limit(self):
+        runner = self.patch('src.research_ui.run_generation', wraps=run_generation)
+        app = self.app(report_mode='argumentative', deep_research=True)
+        app.number_input(key='research_minutes').set_value(60).run()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(runner.call_args.kwargs['timeout'], 3600)
+        self.assertEqual(self.generator.call_args.kwargs['budget']['timeout_seconds'], 3600)
+        self.assertEqual(self.generator.call_args.kwargs['budget']['max_calls'], ui.DEFAULT_BUDGET['max_calls'])
+
+    def test_nondeep_essay_wait_uses_the_workflow_deadline(self):
+        runner = self.patch('src.research_ui.run_generation', wraps=run_generation)
+        app = self.app(report_mode='argumentative', deep_research=False)
+        self.assertTrue(any('有限次重試' in item.value for item in app.caption))
+        self.assertFalse(any('最多5次AI調用' in item.value for item in app.caption))
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(runner.call_args.kwargs['timeout'], ui.ESSAY_DEADLINE_SECONDS)
+        self.assertEqual(runner.call_args.kwargs['timeout'], 3600)
+        self.assertFalse(self.generator.call_args.kwargs['deep_research'])
+        self.assertIsNone(self.generator.call_args.kwargs['budget'])
+
+    def test_unreviewed_writer_result_does_not_claim_a_review_was_saved(self):
+        progress = self.patch('src.research_ui._generation_progress', wraps=ui._generation_progress)
+        def writer_only(*args, on_draft, **kwargs):
+            draft = copy.deepcopy(self.initial_draft)
+            draft['metadata']['review_status'] = 'needs_review'
+            draft['metadata']['validation_warnings'] = [{'message': 'Writer validation still needs checking.'}]
+            on_draft(copy.deepcopy(draft))
+            return draft
+        self.generator.side_effect = writer_only
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertFalse(app.exception)
+        with ResearchStore(self.db) as store:
+            report = store.list_reports()[0]
+            revision = store.list_revisions(report['id'])[0]
+        self.assertEqual(report['metadata']['review_status'], 'pending')
+        self.assertNotIn('reviewed_version', report['metadata'])
+        self.assertEqual(revision['note'], '審稿未完成；保留最後成功保存的正文')
+        self.assertTrue(any('自動審稿未完成，已保留最後成功保存的正文' in item.value for item in app.warning))
+        self.assertFalse(any('正文與審稿版本均已保存' in item.value for item in app.success))
+        self.assertEqual(progress.call_args_list[-1].args[1], 'draft_saved')
+
+    def test_completed_review_with_evidence_gaps_keeps_review_record(self):
+        self.reviewed_draft['metadata'].update(review_status='needs_review', quality_status='needs_review',
+            quality={'verdict': 'pass'}, answer_status='limited',
+            review_findings=[{'message': 'Evidence still needs checking.', 'severity': 'warning'}])
+        app = self.app()
+        app.sidebar.text_input(key='ai_api_key').input('synthetic-session-credential').run()
+        app.button(key='research_generate').click().run()
+        self.assertFalse(app.exception)
+        with ResearchStore(self.db) as store:
+            report = store.list_reports()[0]
+            revision = store.list_revisions(report['id'])[0]
+        self.assertEqual(report['metadata']['review_status'], 'needs_review')
+        self.assertEqual(report['metadata']['reviewed_version'], report['version'])
+        self.assertEqual(revision['note'], 'AI獨立審稿結果')
+        self.assertTrue(any('自動審稿紀錄已保存' in item.value for item in app.warning))
+        self.assertFalse(any('自動審稿未完成' in item.value for item in app.warning))
+        self.assertTrue(any('自動審稿已完成；來源與主張核驗仍有限制' in item.value for item in app.info))
+        self.assertTrue(any('尚未經獨立事實核實' in item.value for item in app.info))
+        self.assertTrue(any('Evidence still needs checking.' == item.value for item in app.text))
+
+    def test_review_completion_requires_a_completed_stage_or_quality_snapshot(self):
+        cases = [({'review_status': 'pending', 'workflow_stage': 'writer_saved'}, False),
+                 ({'review_status': 'reviewed'}, False),
+                 ({'review_status': 'needs_review', 'workflow_stage': 'writer_saved'}, False),
+                 ({'review_status': 'needs_review', 'workflow_stage': 'review_complete'}, True),
+                 ({'review_status': 'reviewed', 'quality_status': 'reviewed_snapshot'}, True),
+                 ({'review_status': 'needs_review', 'workflow_stage': 'review_complete', 'review_error': 'Failed'}, False)]
+        for metadata, expected in cases:
+            with self.subTest(metadata=metadata):
+                self.assertEqual(ui._review_completed(metadata), expected)
 
     def test_legacy_toggle_hides_deep_budget_and_reaches_legacy_generation(self):
         app = self.app(report_mode='argumentative', deep_research=None)
@@ -641,7 +719,7 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         app.text_area(key=f"research_editor_body_{failed['id']}").input('審稿未完成，我自行修改。').run()
         app.button(key='research_save_edit').click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertTrue(any('獨立審稿未完成' in item.value for item in app.info))
+        self.assertTrue(any('自動審稿未完成，已保留最後成功保存的正文' in item.value for item in app.info))
         self.assertFalse(any('AI審稿基於v' in item.value for item in app.info))
         with ResearchStore(self.db) as store:
             saved = store.get_report(failed['id'])
@@ -650,7 +728,7 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         self.assertNotIn('reviewed_version', saved['metadata'])
         for export in (export_markdown, export_html):
             text = export(saved).decode('utf-8')
-            self.assertIn('審稿未完成，初稿保留', text)
+            self.assertIn('自動審稿未完成，已保留最後成功保存的正文', text)
             self.assertNotIn('AI審稿基於v', text)
         self.assertEqual(self.generator.call_count, 1)
 

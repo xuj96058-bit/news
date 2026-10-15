@@ -21,7 +21,7 @@ METADATA_FIELDS = frozenset({
     "research_brief", "report_mode", "quality_status",
     "writing_style", "argument_plan", "quality", "retrieval_outcomes", "api_call_count",
     "daily_selection", "input_sources", "manually_verified",
-    "review_error_reason",
+    "review_error_reason", "review_history",
     "data_preparation",
     "deep_research", "research_packet", "research_budget", "research_execution",
     "answer_status", "claim_audit", "restoration",

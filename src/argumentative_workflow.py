@@ -9,6 +9,7 @@ import copy
 import json
 import re
 import time
+import unicodedata
 from threading import Event
 
 from openai import OpenAI
@@ -20,11 +21,11 @@ from .research import (MAX_PROMPT_CHARS, MAX_RESPONSE_CHARS, ResearchError,
     _date_label, _markdown_text, _number_values, _nonstream_content, _progress,
     _stream_content, _transport_timed_out, _validated_sources, prepare_evidence)
 from .research_quality import build_research_brief, select_relevant_passages
+from .research_timing import publication_reserves, stage_deadline
 from .research_workflow import (_CapturedStream, _computed_numbers, _decode,
     _safe_model_text, _allowed_urls, _safe_review_error)
 
-ESSAY_DEADLINE_SECONDS = 720
-ESSAY_STAGE_SECONDS = 240
+ESSAY_DEADLINE_SECONDS = 3600
 QUALITY_DIMENSIONS = ("relevance", "evidence", "reasoning", "readability")
 
 
@@ -33,14 +34,27 @@ def _finding(message, *, section="thesis", paragraph=1, severity="warning", ids=
             "message": message, "source_ids": list(ids)}
 
 
-def _checked_essay(payload, sources, brief):
+def _checked_essay(payload, sources, brief, *, as_of=None):
     from .argumentation import parse_essay, essay_paragraphs
     draft, warnings = parse_essay(payload, sources, brief)
     urls = _allowed_urls(sources)
+    date = _date_label(as_of) if as_of is not None else None
+    def numeric_text(text):
+        # The report's own cutoff is trusted metadata, not an asserted market
+        # value. Exempt only complete matching dates, never their bare numbers.
+        text = unicodedata.normalize("NFKC", text)
+        if date:
+            year, month, day = map(int, date.split("-"))
+            month_token = f"0?{month}" if month < 10 else str(month)
+            day_token = f"0?{day}" if day < 10 else str(day)
+            pattern = (rf"(?<![0-9A-Za-z])(?:{re.escape(date)}|"
+                rf"{year}年\s*{month_token}月\s*{day_token}日|{month_token}月\s*{day_token}日)(?![0-9])")
+            text = re.sub(pattern, " ", text)
+        return text
     def heading_numbers(text, ids, section):
         evidence = "\n".join(str(source.get(k) or "") for source in sources if source["id"] in ids
             for k in ("content", "title", "published_at", "publication_date", "observation_date"))
-        if not _number_values(text).issubset(_number_values(evidence)):
+        if not _number_values(numeric_text(text)).issubset(_number_values(evidence)):
             warnings.append({"code":"untraceable_numbers", "section":section, "paragraph":1,
                 "message":"標題中的數字未能追溯至支持來源。"})
     heading_numbers(draft["title"], {s["id"] for s in sources}, "thesis")
@@ -56,20 +70,22 @@ def _checked_essay(payload, sources, brief):
         evidence = "\n".join(str(source.get(key) or "") for source in sources
             if source["id"] in paragraph["source_ids"]
             for key in ("content", "title", "published_at", "publication_date", "observation_date"))
-        text = re.sub(r"(?i)(?<![A-Za-z0-9])S\s*\d+(?![A-Za-z0-9])", "", paragraph["text"])
+        text = numeric_text(re.sub(r"(?i)(?<![A-Za-z0-9])S\s*\d+(?![A-Za-z0-9])", "", paragraph["text"]))
         computed, missing = _computed_numbers(brief, paragraph["source_ids"], text, evidence)
-        if not _number_values(text).issubset(_number_values(evidence) | computed) or missing:
+        unmatched = sorted(_number_values(text) - (_number_values(evidence) | computed))
+        if unmatched or missing:
             warnings.append({"code": "untraceable_numbers", "section": section,
-                "paragraph": index, "message": "數字或算式未能追溯至本段全部來源及操作數。"})
+                "paragraph": index, "message": "數字或算式未能追溯至本段全部來源及操作數。"
+                    + ("未匹配數字：" + "、".join(str(value) for value in unmatched[:20]) + "。" if unmatched else "")})
     return draft, warnings
 
 
-def _review(raw, sources, brief, plan):
+def _review(raw, sources, brief, plan, *, as_of=None):
     from .argumentation import essay_paragraphs, essay_findings
     payload = _decode(raw)
     if not {"draft", "findings", "summary", "quality"} <= set(payload):
         raise ModelResponseError("invalid_schema")
-    draft, warnings = _checked_essay(payload["draft"], sources, brief)
+    draft, warnings = _checked_essay(payload["draft"], sources, brief, as_of=as_of)
     locations = {(section, index) for section, index, _p in essay_paragraphs(draft)}
     locations.add(("thesis", 1))
     locations.add(("title", 1))
@@ -99,9 +115,16 @@ def _review(raw, sources, brief, plan):
     for key in QUALITY_DIMENSIONS:
         if quality[key] < 3:
             clean.append(_finding(f"品質項目 {key} 尚未達標，需補證或修改。"))
+    clean.extend(essay_findings(draft, plan))
+    quality = dict(quality)
+    # A self-reported pass cannot override the review's own low scores or
+    # blocking findings. Ask for the bounded repair instead of only relabelling.
+    if quality["verdict"] == "pass" and (any(quality[key] < 3 for key in QUALITY_DIMENSIONS)
+            or any(item["severity"] == "error" for item in clean)
+            or any(item.get("code") == "untraceable_numbers" for item in warnings)):
+        quality["verdict"] = "revise"
     if quality["verdict"] != "pass":
         clean.append(_finding("審稿要求修改或補充證據，尚未達成可交付的論證。"))
-    clean.extend(essay_findings(draft, plan))
     summary = payload["summary"]
     if not isinstance(summary, str) or not 1 <= len(summary) <= 2000:
         raise ModelResponseError("invalid_schema")
@@ -114,7 +137,7 @@ def _body(draft, sources, as_of, *, plan, warnings=(), findings=(), summary="", 
     title = draft["title"] if draft else "待核對議論文草稿"
     lines = [f"# {_markdown_text(title)}", "", f"資料截至：{as_of}（香港日期）", ""]
     if stage == "review_failed":
-        lines.extend(["> 審稿未完成；已保留初稿。", ""])
+        lines.extend(["> 後續審稿未完成；已保留最後成功保存的正文。", ""])
     elif warnings or any(item["severity"] in {"warning", "error"} for item in findings):
         lines.extend(["> 草稿尚有待核對問題。", ""])
     if plan["answer_scope"] != "full":
@@ -151,11 +174,12 @@ def _body(draft, sources, as_of, *, plan, warnings=(), findings=(), summary="", 
 def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek", model=None,
         as_of, instructions="", on_progress=None, register_cancel=None, on_draft=None,
         client=None, research_brief=None, retrieve_sources=True, prepared_research=None,
-        request_guard=None, overall_deadline=None):
+        request_guard=None, overall_deadline=None, _resume_snapshot=None, _resume_max_calls=1):
     from .argumentation import (PLAN_SYSTEM, ESSAY_WRITER_SYSTEM, ESSAY_REVIEWER_SYSTEM,
         parse_plan, essay_findings)
     checked = _validated_sources(sources)
-    input_sources = copy.deepcopy(checked)
+    resuming = _resume_snapshot is not None
+    input_sources = copy.deepcopy(_resume_snapshot["metadata"].get("input_sources", checked) if resuming else checked)
     if not isinstance(topic, str) or not 1 <= len(topic.strip()) <= 500:
         raise ResearchError("invalid_topic")
     topic = topic.strip()
@@ -170,10 +194,11 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
     model = validate_provider_model(provider, model or selected.models[0])
     key = api_key.strip()
     deadline = overall_deadline or time.monotonic() + ESSAY_DEADLINE_SECONDS
+    reserves = publication_reserves(max(1, deadline - time.monotonic()))
     retrieval = []
-    brief = build_research_brief(topic, checked,
-        observations=(research_brief or {}).get("observations", []), as_of=date)
-    if retrieve_sources:
+    brief = (copy.deepcopy(_resume_snapshot["metadata"]["research_brief"]) if resuming else
+        build_research_brief(topic, checked, observations=(research_brief or {}).get("observations", []), as_of=date))
+    if retrieve_sources and not resuming:
         from .research_retrieval import enrich_sources
         from .research_evidence import collect_evidence
         _progress(on_progress, "retrieving")
@@ -202,19 +227,23 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
     owned = False
     calls = 0
     persistence_error = None
+    writer_abort = None
     from .research_tables import extract_table_observations
-    table_rows = extract_table_observations(checked, as_of=date)
+    table_rows = [] if resuming else extract_table_observations(checked, as_of=date)
     if table_rows:
         brief = build_research_brief(topic, checked,
             observations=[*brief["observations"], *table_rows], as_of=date)
-    preparation_diagnostics = {"table_row_count": len(table_rows)}
+    preparation_diagnostics = (copy.deepcopy(_resume_snapshot["metadata"].get("data_preparation", {}))
+        if resuming else {"table_row_count": len(table_rows)})
     cancelled = Event()
     if register_cancel:
         register_cancel(cancelled.set)
 
-    def request(system, packet, stage):
-        nonlocal calls
+    def request_once(system, packet, stage):
+        nonlocal calls, writer_abort
         if cancelled.is_set():
+            raise ResearchError("generation_timeout")
+        if resuming and calls >= _resume_max_calls:
             raise ResearchError("generation_timeout")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -222,35 +251,72 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
         user = json.dumps(packet, ensure_ascii=False)
         if len(user) + len(system) > MAX_PROMPT_CHARS:
             raise ResearchError("source_budget")
+        protected = {"planning": ("writing", "reviewing"), "writing": ("reviewing",)}
+        request_deadline = stage_deadline(stage, deadline,
+            reserve_seconds=sum(reserves.get(name, 0) for name in protected.get(stage, ())))
         if request_guard is not None:
-            request_guard(stage)
+            guarded_deadline = request_guard(stage)
+            if type(guarded_deadline) in {int, float}:
+                request_deadline = min(request_deadline, guarded_deadline)
+        if time.monotonic() >= request_deadline:
+            raise ResearchError("generation_timeout")
         _progress(on_progress, stage)
         calls += 1
-        stage_deadline = min(deadline, time.monotonic() + ESSAY_STAGE_SECONDS)
         if provider == "anthropic":
             value = _nonstream_content(claude_completion(model=model, api_key=key, system=system, user=user))
-            if time.monotonic() > stage_deadline:
+            if time.monotonic() > request_deadline:
                 raise ResearchError("generation_timeout")
             return value
         params = {"model": model, "messages": [{"role": "system", "content": system},
             {"role": "user", "content": user}], "response_format": {"type": "json_object"},
-            "stream": True, "timeout": min(60, remaining)}
+            "stream": True, "timeout": min(60, request_deadline - time.monotonic())}
         if provider == "openai":
             params["max_completion_tokens"] = 16000
         elif provider == "deepseek":
             params.update(max_tokens=32768 if stage in {"reviewing", "revising"} else 24000,
                 extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
+        elif provider == "openrouter":
+            params.update(max_tokens=24576 if stage in {"reviewing", "revising"} else 16384)
         else:
             params.update(max_tokens=8000, temperature=0.2)
         captured = _CapturedStream(client.chat.completions.create(**configure_provider_request(provider, params)))
         try:
-            return _stream_content(captured, deadline=stage_deadline, register_cancel=register_cancel,
+            return _stream_content(captured, deadline=request_deadline, register_cancel=register_cancel,
                 max_chunks=50000,
                 on_progress=lambda _s, n: _progress(on_progress, stage, n))
-        except Exception:
-            if stage == "writing" and captured.text.strip() and time.monotonic() < stage_deadline:
-                return captured.text
+        except Exception as error:
+            if stage == "writing" and captured.text.strip():
+                status = provider_status_code(error)
+                if status in {401, 402, 403, 404}:
+                    writer_abort = {"reason": f"provider_http_{status}",
+                        "message": _safe_review_error(ProviderAPIError(status))}
+                    return captured.text
+                if cancelled.is_set():
+                    writer_abort = {"reason": "generation_timeout",
+                        "message": _safe_review_error(ResearchError("generation_timeout"))}
+                    return captured.text
+                if time.monotonic() < request_deadline:
+                    return captured.text
             raise
+
+    def request(system, packet, stage):
+        # Critical publication calls may retry a transient transport failure
+        # once. Each attempt passes the shared call guard and overall deadline.
+        for attempt in range(2):
+            try:
+                return request_once(system, packet, stage)
+            except Exception as error:
+                status = provider_status_code(error)
+                reason = provider_failure_reason(error)
+                transient = (_transport_timed_out(error)
+                    or status in {408, 429, 500, 502, 503, 504}
+                    or reason in {"provider_connection_error", "provider_protocol_error", "provider_stream_error"})
+                if (attempt or status in {401, 402, 403, 404}
+                        or stage not in {"writing", "reviewing", "revising"}
+                        or cancelled.is_set() or time.monotonic() >= deadline or not transient):
+                    raise
+                preparation_diagnostics.setdefault("publication_retries", []).append({
+                    "stage": stage, "reason": reason, "attempt": 2})
 
     try:
         if provider != "anthropic":
@@ -263,7 +329,7 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
                     or str(client.base_url).rstrip("/") != selected.base_url.rstrip("/")):
                 raise ProviderConfigurationError("invalid_model")
         # Quantitative subjects get one bounded extraction before planning.
-        if retrieve_sources and brief["profile"]["key"] != "generic" and not brief["ready"]:
+        if retrieve_sources and not resuming and brief["profile"]["key"] != "generic" and not brief["ready"]:
             from .research_analysis import extract_research_observations
             _progress(on_progress, "organizing")
             calls += 1
@@ -280,112 +346,183 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
             "sources": checked, "research_brief": brief}
         if prepared_research is not None:
             from .research_packet import DEEP_WRITING_RULES, packet_brief, prompt_packet
-            brief = packet_brief(prepared_research)
+            if not resuming:
+                brief = packet_brief(prepared_research)
             packet.update(research_brief=brief, research_packet=prompt_packet(prepared_research))
             PLAN_SYSTEM += DEEP_WRITING_RULES
             ESSAY_WRITER_SYSTEM += DEEP_WRITING_RULES
             ESSAY_REVIEWER_SYSTEM += DEEP_WRITING_RULES
-        try:
-            raw_plan = request(PLAN_SYSTEM, packet, "planning")
-        except Exception as error:
-            if (cancelled.is_set() or time.monotonic() >= deadline
-                    or isinstance(error, ProviderConfigurationError)
-                    or provider_status_code(error) in {401, 402, 403, 404}
-                    or isinstance(error, ResearchError) and error.reason != "generation_timeout"):
-                raise
-            # A transport failure in the optional planning call must not turn
-            # available sources into a report made only of preparation notes.
-            # This is an explicit procedural placeholder, never a model claim.
-            reason = error.reason if isinstance(error, (ResearchError, ModelResponseError)) else provider_failure_reason(error)
-            failure = {"stage": "planning", "reason": reason}
-            preparation_diagnostics["planning_failure"] = failure
-            if prepared_research is not None:
-                prepared_research.setdefault("preparation_warnings", []).append(failure)
-            plan = {"research_question": topic, "thesis": "論點規劃未完成；須直接依來源形成有界判斷。",
-                "answer_scope": "narrowed", "source_ids": [row["id"] for row in checked],
-                "arguments": [], "missing_evidence": ["論點規劃未完成，正文的選材及推理仍須審稿核對。"]}
-            packet["planning_fallback"] = failure
-            ESSAY_WRITER_SYSTEM += "\n論點規劃的服務調用失敗，argument_plan是程序佔位，不是已成立論點。請直接閱讀sources，排除無關材料，自行形成有證據的分論點並寫完整正文；不得將佔位文字抄成報告。資料不足只限制對應結論，仍保留有歸因的分析；所有來源均無實質相關內容時才保留有限判斷及缺口。"
+        if resuming:
+            metadata = copy.deepcopy(_resume_snapshot["metadata"])
+            # Storage merges metadata; explicit empty values clear a prior
+            # failed review when this continuation succeeds.
+            metadata.update(review_error="", review_error_reason="")
+            metadata.update(provider=provider, model=model, data_preparation=preparation_diagnostics)
+            plan, draft = metadata["argument_plan"], metadata["structured_draft"]
+            warnings = metadata.get("validation_warnings", [])
+            findings = metadata.get("review_findings", [])
+            raw = ""
+            result = {"title": draft["title"], "sources": checked,
+                "body": _resume_snapshot["body"], "metadata": metadata}
+            packet.update(sources=checked, argument_plan=plan, research_brief=brief)
         else:
-            # Invalid model selections, including unknown IDs, stay fatal;
-            # fallback never grants a malformed plan permission to cite sources.
-            plan = parse_plan(raw_plan, checked, topic)
-        if prepared_research is None:
-            checked = [source for source in checked if source["id"] in plan["source_ids"]]
-        else:
-            # Keep evidence/calculation references stable and make omitted
-            # counter-evidence visible to the reviewer, even if not cited.
-            required_ids = {row["source_id"] for row in prepared_research["evidence"]["items"] if row.get("eligible")}
-            plan["source_ids"] = list(dict.fromkeys([*plan["source_ids"], *sorted(required_ids)]))
-        if not checked:
-            raise ResearchError("empty_sources")
-        if prepared_research is None:
-            brief = build_research_brief(topic, checked, observations=brief["observations"], as_of=date)
-        if brief["profile"]["key"] != "generic" and not brief["ready"]:
-            if plan["answer_scope"] == "full":
-                plan["answer_scope"] = "narrowed"
-            plan["missing_evidence"] = list(dict.fromkeys(plan["missing_evidence"] + [
-                row["label"] + "：" + row["reason"] for row in brief["requirements"]
-                if row["status"] != "fulfilled"]))
-        packet.update(sources=checked, argument_plan=plan, research_brief=brief)
-        raw = request(ESSAY_WRITER_SYSTEM, packet, "writing")
-        try:
-            draft, warnings = _checked_essay(_decode(raw), checked, brief)
-        except ModelResponseError:
-            draft = None
-            warnings = [{"code": "invalid_schema", "section": "thesis", "paragraph": 1,
-                "message": "初稿格式未通過檢查，已保存收到的正文供修改。"}]
-        findings = essay_findings(draft, plan) if draft else []
-        metadata = {"provider": provider, "model": model, "writing_style": "argumentative",
-            "report_mode": "argumentative", "workflow_stage": "writer_saved",
-            "review_status": "pending", "quality_status": "pending", "manually_verified": False,
-            "argument_plan": plan, "structured_draft": draft, "research_brief": brief,
-            "input_sources": input_sources,
-            "data_preparation": preparation_diagnostics,
-            "retrieval_outcomes": retrieval, "validation_warnings": warnings,
-            "review_findings": findings, "api_call_count": calls}
-        result = {"title": draft["title"] if draft else topic[:180], "sources": checked,
-            "body": _body(draft, checked, date, plan=plan, warnings=warnings, findings=findings, raw=raw),
-            "metadata": metadata}
-        if time.monotonic() > deadline:
-            raise ResearchError("generation_timeout")
-        if on_draft:
             try:
-                on_draft(copy.deepcopy(result))
+                raw_plan = request(PLAN_SYSTEM, packet, "planning")
             except Exception as error:
-                persistence_error = error
-                raise
-        # Persistence failures stop before any further paid request.
+                if (cancelled.is_set() or time.monotonic() >= deadline
+                        or isinstance(error, ProviderConfigurationError)
+                        or provider_status_code(error) in {401, 402, 403, 404}
+                        or isinstance(error, ResearchError) and error.reason != "generation_timeout"):
+                    raise
+                # A transport failure in the optional planning call must not turn
+                # available sources into a report made only of preparation notes.
+                # This is an explicit procedural placeholder, never a model claim.
+                reason = error.reason if isinstance(error, (ResearchError, ModelResponseError)) else provider_failure_reason(error)
+                failure = {"stage": "planning", "reason": reason}
+                preparation_diagnostics["planning_failure"] = failure
+                if prepared_research is not None:
+                    prepared_research.setdefault("preparation_warnings", []).append(failure)
+                plan = {"research_question": topic, "thesis": "論點規劃未完成；須直接依來源形成有界判斷。",
+                    "answer_scope": "narrowed", "source_ids": [row["id"] for row in checked],
+                    "arguments": [], "missing_evidence": ["論點規劃未完成，正文的選材及推理仍須審稿核對。"]}
+                packet["planning_fallback"] = failure
+                ESSAY_WRITER_SYSTEM += "\n論點規劃的服務調用失敗，argument_plan是程序佔位，不是已成立論點。請直接閱讀sources，排除無關材料，自行形成有證據的分論點並寫完整正文；不得將佔位文字抄成報告。資料不足只限制對應結論，仍保留有歸因的分析；所有來源均無實質相關內容時才保留有限判斷及缺口。"
+            else:
+                # Invalid model selections, including unknown IDs, stay fatal;
+                # fallback never grants a malformed plan permission to cite sources.
+                plan = parse_plan(raw_plan, checked, topic)
+            if prepared_research is None:
+                checked = [source for source in checked if source["id"] in plan["source_ids"]]
+            else:
+                # Keep evidence/calculation references stable and make omitted
+                # counter-evidence visible to the reviewer, even if not cited.
+                required_ids = {row["source_id"] for row in prepared_research["evidence"]["items"] if row.get("eligible")}
+                plan["source_ids"] = list(dict.fromkeys([*plan["source_ids"], *sorted(required_ids)]))
+            if not checked:
+                raise ResearchError("empty_sources")
+            if prepared_research is None:
+                brief = build_research_brief(topic, checked, observations=brief["observations"], as_of=date)
+            if brief["profile"]["key"] != "generic" and not brief["ready"]:
+                if plan["answer_scope"] == "full":
+                    plan["answer_scope"] = "narrowed"
+                plan["missing_evidence"] = list(dict.fromkeys(plan["missing_evidence"] + [
+                    row["label"] + "：" + row["reason"] for row in brief["requirements"]
+                    if row["status"] != "fulfilled"]))
+            packet.update(sources=checked, argument_plan=plan, research_brief=brief)
+            raw = request(ESSAY_WRITER_SYSTEM, packet, "writing")
+            if cancelled.is_set() and writer_abort is None:
+                writer_abort = {"reason": "generation_timeout",
+                    "message": _safe_review_error(ResearchError("generation_timeout"))}
+            try:
+                draft, warnings = _checked_essay(_decode(raw), checked, brief, as_of=date)
+            except ModelResponseError:
+                draft = None
+                warnings = [{"code": "invalid_schema", "section": "thesis", "paragraph": 1,
+                    "message": "初稿格式未通過檢查，已保存收到的正文供修改。"}]
+            findings = essay_findings(draft, plan) if draft else []
+            metadata = {"provider": provider, "model": model, "writing_style": "argumentative",
+                "report_mode": "argumentative", "workflow_stage": "writer_saved",
+                "review_status": "pending", "quality_status": "pending", "manually_verified": False,
+                "argument_plan": plan, "structured_draft": draft, "research_brief": brief,
+                "input_sources": input_sources,
+                "data_preparation": preparation_diagnostics,
+                "retrieval_outcomes": retrieval, "validation_warnings": warnings,
+                "review_findings": findings, "api_call_count": calls}
+            result = {"title": draft["title"] if draft else topic[:180], "sources": checked,
+                "body": _body(draft, checked, date, plan=plan, warnings=warnings, findings=findings, raw=raw),
+                "metadata": metadata}
+            if writer_abort is not None:
+                metadata.update(workflow_stage="review_failed", review_status="review_failed",
+                    quality_status="review_failed", review_error=writer_abort["message"],
+                    review_error_reason=writer_abort["reason"])
+                result["body"] = _body(draft, checked, date, plan=plan, warnings=warnings,
+                    findings=findings, summary=writer_abort["message"], stage="review_failed", raw=raw)
+            if writer_abort is None and time.monotonic() > deadline:
+                raise ResearchError("generation_timeout")
+            if on_draft:
+                try:
+                    on_draft(copy.deepcopy(result))
+                except Exception as error:
+                    persistence_error = error
+                    raise
+            if writer_abort is not None:
+                return result
+        def adopt_review(revised, current_warnings, current_findings, summary, quality, stage):
+            needs_review = bool(current_warnings or any(
+                finding["severity"] in {"warning", "error"} for finding in current_findings))
+            if plan["answer_scope"] != "full":
+                needs_review = True
+                current_findings = [*current_findings, _finding(
+                    "原研究問題尚未完整回答；本稿已依證據縮小論證範圍。")]
+            metadata.update(workflow_stage=stage,
+                review_status="needs_review" if needs_review else "reviewed",
+                quality_status="needs_review" if needs_review else "reviewed_snapshot",
+                quality=quality, structured_draft=revised,
+                validation_warnings=current_warnings, review_findings=current_findings,
+                review_summary=summary, api_call_count=calls)
+            metadata.setdefault("review_history", []).append({"stage": stage,
+                "verdict": quality["verdict"], "scores": {key: quality[key] for key in QUALITY_DIMENSIONS},
+                "summary": summary, "api_call_count": calls})
+            result.update(title=revised["title"], body=_body(revised, checked, date, plan=plan,
+                warnings=current_warnings, findings=current_findings, summary=summary, stage=stage))
+
+        # Every valid review is adopted before an optional further request.
+        # A later provider failure must retain these actual revisions.
         try:
             reviewer_packet = {**packet, "writer_draft": draft or {"raw_text": raw[:MAX_RESPONSE_CHARS]},
                 "validation_warnings": warnings, "program_findings": findings}
             if prepared_research is not None:
                 reviewer_packet["claim_audit"] = prepared_research.get("claim_audit")
-            review_raw = request(ESSAY_REVIEWER_SYSTEM, reviewer_packet, "reviewing")
-            revised, warnings, findings, summary, quality = _review(review_raw, checked, brief, plan)
-            # One bounded rewrite/review pass; do not spin on poor evidence.
-            if quality["verdict"] == "revise" and deadline-time.monotonic() > 30:
-                reviewer_packet.update(writer_draft=revised, validation_warnings=warnings,
-                    program_findings=findings, revision_request="修正仍存在的問題；不可新增來源，證據不足就縮小結論。這是最後一輪。")
-                review_raw = request(ESSAY_REVIEWER_SYSTEM, reviewer_packet, "revising")
-                revised, warnings, findings, summary, quality = _review(review_raw, checked, brief, plan)
-            needs_review = bool(warnings or any(f["severity"] in {"warning","error"} for f in findings))
-            if plan["answer_scope"] != "full":
-                needs_review = True
-                findings.append(_finding("原研究問題尚未完整回答；本稿已依證據縮小論證範圍。"))
-            metadata.update(workflow_stage="review_complete", review_status="needs_review" if needs_review else "reviewed",
-                quality_status="needs_review" if needs_review else "reviewed_snapshot", quality=quality,
-                structured_draft=revised, validation_warnings=warnings, review_findings=findings,
-                review_summary=summary, api_call_count=calls)
-            result.update(title=revised["title"], body=_body(revised, checked, date, plan=plan,
-                warnings=warnings, findings=findings, summary=summary, stage="review_complete"))
+            # The second outcome slot is shared by a substantive revision and
+            # recovery from malformed output. Never add a third review because
+            # a recovered response itself asks for revision. Transport retries
+            # remain bounded inside request and pass the same central guard.
+            review_stage = "reviewing"
+            for outcome_attempt in range(2):
+                try:
+                    review_raw = request(ESSAY_REVIEWER_SYSTEM, reviewer_packet, review_stage)
+                    revised, warnings, findings, summary, quality = _review(
+                        review_raw, checked, brief, plan, as_of=date)
+                except ModelResponseError as error:
+                    if (outcome_attempt or cancelled.is_set() or deadline-time.monotonic() <= 30
+                            or resuming and calls >= _resume_max_calls):
+                        raise
+                    preparation_diagnostics.setdefault("review_format_retries", []).append({
+                        "stage": review_stage, "reason": error.reason, "attempt": 2})
+                    reviewer_packet["response_repair_request"] = (
+                        "上一輪回覆未通過完整 JSON 格式檢查。請重新完成同一份草稿的實質審稿，"
+                        "輸出符合全部欄位規格的完整 JSON；不得只回傳補丁或省略 draft。"
+                        "保持文字精簡，避免重複，以免截斷。這是最後一輪。")
+                    continue
+                if (not outcome_attempt and quality["verdict"] == "revise"
+                        and deadline-time.monotonic() > 30 and (not resuming or calls < _resume_max_calls)):
+                    adopt_review(revised, warnings, findings, summary, quality, "review_saved")
+                    if on_draft:
+                        try:
+                            on_draft(copy.deepcopy(result))
+                        except Exception as error:
+                            persistence_error = error
+                            raise
+                    reviewer_packet.update(writer_draft=revised, validation_warnings=warnings,
+                        program_findings=findings, revision_request="修正仍存在的問題；不可新增來源，證據不足就縮小結論。這是最後一輪。")
+                    review_stage = "revising"
+                    continue
+                adopt_review(revised, warnings, findings, summary, quality, "review_complete")
+                break
         except Exception as error:
+            if error is persistence_error:
+                raise
             summary = _safe_review_error(error)
+            review_status_code = provider_status_code(error)
+            review_reason = (f"provider_http_{review_status_code}" if review_status_code is not None else
+                getattr(error, "reason", provider_failure_reason(error)))
             metadata.update(workflow_stage="review_failed", review_status="review_failed",
                 quality_status="review_failed", review_error=summary,
-                review_error_reason=getattr(error,"reason",type(error).__name__), api_call_count=calls)
-            result["body"] = _body(draft, checked, date, plan=plan, warnings=warnings,
-                findings=findings, summary=summary, stage="review_failed", raw=raw)
+                review_error_reason=review_reason, api_call_count=calls)
+            retained = metadata.get("structured_draft")
+            result["body"] = _body(retained, checked, date, plan=plan,
+                warnings=metadata.get("validation_warnings", []),
+                findings=metadata.get("review_findings", []), summary=summary, stage="review_failed", raw=raw)
         if time.monotonic() > deadline:
             raise ResearchError("generation_timeout")
         _progress(on_progress, "ready")
@@ -406,3 +543,13 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
                 client.close()
             except Exception:
                 pass
+
+
+def resume_argumentative_review(saved_report, *, api_key, provider=None, model=None,
+        on_progress=None, register_cancel=None, on_draft=None, client=None,
+        request_guard=None, overall_deadline=None, max_calls=1):
+    """Continue a matching saved deep draft through the same bounded reviewer."""
+    from .argumentative_resume import resume_review
+    return resume_review(saved_report, api_key=api_key, provider=provider, model=model,
+        on_progress=on_progress, register_cancel=register_cancel, on_draft=on_draft, client=client,
+        request_guard=request_guard, overall_deadline=overall_deadline, max_calls=max_calls)
