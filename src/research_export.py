@@ -16,6 +16,8 @@ import re
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from .research_status import review_status_label
+
 
 class ResearchExportError(Exception):
     """A safe, user-facing export failure; never includes report configuration."""
@@ -39,16 +41,8 @@ def _fields(report: Mapping[str, Any]) -> tuple[str, str, list[str]]:
     if isinstance(workflow, Mapping) and workflow.get("report_mode") in {"research", "gap", "argumentative"}:
         metadata.append("報告類型：" + {"gap":"資料缺口簡報", "research":"研究草稿",
             "argumentative":"議論文研究草稿"}[workflow["report_mode"]])
-    if isinstance(workflow, Mapping) and isinstance(workflow.get("review_status"), str) and workflow["review_status"]:
-        reviewed = workflow.get("reviewed_version")
-        if not isinstance(reviewed, int) or isinstance(reviewed, bool) or reviewed < 1:
-            reviewed = None
-        if reviewed and reviewed != report.get("version"):
-            label = f"人工修改後待核對（AI審稿基於v{reviewed}）"
-        else:
-            label = {"pending": "初稿待審稿", "draft": "初稿待審稿", "reviewed": "AI審稿完成，尚未人工核實",
-                     "needs_review": "有待核對項目", "review_failed": "審稿未完成，初稿保留"}.get(
-                         workflow["review_status"], "草稿待核對")
+    label = review_status_label(workflow, version=report.get("version"))
+    if label:
         metadata.append("草稿狀態：" + label)
     # The export already owns the title. Remove just an identical opening H1,
     # preserving all other user-authored headings and the stored original body.

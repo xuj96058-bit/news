@@ -14,6 +14,8 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from openai import APITimeoutError, OpenAI
@@ -21,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from requests.exceptions import Timeout as RequestsTimeout
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 
 
 MAX_ARTICLES = 30
@@ -48,7 +50,7 @@ _SAFE_ERRORS = {
     "missing_citations": "AI 報告有正文段落缺少來源引用，草稿未保存。請重新生成或減少所選材料。",
     "untraceable_numbers": "模型數字敘述未能追溯至同段引用的來源快照，請重新生成。",
     "invented_url": "模型報告包含來源快照以外的連結，請重新生成。",
-    "generation_timeout": "報告生成逾時：AI 服務未及時回應，或已超過 180 秒整體時限。請稍後重試，或減少所選新聞。",
+    "generation_timeout": "報告生成逾時：服務未及時回應，或已超過本次研究設定的時限。已保存資料及草稿仍可查看。",
 }
 
 
@@ -484,6 +486,78 @@ def _transport_timed_out(error: Exception) -> bool:
     return False
 
 
+def _deadline_chunks(stream, deadline, register_cancel=None):
+    """Bound wall-clock waiting even when an SDK consumes SSE heartbeats internally."""
+    queue = Queue(maxsize=1)
+    stopped, cancelled = Event(), Event()
+    close = getattr(stream, "close", None)
+    closing = None
+    close_lock = Lock()
+
+    def close_stream():
+        nonlocal closing
+        with close_lock:
+            if callable(close) and closing is None:
+                def safely_close():
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                closing = Thread(target=safely_close, name="research-stream-close", daemon=True)
+                closing.start()
+
+    def cancel():
+        cancelled.set()
+        stopped.set()
+        close_stream()
+
+    def publish(kind, value):
+        while not stopped.is_set():
+            try:
+                queue.put((kind, value), timeout=0.05)
+                return True
+            except Full:
+                continue
+        return False
+
+    def consume():
+        try:
+            for chunk in stream:
+                if not publish("chunk", chunk):
+                    return
+        except BaseException as error:
+            publish("error", error)
+        finally:
+            publish("done", None)
+
+    try:
+        if register_cancel:
+            register_cancel(cancel)
+        if cancelled.is_set() or time.monotonic() >= deadline:
+            raise ResearchError("generation_timeout")
+        Thread(target=consume, name="research-stream-read", daemon=True).start()
+        while True:
+            remaining = deadline - time.monotonic()
+            if cancelled.is_set() or remaining <= 0:
+                raise ResearchError("generation_timeout")
+            try:
+                kind, value = queue.get(timeout=min(remaining, 0.1))
+            except Empty:
+                continue
+            if kind == "error":
+                raise value
+            if kind == "done":
+                return
+            yield value
+    finally:
+        stopped.set()
+        close_stream()
+        if closing is not None:
+            # Normal close completes immediately. A blocked transport close
+            # must not extend the deadline or block cancellation indefinitely.
+            closing.join(timeout=0.1)
+
+
 def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = None,
                     register_cancel: Callable[[Callable[[], None]], None] | None = None,
                     deadline: float | None = None, max_chunks: int = MAX_STREAM_CHUNKS) -> str:
@@ -495,11 +569,9 @@ def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = 
         raise ResearchError("source_budget")
     if deadline is None:
         deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+    chunks_with_deadline = _deadline_chunks(stream, deadline, register_cancel)
     try:
-        close = getattr(stream, "close", None)
-        if register_cancel is not None and callable(close):
-            register_cancel(close)
-        for chunk in stream:
+        for chunk in chunks_with_deadline:
             chunks += 1
             if time.monotonic() > deadline:
                 raise ResearchError("generation_timeout")
@@ -534,12 +606,7 @@ def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = 
             raise ResearchError("generation_timeout")
         return "".join(pieces)
     finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+        chunks_with_deadline.close()
 
 
 def _nonstream_content(response) -> str:
@@ -677,8 +744,38 @@ def _parse_draft(raw: str, sources: list[dict]) -> tuple[ResearchDraft, list[str
     return result, list(dict.fromkeys(review_warnings))
 
 
+_NAMED_INDEX_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"S\s*&\s*P\s*500|Standard\s*&\s*Poor['’]s\s*500|"
+    r"標普\s*500|标普\s*500|標準普爾\s*500|标准普尔\s*500|"
+    r"Russell\s*1000|羅素\s*1000|罗素\s*1000"
+    r")(?:\s*(?:index|指數|指数))?(?![A-Za-z0-9]|[.,]\d)", re.I)
+_NUMBER_LABEL_UNIT = re.compile(
+    r"\s*(?:[%％]|倍|點|点|元|美元|港元|人民幣|人民币|億|亿|萬|万|千|百|家|人|項|项|"
+    r"(?:USD|HKD|CNY|RMB|EUR|GBP|percent|percentage|million|billion|trillion|"
+    r"dollars?|points?|times|bps?|basis\s+points?)\b)", re.I)
+
+
+def _without_named_index_numbers(text: str) -> str:
+    """Mask complete known index labels, never every occurrence of their value.
+
+    Ambiguous quantity suffixes remain numerical claims. A masked label only
+    says its digits name an entity; source support for that entity still needs
+    semantic review. Unknown labels are deliberately not exempted.
+    """
+    def replace(match):
+        if _NUMBER_LABEL_UNIT.match(text, match.end()):
+            return match.group()
+        return " " * len(match.group())
+    return _NAMED_INDEX_NUMBER.sub(replace, text)
+
+
 def _number_values(text: str) -> set[Decimal]:
-    values = {Decimal(number.replace(",", "")) for number in re.findall(r"(?<![A-Za-z])\d+(?:,\d{3})*(?:\.\d+)?", text)}
+    text = _without_named_index_numbers(unicodedata.normalize("NFKC", text))
+    # Recognize whole numeric tokens, including unknown alphanumeric labels.
+    # A letter before 500 must not make the regex restart at its trailing 00.
+    values = {Decimal(number.replace(",", "")) for number in
+              re.findall(r"(?<![\d.])\d+(?:,\d{3})*(?:\.\d+)?(?!\d)", text)}
     # Translation of a supplied month name is a date label, not new evidence.
     for month, value in enumerate(("january", "february", "march", "april", "may", "june",
                                     "july", "august", "september", "october", "november", "december"), 1):
@@ -749,7 +846,7 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
             if remaining <= 0:
                 raise ResearchError("generation_timeout")
             request["timeout"] = min(60.0, remaining)
-        return _stream_content(client.chat.completions.create(**request), on_progress=progress,
+        return _stream_content(client.chat.completions.create(**configure_provider_request(provider, request)), on_progress=progress,
                                register_cancel=register_cancel, deadline=deadline)
 
     try:

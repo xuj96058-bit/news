@@ -3,7 +3,7 @@ import copy
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.research import prepare_sources
 from src.research_workflow import generate_research_workflow
@@ -71,15 +71,126 @@ class ArgumentativeWorkflowTests(unittest.TestCase):
         saved=[]
         result=self.generate(c,on_draft=saved.append)
         self.assertEqual(len(saved),1)
+        self.assertEqual(c.chat.completions.create.call_count,3)
         self.assertEqual(result["metadata"]["review_status"],"review_failed")
         self.assertNotIn("synthetic-key",json.dumps(result))
+
+    def test_invalid_review_output_recovers_once_through_shared_guard(self):
+        class InvalidStream(Stream):
+            def __init__(self, raw, finish): self.text=raw; self.finish=finish
+            def __iter__(self):
+                yield SimpleNamespace(choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=self.text),finish_reason=self.finish)])
+        for reason,raw,finish in (("invalid_json","{synthetic-private-response","stop"),
+                ("invalid_shape","[]","stop"),("invalid_schema","{}","stop"),
+                ("empty_content","","stop"),("truncated",json.dumps(review()),"length")):
+            with self.subTest(reason=reason):
+                c=self.client(plan(),essay(),InvalidStream(raw,finish),review())
+                stages=[];saved=[]
+                result=self.generate(c,request_guard=stages.append,on_draft=saved.append)
+                self.assertEqual(stages,["planning","writing","reviewing","reviewing"])
+                self.assertEqual(c.chat.completions.create.call_count,4)
+                self.assertEqual(result["metadata"]["workflow_stage"],"review_complete")
+                self.assertEqual(len(result["metadata"]["review_history"]),1)
+                self.assertEqual([row["metadata"]["workflow_stage"] for row in saved],["writer_saved"])
+                self.assertEqual(result["metadata"]["data_preparation"]["review_format_retries"],
+                    [{"stage":"reviewing","reason":reason,"attempt":2}])
+                first=json.loads(c.chat.completions.create.call_args_list[2].kwargs["messages"][1]["content"])
+                recovery=json.loads(c.chat.completions.create.call_args_list[3].kwargs["messages"][1]["content"])
+                self.assertEqual(recovery["writer_draft"],first["writer_draft"])
+                self.assertIn("response_repair_request",recovery)
+                self.assertNotIn("synthetic-private-response",json.dumps(result))
+                self.assertNotIn("synthetic-private-response",json.dumps(recovery))
+
+    def test_recovered_review_needing_revision_does_not_get_a_third_outcome(self):
+        c=self.client(plan(),essay(),{},review(verdict="revise"),review())
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual(result["metadata"]["workflow_stage"],"review_complete")
+        self.assertEqual(result["metadata"]["review_status"],"needs_review")
+        self.assertEqual(result["metadata"]["quality"]["verdict"],"revise")
+        self.assertEqual(len(result["metadata"]["review_history"]),1)
+
+    def test_second_invalid_review_retains_initial_body_and_failure_status(self):
+        c=self.client(plan(),essay(),{},{},review())
+        saved=[]
+        result=self.generate(c,on_draft=saved.append)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual(result["metadata"]["review_status"],"review_failed")
+        self.assertEqual(result["metadata"]["review_error_reason"],"invalid_schema")
+        self.assertEqual(result["metadata"]["structured_draft"],saved[0]["metadata"]["structured_draft"])
+        self.assertNotIn("review_history",result["metadata"])
+
+    def test_invalid_revision_retains_last_successful_durable_body(self):
+        revised=essay();revised["title"]="Already corrected operating outlook"
+        c=self.client(plan(),essay(),review(revised,verdict="revise"),{},review())
+        saved=[]
+        result=self.generate(c,on_draft=saved.append)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual([row["metadata"]["workflow_stage"] for row in saved],
+            ["writer_saved","review_saved"])
+        self.assertEqual(result["title"],revised["title"])
+        self.assertEqual(result["metadata"]["structured_draft"],saved[-1]["metadata"]["structured_draft"])
+        self.assertEqual(result["metadata"]["review_status"],"review_failed")
+        self.assertEqual(result["metadata"]["review_error_reason"],"invalid_schema")
+        self.assertNotIn("review_format_retries",result["metadata"]["data_preparation"])
+
+    def test_format_recovery_cannot_retry_authentication_failure(self):
+        from src.analysis_errors import ProviderAPIError
+        c=self.client(plan(),essay(),{},ProviderAPIError(401),review())
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual(result["metadata"]["review_status"],"review_failed")
+        self.assertEqual(result["metadata"]["review_error_reason"],"provider_http_401")
+
+    def test_format_recovery_stops_when_cancelled_or_overall_time_is_nearly_used(self):
+        from src.analysis_errors import ModelResponseError
+        for stop in ("cancelled","deadline"):
+            with self.subTest(stop=stop):
+                clock=[100.0];callbacks=[]
+                c=self.client(plan(),essay(),{},review())
+                def invalid_review(*_args,**_kwargs):
+                    if stop=="cancelled": callbacks[0]()
+                    else: clock[0]=3680.0
+                    raise ModelResponseError("invalid_schema")
+                with patch("src.argumentative_workflow.time.monotonic",side_effect=lambda:clock[0]), \
+                        patch("src.argumentative_workflow._review",side_effect=invalid_review):
+                    result=self.generate(c,register_cancel=callbacks.append)
+                self.assertEqual(c.chat.completions.create.call_count,3)
+                self.assertEqual(result["metadata"]["review_status"],"review_failed")
+                self.assertNotIn("review_format_retries",result["metadata"]["data_preparation"])
 
     def test_scores_cannot_clear_untraceable_numbers(self):
         d=essay();d["arguments"][0]["claim"]["text"]="Orders increased 987 percent."
         p=plan();p.update(answer_scope="full",missing_evidence=[])
-        result=self.generate(self.client(p,d,review(d)))
+        result=self.generate(self.client(p,d,review(d),review(d)))
         self.assertEqual(result["metadata"]["review_status"],"needs_review")
         self.assertTrue(any(w["code"]=="untraceable_numbers" for w in result["metadata"]["validation_warnings"]))
+
+    def test_numeric_source_mismatch_triggers_actual_automatic_repair(self):
+        d=essay();d["arguments"][0]["evidence"][0]["text"]="Orders increased 987 percent."
+        p=plan();p.update(answer_scope="full",missing_evidence=[])
+        c=self.client(p,d,review(d),review(essay()))
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual([row["verdict"] for row in result["metadata"]["review_history"]],
+            ["revise","pass"])
+        self.assertFalse(result["metadata"]["validation_warnings"])
+        self.assertNotIn("987",result["body"])
+        retry=json.loads(c.chat.completions.create.call_args_list[3].kwargs["messages"][1]["content"])
+        self.assertTrue(any(w["code"]=="untraceable_numbers" for w in retry["validation_warnings"]))
+
+    def test_cutoff_dates_do_not_license_unrelated_numbers(self):
+        from src.argumentative_workflow import _checked_essay
+        for date_text in ("2026-10-15", "2026年10月15日", "10月15日"):
+            with self.subTest(date=date_text):
+                d=essay()
+                d["arguments"][0]["evidence"][0]["text"]=f"資料不是{date_text}的收市行情。"
+                _,warnings=_checked_essay(d,sources(),{},as_of="2026-10-15")
+                self.assertFalse(warnings)
+                d["arguments"][0]["evidence"][0]["text"]+="盈利增長15%。"
+                _,warnings=_checked_essay(d,sources(),{},as_of="2026-10-15")
+                self.assertTrue(any(w["code"]=="untraceable_numbers" for w in warnings))
 
     def test_one_revision_only(self):
         c=self.client(plan(),essay(),review(verdict="revise"),review(verdict="revise"))
@@ -87,12 +198,104 @@ class ArgumentativeWorkflowTests(unittest.TestCase):
         self.assertEqual(c.chat.completions.create.call_count,4)
         self.assertEqual(result["metadata"]["review_status"],"needs_review")
 
+    def test_low_review_score_cannot_skip_automatic_revision_with_a_pass_label(self):
+        first=review()
+        first["quality"]["reasoning"]=2
+        c=self.client(plan(),essay(),first,review())
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual([row["verdict"] for row in result["metadata"]["review_history"]],
+            ["revise","pass"])
+        self.assertEqual(result["metadata"]["quality"]["reasoning"],3)
+
+    def test_blocking_review_finding_requires_revision_despite_high_scores(self):
+        first=review()
+        first["findings"]=[{"section":"thesis","paragraph":1,"severity":"error",
+            "message":"The conclusion exceeds the supplied evidence.","source_ids":["S1"]}]
+        c=self.client(plan(),essay(),first,review())
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual(result["metadata"]["review_history"][0]["verdict"],"revise")
+
+    def test_failed_second_review_retains_the_durably_saved_first_revision(self):
+        revised=essay();revised["title"]="Revised orders and profits"
+        c=self.client(plan(),essay(),review(revised,verdict="revise"),RuntimeError("provider failed"))
+        saved=[]
+        result=self.generate(c,on_draft=saved.append)
+        self.assertEqual([row["metadata"]["workflow_stage"] for row in saved],
+            ["writer_saved","review_saved"])
+        self.assertNotEqual(saved[0]["title"],saved[1]["title"])
+        self.assertEqual(result["title"],revised["title"])
+        self.assertEqual(result["metadata"]["structured_draft"],saved[1]["metadata"]["structured_draft"])
+        self.assertIn(revised["title"],result["body"])
+        self.assertEqual(result["metadata"]["review_status"],"review_failed")
+
+    def test_failed_revision_checkpoint_stops_before_another_paid_request(self):
+        c=self.client(plan(),essay(),review(verdict="revise"),review())
+        def checkpoint(draft):
+            if draft["metadata"]["workflow_stage"]=="review_saved":
+                raise RuntimeError("revision database unavailable")
+        with self.assertRaisesRegex(RuntimeError,"revision database unavailable"):
+            self.generate(c,on_draft=checkpoint)
+        self.assertEqual(c.chat.completions.create.call_count,3)
+
+    def test_transient_review_failure_retries_through_the_shared_call_guard(self):
+        from src.analysis_errors import ProviderAPIError
+        c=self.client(plan(),essay(),ProviderAPIError(503),review())
+        stages=[]
+        result=self.generate(c,request_guard=stages.append)
+        self.assertEqual(stages,["planning","writing","reviewing","reviewing"])
+        self.assertEqual(c.chat.completions.create.call_count,4)
+        self.assertEqual(result["metadata"]["workflow_stage"],"review_complete")
+        self.assertEqual(result["metadata"]["data_preparation"]["publication_retries"],
+            [{"stage":"reviewing","reason":"provider_or_processing_error","attempt":2}])
+
+    def test_review_authentication_failure_does_not_retry(self):
+        from src.analysis_errors import ProviderAPIError
+        c=self.client(plan(),essay(),ProviderAPIError(401),review())
+        result=self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count,3)
+        self.assertEqual(result["metadata"]["review_error_reason"],"provider_http_401")
+
     def test_unknown_plan_reference_never_reaches_writer(self):
         p=plan();p["source_ids"].append("S999")
         c=self.client(p,essay(),review())
         from src.analysis_errors import ModelResponseError
         with self.assertRaises(ModelResponseError): self.generate(c)
         self.assertEqual(c.chat.completions.create.call_count,1)
+
+    def test_planning_transport_failure_still_writes_and_reviews_sources(self):
+        c = self.client(RuntimeError("synthetic-provider-secret"), essay(), review())
+        result = self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count, 3)
+        self.assertTrue(result["metadata"]["structured_draft"]["arguments"])
+        self.assertEqual(result["metadata"]["argument_plan"]["answer_scope"], "narrowed")
+        self.assertEqual(result["metadata"]["data_preparation"]["planning_failure"],
+            {"stage": "planning", "reason": "provider_or_processing_error"})
+        writer_payload = json.loads(c.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual(writer_payload["planning_fallback"]["stage"], "planning")
+        self.assertNotIn("synthetic-provider-secret", json.dumps(result))
+
+    def test_authentication_failure_does_not_try_writer(self):
+        from src.analysis_errors import ProviderAPIError
+        for status in (401, 402, 403, 404):
+            with self.subTest(status=status):
+                c = self.client(ProviderAPIError(status), essay(), review())
+                with self.assertRaises(ProviderAPIError):
+                    self.generate(c)
+                self.assertEqual(c.chat.completions.create.call_count, 1)
+
+    def test_cancelled_planning_does_not_fallback_to_writer(self):
+        callbacks = []
+        c = self.client()
+        def cancel(**_kwargs):
+            callbacks[0]()
+            raise RuntimeError("closed transport")
+        c.chat.completions.create.side_effect = cancel
+        from src.analysis_errors import ProviderAPIError
+        with self.assertRaises(ProviderAPIError):
+            self.generate(c, register_cancel=callbacks.append)
+        self.assertEqual(c.chat.completions.create.call_count, 1)
 
     def test_numeric_headings_and_title_cannot_bypass_checks(self):
         for location in ("title","heading"):
@@ -106,6 +309,7 @@ class ArgumentativeWorkflowTests(unittest.TestCase):
         from src.research_store import ResearchStore
         result=self.generate(self.client(plan(),essay(),review()))
         result["metadata"]["argument_plan"]["api_key"]="synthetic-secret"
+        result["metadata"]["review_history"][0]["api_key"]="synthetic-secret"
         with ResearchStore(":memory:") as store:
             saved=store.create_report(topic="Orders",title=result["title"],body=result["body"],
                 sources=result["sources"],provider="deepseek",model="deepseek-flash",
@@ -113,6 +317,7 @@ class ArgumentativeWorkflowTests(unittest.TestCase):
             loaded=store.get_report(saved["id"])
         self.assertEqual(loaded["metadata"]["writing_style"],"argumentative")
         self.assertEqual(loaded["metadata"]["quality"]["relevance"],3)
+        self.assertEqual(loaded["metadata"]["review_history"][0]["verdict"],"pass")
         self.assertEqual(loaded["metadata"]["argument_plan"]["source_ids"],["S1","S2"])
         self.assertNotIn("synthetic-secret",json.dumps(loaded))
 
@@ -151,6 +356,7 @@ class ArgumentativeUiTests(ResearchUiHarness, unittest.TestCase):
         self.generator.side_effect=real_flow
         app=self.app(report_mode="argumentative")
         self.assertEqual(app.radio(key="research_report_mode").value,"議論文式研究報告（建議）")
+        self.assertFalse(app.checkbox(key="research_deep").value)
         app.sidebar.text_input(key="ai_api_key").input("synthetic-ui-key").run()
         self.assertFalse(app.button(key="research_generate").disabled)
         app.button(key="research_generate").click().run()

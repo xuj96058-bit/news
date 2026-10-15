@@ -10,7 +10,7 @@ from typing import Any
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 from .analysis_errors import ModelResponseError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, provider_environment_key, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, provider_environment_key, validate_provider_model
 
 
 class EventExtraction(BaseModel):
@@ -44,6 +44,8 @@ def parse_analysis_response(response) -> AnalysisResult:
     choice = choices[0]
     if getattr(choice, "finish_reason", None) == "length":
         raise ModelResponseError("truncated")
+    if getattr(choice, "finish_reason", None) != "stop":
+        raise ModelResponseError("invalid_shape")
     raw = getattr(getattr(choice, "message", None), "content", None)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         raise ModelResponseError("empty_content")
@@ -240,7 +242,7 @@ JSON Schema:
             request["extra_body"] = {"thinking": {"type": "disabled"}}
         elif provider is None:
             request["extra_body"] = None
-        resp = client.chat.completions.create(**request)
+        resp = client.chat.completions.create(**configure_provider_request(provider, request))
 
     result = parse_analysis_response(resp)
     return post_process_impacts(result, universe_path=universe_path)

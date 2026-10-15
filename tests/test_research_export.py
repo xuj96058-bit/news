@@ -86,6 +86,24 @@ def raw_fallback_report():
 
 
 class ResearchExportTests(unittest.TestCase):
+    def test_exports_distinguish_editorial_review_from_evidence_verification(self):
+        cases = [({'verdict': 'pass'}, [], '來源與主張核驗仍有限制'),
+                 ({'verdict': 'revise'}, [], '審稿結果仍要求修訂'),
+                 ({'verdict': 'insufficient'}, [], '可支持的論證仍不足'),
+                 ({'verdict': 'pass'}, [{'severity': 'error', 'message': 'Unsupported claim'}], '程序核驗仍有未解問題')]
+        for quality, findings, expected in cases:
+            report = edited_report()
+            report['metadata'] = {'review_status': 'needs_review', 'workflow_stage': 'review_complete',
+                'quality': quality, 'answer_status': 'limited', 'review_findings': findings, 'reviewed_version': 3}
+            for export in (export_markdown, export_html):
+                with self.subTest(quality=quality, findings=findings, export=export.__name__):
+                    result = export(report).decode('utf-8')
+                    self.assertIn('自動審稿已完成', result)
+                    self.assertIn(expected, result)
+                    self.assertIn('尚未經獨立事實核實', result)
+                    self.assertIn('毛利率展望仍需驗證', result)
+                    self.assertNotIn('模型評審通過', result)
+
     def test_gap_mode_label_survives_manual_title_and_body_replacement(self):
         report = edited_report()
         report['metadata'] = {'report_mode': 'gap', 'review_status': 'needs_review', 'quality_status': 'evidence_gap'}
@@ -111,8 +129,8 @@ class ResearchExportTests(unittest.TestCase):
     def test_exports_label_review_state_and_later_manual_edits_without_blocking(self):
         report = edited_report()
         report['metadata'] = {'review_status': 'review_failed'}
-        self.assertIn('審稿未完成，初稿保留', export_markdown(report).decode('utf-8'))
-        self.assertIn('審稿未完成，初稿保留', export_html(report).decode('utf-8'))
+        self.assertIn('自動審稿未完成，已保留最後成功保存的正文', export_markdown(report).decode('utf-8'))
+        self.assertIn('自動審稿未完成，已保留最後成功保存的正文', export_html(report).decode('utf-8'))
         report['metadata'] = {'review_status': 'reviewed', 'reviewed_version': 2}
         self.assertIn('人工修改後待核對（AI審稿基於v2）', export_markdown(report).decode('utf-8'))
         self.assertIn('人工修改後待核對（AI審稿基於v2）', export_html(report).decode('utf-8'))
@@ -231,7 +249,7 @@ class ResearchPDFTests(unittest.TestCase):
         self.assertIn('[unprovided Markdown](https://unprovided.example/markdown)', text)
         self.assertIn('https://unprovided.example/after-fence', text)
         self.assertIn('<script>alert("raw fallback")</script>', text)
-        self.assertIn('審稿未完成，初稿保留', text)
+        self.assertIn('自動審稿未完成，已保留最後成功保存的正文', text)
 
     def test_pdf_has_editable_body_chinese_sources_and_no_credential_metadata(self):
         reader = self.reader(edited_report())

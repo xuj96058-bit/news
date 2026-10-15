@@ -31,6 +31,26 @@ class ResearchStoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_preparation_failure_metadata_survives_reopen_and_snapshots_without_credentials(self):
+        created = self.store.create_report(**report_args(metadata={
+            "report_has_body": False, "workflow_stage": "research_prepared"}))
+        failed = self.store.save_review(created["id"], title="Research preparation", body="Preparation memo",
+            expected_version=1, metadata={"report_has_body": False, "workflow_stage": "preparation_failed",
+                "review_status": "preparation_failed", "failure_stage": "organizing", "failure_reason": "invalid_schema",
+                "preparation_warnings": [{"stage": "organizing", "reason": "invalid_schema", "api_key": "SECRET"}]})
+        with ResearchStore(self.path) as reopened:
+            saved = reopened.get_report(created["id"])
+            snapshot = reopened.get_research_snapshot(created["id"], 2)
+            initial = reopened.get_research_snapshot(created["id"], 1)
+        self.assertEqual(saved, failed)
+        self.assertEqual(snapshot["metadata"], failed["metadata"])
+        self.assertFalse(initial["metadata"]["report_has_body"])
+        self.assertEqual(saved["metadata"]["failure_stage"], "organizing")
+        self.assertEqual(saved["metadata"]["failure_reason"], "invalid_schema")
+        self.assertEqual(saved["metadata"]["preparation_warnings"], [{"stage": "organizing", "reason": "invalid_schema"}])
+        self.assertNotIn("reviewed_version", saved["metadata"])
+        self.assertNotIn(b"SECRET", self.path.read_bytes())
+
     def test_quality_brief_and_observation_provenance_survive_save_review_and_edit(self):
         brief = {"ready": False, "requirements": [{"id": "margin", "status": "candidate"}],
                  "observations": [{"source_id": "S1", "metric": "Borrowing", "value": "20",

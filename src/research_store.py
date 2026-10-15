@@ -21,8 +21,11 @@ METADATA_FIELDS = frozenset({
     "research_brief", "report_mode", "quality_status",
     "writing_style", "argument_plan", "quality", "retrieval_outcomes", "api_call_count",
     "daily_selection", "input_sources", "manually_verified",
-    "review_error_reason",
+    "review_error_reason", "review_history",
     "data_preparation",
+    "deep_research", "research_packet", "research_budget", "research_execution",
+    "answer_status", "claim_audit", "restoration",
+    "report_has_body", "failure_stage", "failure_reason", "preparation_warnings",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",
@@ -120,7 +123,9 @@ def _version(value: int) -> int:
 class ResearchStore:
     """A separate SQLite report library. All edits append a revision immediately.
 
-    The generated title/body and selected news snapshot are fixed at creation.
+    The generated title/body and original news snapshot are fixed at creation.
+    Each revision records its own sources and metadata; retrieval may add sources
+    to the current report without rewriting any earlier research snapshot.
     A user may edit the latest title/body freely without any AI approval or lock.
     Optimistic concurrency only prevents an older editor from losing newer edits.
     """
@@ -160,6 +165,17 @@ class ResearchStore:
                     created_at TEXT NOT NULL,
                     UNIQUE (report_id, version)
                 );
+                CREATE TABLE IF NOT EXISTS research_snapshots (
+                    report_id TEXT NOT NULL,
+                    version INTEGER NOT NULL CHECK (version >= 1),
+                    sources_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    snapshot_status TEXT NOT NULL CHECK (snapshot_status IN
+                        ('captured', 'legacy_current', 'legacy_sources_only')),
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY (report_id, version),
+                    FOREIGN KEY (report_id, version) REFERENCES research_revisions(report_id, version)
+                );
                 CREATE INDEX IF NOT EXISTS reports_updated ON research_reports(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS revisions_report ON research_revisions(report_id, version DESC);
             """)
@@ -184,16 +200,48 @@ class ResearchStore:
             "body": row["body"], "version": row["current_version"],
             "revision_id": row["revision_id"], "original_title": row["original_title"],
             "original_body": row["original_body"], "sources": json.loads(row["sources_json"]),
+            "original_sources": json.loads(row["original_sources_json"] or row["sources_json"]),
             "provider": row["provider"], "model": row["model"], "as_of": row["as_of"],
             "metadata": json.loads(row["metadata_json"]),
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
 
     _REPORT_QUERY = (
-        "SELECT r.*, v.id AS revision_id, v.title, v.body "
+        "SELECT r.*, v.id AS revision_id, v.title, v.body, s.sources_json AS original_sources_json "
         "FROM research_reports r JOIN research_revisions v "
         "ON v.report_id = r.id AND v.version = r.current_version "
+        "LEFT JOIN research_snapshots s ON s.report_id = r.id AND s.version = 1 "
     )
+
+    def _insert_snapshot(self, report_id, version, sources_json, metadata_json, now, *, status="captured"):
+        """Call only inside the revision transaction, after inserting that revision."""
+        self.connection.execute(
+            "INSERT INTO research_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (report_id, version, sources_json, metadata_json, status, now),
+        )
+
+    def _preserve_legacy_snapshots(self, report_id, version, row, now):
+        """Capture the old current state before mutation, without inventing history.
+
+        Before per-version snapshots existed, sources were immutable but metadata
+        was overwritten on review. Old sources remain recoverable; old metadata
+        is deliberately empty unless this is the version currently being saved.
+        The caller has already acquired the optimistic write lock.
+        """
+        sources_json = _json(_clean_json(json.loads(row["sources_json"])))
+        metadata_json = _json(_clean_json({key: value for key, value in json.loads(row["metadata_json"]).items()
+                                          if key in METADATA_FIELDS}))
+        for historical_version in sorted({1, version}):
+            exists = self.connection.execute(
+                "SELECT 1 FROM research_snapshots WHERE report_id = ? AND version = ?",
+                (report_id, historical_version),
+            ).fetchone()
+            if not exists:
+                current = historical_version == version
+                self._insert_snapshot(report_id, historical_version, sources_json,
+                                      metadata_json if current else "{}", now,
+                                      status="legacy_current" if current else "legacy_sources_only")
+        return sources_json, metadata_json
 
     def create_report(self, *, topic: str, title: str, body: str, sources: list[dict],
                       provider: str, model: str, as_of: str, metadata: dict | None = None) -> dict:
@@ -222,6 +270,7 @@ class ResearchStore:
                     "INSERT INTO research_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (revision_id, report_id, 1, title, body, "Initial generated report", None, now),
                 )
+                self._insert_snapshot(report_id, 1, sources_json, metadata_json, now)
         except sqlite3.Error:
             raise ResearchStoreError("Could not save the research report.") from None
         return self.get_report(report_id)
@@ -262,11 +311,17 @@ class ResearchStore:
                     if exists is None:
                         raise ResearchStoreError("Research report was not found.")
                     raise ResearchConflictError("This report has newer edits. Reload it before saving.")
+                row = self.connection.execute(
+                    "SELECT sources_json, metadata_json FROM research_reports WHERE id = ?", (report_id,),
+                ).fetchone()
+                sources_json, metadata_json = self._preserve_legacy_snapshots(report_id, expected_version, row, now)
                 self.connection.execute(
                     "INSERT INTO research_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(uuid4()), report_id, expected_version + 1, title, body, note,
                      restored_from_revision_id, now),
                 )
+                self._insert_snapshot(report_id, expected_version + 1,
+                                      sources_json, metadata_json, now)
         except sqlite3.Error:
             raise ResearchStoreError("Could not save the report revision.") from None
         return self.get_report(report_id)
@@ -278,19 +333,24 @@ class ResearchStore:
                                      expected_version=expected_version, note=note)
 
     def save_review(self, report_id: str, *, title: str, body: str, expected_version: int,
-                    metadata: dict, note: str = "AI independent review") -> dict:
+                    metadata: dict, note: str = "AI independent review", sources: list[dict] | None = None) -> dict:
         """Append review and its safe workflow facts atomically, preserving human edits.
 
         A reviewer works from a specific saved draft. If its author has edited that
         draft while review was running, no review text or metadata is written. The
         caller may save the review separately rather than replace the author's work.
+        Optional sources are the exact source snapshot used by this new revision;
+        omitting them preserves the current sources. Previous snapshots stay fixed.
         """
         report_id, title, body = (_text(report_id, "Report ID"), _text(title, "Title"), _text(body, "Body"))
         note, expected_version = _text(note, "Revision note"), _version(expected_version)
         if not isinstance(metadata, dict):
             raise ResearchStoreError("Report metadata must be a dictionary.")
+        if sources is not None and (not isinstance(sources, list) or not all(isinstance(source, dict) for source in sources)):
+            raise ResearchStoreError("Sources must be a list of news snapshots.")
         try:
             safe_metadata = _clean_json({key: value for key, value in metadata.items() if key in METADATA_FIELDS})
+            sources_json = _json(_clean_json(sources)) if sources is not None else None
             # Validate before taking a write lock. This also rejects NaN and cycles.
             _json(safe_metadata)
         except RecursionError:
@@ -308,25 +368,73 @@ class ResearchStore:
                         raise ResearchStoreError("Research report was not found.")
                     raise ResearchConflictError("This report has newer edits. Reload it before saving.")
                 row = self.connection.execute(
-                    "SELECT metadata_json FROM research_reports WHERE id = ?", (report_id,),
+                    "SELECT sources_json, metadata_json FROM research_reports WHERE id = ?", (report_id,),
                 ).fetchone()
+                self._preserve_legacy_snapshots(report_id, expected_version, row, now)
                 merged_metadata = json.loads(row["metadata_json"])
                 merged_metadata.update(safe_metadata)
                 if merged_metadata.get("review_status") in ("reviewed", "needs_review"):
                     merged_metadata["reviewed_version"] = expected_version + 1
                 else:
                     merged_metadata.pop("reviewed_version", None)
+                metadata_json = _json(_clean_json({key: value for key, value in merged_metadata.items()
+                                                   if key in METADATA_FIELDS}))
+                if sources_json is None:
+                    sources_json = _json(_clean_json(json.loads(row["sources_json"])))
                 self.connection.execute(
-                    "UPDATE research_reports SET metadata_json = ? WHERE id = ?",
-                    (_json(merged_metadata), report_id),
+                    "UPDATE research_reports SET metadata_json = ?, sources_json = ? WHERE id = ?",
+                    (metadata_json, sources_json, report_id),
                 )
                 self.connection.execute(
                     "INSERT INTO research_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(uuid4()), report_id, expected_version + 1, title, body, note, None, now),
                 )
+                self._insert_snapshot(report_id, expected_version + 1, sources_json, metadata_json, now)
         except sqlite3.Error:
             raise ResearchStoreError("Could not save the report review.") from None
         return self.get_report(report_id)
+
+    def get_research_snapshot(self, report_id: str, version: int) -> dict | None:
+        """Return a detached version-bound research record, or None if absent.
+
+        Legacy reports have no historical metadata. Their fallback is explicitly
+        labelled and never attaches the latest review to an older body. Before
+        enrichment, legacy sources were immutable; the original-source baseline
+        remains available after the first write by this schema.
+        """
+        report_id, version = _text(report_id, "Report ID"), _version(version)
+        try:
+            row = self.connection.execute(
+                "SELECT v.*, r.current_version, r.sources_json AS current_sources_json, "
+                "r.metadata_json AS current_metadata_json, s.sources_json, s.metadata_json, "
+                "s.snapshot_status, s.captured_at, original.sources_json AS original_sources_json "
+                "FROM research_revisions v JOIN research_reports r ON r.id = v.report_id "
+                "LEFT JOIN research_snapshots s ON s.report_id = v.report_id AND s.version = v.version "
+                "LEFT JOIN research_snapshots original ON original.report_id = v.report_id AND original.version = 1 "
+                "WHERE v.report_id = ? AND v.version = ?", (report_id, version),
+            ).fetchone()
+            if row is None:
+                return None
+            available = row["snapshot_status"] is not None
+            current = version == row["current_version"]
+            sources_json = row["sources_json"] if available else (
+                row["original_sources_json"] or row["current_sources_json"])
+            metadata_json = row["metadata_json"] if available else (row["current_metadata_json"] if current else "{}")
+            metadata = _clean_json({key: value for key, value in json.loads(metadata_json).items() if key in METADATA_FIELDS})
+            return {"report_id": report_id, "version": version, "revision_id": row["id"],
+                    "title": row["title"], "body": row["body"], "note": row["note"],
+                    "sources": _clean_json(json.loads(sources_json)), "metadata": metadata,
+                    "snapshot_status": row["snapshot_status"] if available else "legacy_fallback",
+                    "historical_metadata_available": row["snapshot_status"] != "legacy_sources_only" if available else current,
+                    "created_at": row["created_at"], "captured_at": row["captured_at"]}
+        except sqlite3.Error:
+            raise ResearchStoreError("Could not read the research snapshot.") from None
+
+    def list_research_snapshots(self, report_id: str) -> list[dict]:
+        """Return every saved revision's research snapshot, newest first."""
+        report_id = _text(report_id, "Report ID")
+        return [self.get_research_snapshot(report_id, row["version"])
+                for row in self.list_revisions(report_id)]
 
     def list_revisions(self, report_id: str) -> list[dict]:
         report_id = _text(report_id, "Report ID")
@@ -339,18 +447,65 @@ class ResearchStore:
             raise ResearchStoreError("Could not read the report revision history.") from None
 
     def restore_revision(self, report_id: str, revision_id: str, *, expected_version: int) -> dict:
-        """Copy a prior revision into a new version, preserving every intervening edit."""
+        """Restore a body with its own research snapshot in one locked revision.
+
+        A restoration is not a new review. Its review-version marker remains the
+        target snapshot's marker; absent historical research metadata must never
+        inherit a newer version's evidence or audit.
+        """
         report_id, revision_id = _text(report_id, "Report ID"), _text(revision_id, "Revision ID")
-        _version(expected_version)
+        expected_version = _version(expected_version)
+        now = _now()
         try:
-            revision = self.connection.execute(
-                "SELECT * FROM research_revisions WHERE id = ? AND report_id = ?", (revision_id, report_id),
-            ).fetchone()
+            with self.connection:
+                revision = self.connection.execute(
+                    "SELECT * FROM research_revisions WHERE id = ? AND report_id = ?", (revision_id, report_id),
+                ).fetchone()
+                if revision is None:
+                    raise ResearchStoreError("Report revision was not found.")
+                result = self.connection.execute(
+                    "UPDATE research_reports SET current_version = current_version + 1, updated_at = ? "
+                    "WHERE id = ? AND current_version = ?", (now, report_id, expected_version),
+                )
+                if not result.rowcount:
+                    raise ResearchConflictError("This report has newer edits. Reload it before restoring.")
+                current = self.connection.execute(
+                    "SELECT sources_json, metadata_json FROM research_reports WHERE id = ?", (report_id,),
+                ).fetchone()
+                self._preserve_legacy_snapshots(report_id, expected_version, current, now)
+                target = self.get_research_snapshot(report_id, revision["version"])
+                if target is None:
+                    raise ResearchStoreError("Report research snapshot was not found.")
+                historical_metadata = target["historical_metadata_available"]
+                if historical_metadata:
+                    metadata = target["metadata"]
+                    reviewed = metadata.get("reviewed_version")
+                    if metadata.get("review_status") in {"reviewed", "needs_review"} and (
+                            isinstance(reviewed, bool) or not isinstance(reviewed, int)
+                            or not 1 <= reviewed <= revision["version"]):
+                        metadata.pop("reviewed_version", None)
+                        metadata.update(review_status="needs_review", quality_status="needs_review",
+                            review_error="歷史審查未記錄有效的版本編號；還原不代表新版本已通過審查。")
+                else:
+                    metadata = {"workflow_stage": "restored_without_research_metadata",
+                        "review_status": "needs_review", "quality_status": "needs_review",
+                        "manually_verified": False,
+                        "review_error": "此舊版本未保存歷史研究資料與審查紀錄；未套用最新版本的審查，還原稿需重新核對。"}
+                metadata["restoration"] = {"from_version": revision["version"],
+                    "from_revision_id": revision_id, "snapshot_status": target["snapshot_status"],
+                    "historical_metadata_available": historical_metadata}
+                sources_json = _json(_clean_json(target["sources"]))
+                metadata_json = _json(_clean_json({key: value for key, value in metadata.items() if key in METADATA_FIELDS}))
+                self.connection.execute(
+                    "UPDATE research_reports SET sources_json = ?, metadata_json = ? WHERE id = ?",
+                    (sources_json, metadata_json, report_id),
+                )
+                self.connection.execute(
+                    "INSERT INTO research_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid4()), report_id, expected_version + 1, revision["title"], revision["body"],
+                     f"Restored version {revision['version']}", revision_id, now),
+                )
+                self._insert_snapshot(report_id, expected_version + 1, sources_json, metadata_json, now)
         except sqlite3.Error:
-            raise ResearchStoreError("Could not read the report revision.") from None
-        if revision is None:
-            raise ResearchStoreError("Report revision was not found.")
-        return self._append_revision(
-            report_id, title=revision["title"], body=revision["body"], expected_version=expected_version,
-            note=f"Restored version {revision['version']}", restored_from_revision_id=revision_id,
-        )
+            raise ResearchStoreError("Could not restore the report revision.") from None
+        return self.get_report(report_id)

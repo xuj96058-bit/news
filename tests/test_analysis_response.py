@@ -79,6 +79,11 @@ class AnalysisResponseTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assert_response_error(response(content, finish_reason="length"), "truncated")
 
+    def test_unsuccessful_finish_reason_rejects_even_valid_json(self):
+        for reason in ("error", "content_filter", "tool_calls", None):
+            with self.subTest(reason=reason):
+                self.assert_response_error(response(json.dumps(valid_payload()), finish_reason=reason), "invalid_shape")
+
     def test_authentication_and_type_errors_have_distinct_safe_messages(self):
         secret = "synthetic-sensitive-error-input"
         unauthorized = RuntimeError(secret + " raw-provider-body")
