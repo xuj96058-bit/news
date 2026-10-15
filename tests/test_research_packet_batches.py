@@ -138,6 +138,22 @@ class PacketBatchTests(unittest.TestCase):
         self.assertTrue(any(row["status"] == "invalid_response" for row in result["extraction_coverage"]))
         self.assertEqual(result["answer_status"], "limited")
 
+    def test_batch_local_warning_does_not_attach_to_an_earlier_evidence_id(self):
+        batches = 0
+        def request(system, payload, stage):
+            nonlocal batches
+            if stage == "designing": return design()
+            batches += 1
+            value = extract(payload)
+            if batches == 2:
+                value["items"][0]["quote"] = "Invented quotation not present in this source."
+            return value
+        result = self.prepare(sources(13), request)
+        warning = next(row for row in result["evidence"]["warnings"] if row["code"] == "unanchored_quote")
+        self.assertIsNone(warning["item_id"])
+        self.assertEqual(result["evidence"]["items"][0]["id"], "E1")
+        self.assertEqual(result["evidence"]["items"][0]["source_id"], "S1")
+
     def test_accumulation_limit_is_reported_without_dropping_source_text(self):
         def request(system, payload, stage):
             return design() if stage == "designing" else extract(payload, per_source=5)
