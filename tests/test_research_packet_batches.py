@@ -85,6 +85,36 @@ class PacketBatchTests(unittest.TestCase):
         self.assertEqual(latest["preparation_warnings"][0]["reason"], "evidence_extraction_incomplete")
         self.assertEqual(snapshots[0]["evidence"]["items"], [])
 
+    def test_appendix_distinguishes_interrupted_extraction_from_missing_material(self):
+        snapshots = []
+        def request(system, payload, stage):
+            if stage == "designing": return design()
+            raise RuntimeError("provider stopped")
+        with self.assertRaisesRegex(RuntimeError, "provider stopped"):
+            self.prepare(sources(30), request, on_checkpoint=snapshots.append)
+        packet = snapshots[-1]
+        self.assertEqual(packet["answer_status"], "unanswered")
+        self.assertEqual(packet["evidence"]["requirements"][0]["status"], "missing")
+        self.assertEqual(len(packet["sources"]), 30)
+        before = copy.deepcopy(packet)
+        appendix = render_packet_appendix(packet)
+        self.assertIn("證據整理未完成；回答範圍仍待核對", appendix)
+        self.assertIn("尚未完成證據核對", appendix)
+        self.assertNotIn("現有證據不足以回答", appendix)
+        self.assertNotIn("未取得", appendix)
+        self.assertEqual(packet, before)
+
+    def test_appendix_keeps_missing_evidence_labels_after_completed_extraction(self):
+        def request(system, payload, stage):
+            return design() if stage == "designing" else {"items": []}
+        packet = self.prepare(sources(1), request)
+        self.assertEqual(packet["preparation_warnings"], [])
+        appendix = render_packet_appendix(packet)
+        self.assertIn("現有證據不足以回答", appendix)
+        self.assertIn("未取得", appendix)
+        self.assertNotIn("證據整理未完成", appendix)
+        self.assertNotIn("尚未完成證據核對", appendix)
+
     def test_batch_budget_exposes_unprocessed_material_and_preserves_all_sources(self):
         calls = []
         def request(system, payload, stage):

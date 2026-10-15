@@ -9,7 +9,8 @@ from threading import Event
 
 from openai import OpenAI
 
-from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
+from .analysis_errors import (ModelResponseError, ProviderAPIError, ProviderConfigurationError,
+                             provider_failure_reason, provider_status_code)
 from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research import (MAX_PROMPT_CHARS, ResearchError, _date_label, _nonstream_content,
     _progress, _stream_content, _transport_timed_out, _validated_sources)
@@ -37,12 +38,12 @@ def _failure_reason(error):
         return "generation_timeout"
     if isinstance(error, (ResearchError, ModelResponseError)):
         return error.reason
-    status = getattr(error, "status_code", None)
+    status = provider_status_code(error)
     if type(status) is int and status in {400, 401, 402, 403, 404, 408, 429, 500, 502, 503, 504}:
         return f"provider_http_{status}"
     if isinstance(error, ProviderConfigurationError):
         return "provider_configuration"
-    return "provider_or_processing_error"
+    return provider_failure_reason(error)
 
 
 def research_budget(value=None):
@@ -291,7 +292,7 @@ def generate_deep_research_report(topic, sources, *, api_key, provider="deepseek
         except Exception as error:
             if error is persistence_error or cancelled.is_set() or time.monotonic() >= deadline:
                 raise
-            if isinstance(error, ProviderConfigurationError) or getattr(error, "status_code", None) in {401, 402, 403, 404}:
+            if isinstance(error, ProviderConfigurationError) or provider_status_code(error) in {401, 402, 403, 404}:
                 raise
             failure = record_failure(error)
             if packet is None:

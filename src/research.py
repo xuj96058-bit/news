@@ -14,6 +14,8 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from openai import APITimeoutError, OpenAI
@@ -484,6 +486,78 @@ def _transport_timed_out(error: Exception) -> bool:
     return False
 
 
+def _deadline_chunks(stream, deadline, register_cancel=None):
+    """Bound wall-clock waiting even when an SDK consumes SSE heartbeats internally."""
+    queue = Queue(maxsize=1)
+    stopped, cancelled = Event(), Event()
+    close = getattr(stream, "close", None)
+    closing = None
+    close_lock = Lock()
+
+    def close_stream():
+        nonlocal closing
+        with close_lock:
+            if callable(close) and closing is None:
+                def safely_close():
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                closing = Thread(target=safely_close, name="research-stream-close", daemon=True)
+                closing.start()
+
+    def cancel():
+        cancelled.set()
+        stopped.set()
+        close_stream()
+
+    def publish(kind, value):
+        while not stopped.is_set():
+            try:
+                queue.put((kind, value), timeout=0.05)
+                return True
+            except Full:
+                continue
+        return False
+
+    def consume():
+        try:
+            for chunk in stream:
+                if not publish("chunk", chunk):
+                    return
+        except BaseException as error:
+            publish("error", error)
+        finally:
+            publish("done", None)
+
+    try:
+        if register_cancel:
+            register_cancel(cancel)
+        if cancelled.is_set() or time.monotonic() >= deadline:
+            raise ResearchError("generation_timeout")
+        Thread(target=consume, name="research-stream-read", daemon=True).start()
+        while True:
+            remaining = deadline - time.monotonic()
+            if cancelled.is_set() or remaining <= 0:
+                raise ResearchError("generation_timeout")
+            try:
+                kind, value = queue.get(timeout=min(remaining, 0.1))
+            except Empty:
+                continue
+            if kind == "error":
+                raise value
+            if kind == "done":
+                return
+            yield value
+    finally:
+        stopped.set()
+        close_stream()
+        if closing is not None:
+            # Normal close completes immediately. A blocked transport close
+            # must not extend the deadline or block cancellation indefinitely.
+            closing.join(timeout=0.1)
+
+
 def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = None,
                     register_cancel: Callable[[Callable[[], None]], None] | None = None,
                     deadline: float | None = None, max_chunks: int = MAX_STREAM_CHUNKS) -> str:
@@ -495,11 +569,9 @@ def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = 
         raise ResearchError("source_budget")
     if deadline is None:
         deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+    chunks_with_deadline = _deadline_chunks(stream, deadline, register_cancel)
     try:
-        close = getattr(stream, "close", None)
-        if register_cancel is not None and callable(close):
-            register_cancel(close)
-        for chunk in stream:
+        for chunk in chunks_with_deadline:
             chunks += 1
             if time.monotonic() > deadline:
                 raise ResearchError("generation_timeout")
@@ -534,12 +606,7 @@ def _stream_content(stream, *, on_progress: Callable[[str, int], None] | None = 
             raise ResearchError("generation_timeout")
         return "".join(pieces)
     finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+        chunks_with_deadline.close()
 
 
 def _nonstream_content(response) -> str:

@@ -9,10 +9,12 @@ import copy
 import json
 import re
 import time
+from threading import Event
 
 from openai import OpenAI
 
-from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
+from .analysis_errors import (ModelResponseError, ProviderAPIError, ProviderConfigurationError,
+                             provider_failure_reason, provider_status_code)
 from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research import (MAX_PROMPT_CHARS, MAX_RESPONSE_CHARS, ResearchError,
     _date_label, _markdown_text, _number_values, _nonstream_content, _progress,
@@ -206,9 +208,14 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
         brief = build_research_brief(topic, checked,
             observations=[*brief["observations"], *table_rows], as_of=date)
     preparation_diagnostics = {"table_row_count": len(table_rows)}
+    cancelled = Event()
+    if register_cancel:
+        register_cancel(cancelled.set)
 
     def request(system, packet, stage):
         nonlocal calls
+        if cancelled.is_set():
+            raise ResearchError("generation_timeout")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ResearchError("generation_timeout")
@@ -278,7 +285,31 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
             PLAN_SYSTEM += DEEP_WRITING_RULES
             ESSAY_WRITER_SYSTEM += DEEP_WRITING_RULES
             ESSAY_REVIEWER_SYSTEM += DEEP_WRITING_RULES
-        plan = parse_plan(request(PLAN_SYSTEM, packet, "planning"), checked, topic)
+        try:
+            raw_plan = request(PLAN_SYSTEM, packet, "planning")
+        except Exception as error:
+            if (cancelled.is_set() or time.monotonic() >= deadline
+                    or isinstance(error, ProviderConfigurationError)
+                    or provider_status_code(error) in {401, 402, 403, 404}
+                    or isinstance(error, ResearchError) and error.reason != "generation_timeout"):
+                raise
+            # A transport failure in the optional planning call must not turn
+            # available sources into a report made only of preparation notes.
+            # This is an explicit procedural placeholder, never a model claim.
+            reason = error.reason if isinstance(error, (ResearchError, ModelResponseError)) else provider_failure_reason(error)
+            failure = {"stage": "planning", "reason": reason}
+            preparation_diagnostics["planning_failure"] = failure
+            if prepared_research is not None:
+                prepared_research.setdefault("preparation_warnings", []).append(failure)
+            plan = {"research_question": topic, "thesis": "論點規劃未完成；須直接依來源形成有界判斷。",
+                "answer_scope": "narrowed", "source_ids": [row["id"] for row in checked],
+                "arguments": [], "missing_evidence": ["論點規劃未完成，正文的選材及推理仍須審稿核對。"]}
+            packet["planning_fallback"] = failure
+            ESSAY_WRITER_SYSTEM += "\n論點規劃的服務調用失敗，argument_plan是程序佔位，不是已成立論點。請直接閱讀sources，排除無關材料，自行形成有證據的分論點並寫完整正文；不得將佔位文字抄成報告。資料不足只限制對應結論，仍保留有歸因的分析；所有來源均無實質相關內容時才保留有限判斷及缺口。"
+        else:
+            # Invalid model selections, including unknown IDs, stay fatal;
+            # fallback never grants a malformed plan permission to cite sources.
+            plan = parse_plan(raw_plan, checked, topic)
         if prepared_research is None:
             checked = [source for source in checked if source["id"] in plan["source_ids"]]
         else:
@@ -366,8 +397,9 @@ def generate_argumentative_report(topic, sources, *, api_key, provider="deepseek
             raise
         if _transport_timed_out(error):
             raise ResearchError("generation_timeout") from None
-        status = getattr(error, "status_code", None)
-        raise ProviderAPIError(status if isinstance(status, int) else None) from None
+        status = provider_status_code(error)
+        raise ProviderAPIError(status if isinstance(status, int) else None,
+            reason=provider_failure_reason(error)) from None
     finally:
         if owned:
             try:

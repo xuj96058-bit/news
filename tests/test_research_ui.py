@@ -193,6 +193,19 @@ class ResearchUiTests(ResearchUiHarness, unittest.TestCase):
         self.assertTrue(any('證據記錄容量' in message for message in messages))
         self.assertNotIn('SECRET', ''.join(messages))
 
+    def test_preparation_messages_explain_connection_and_stream_failures(self):
+        cases = {
+            'provider_connection_error': '與AI服務的連線未能完成',
+            'provider_protocol_error': 'AI服務回應傳輸異常，未能完整讀取',
+            'provider_stream_error': 'AI回覆串流中斷，內容未完整接收',
+        }
+        for reason, label in cases.items():
+            with self.subTest(reason=reason):
+                messages = ui._preparation_messages({
+                    'failure_stage': 'planning', 'failure_reason': reason,
+                    'preparation_warnings': [{'stage': 'planning', 'reason': reason, 'message': 'SECRET diagnostic'}]})
+                self.assertEqual(messages, [f'論點規劃：{label}。'])
+
     def test_deep_research_is_enabled_by_default_with_bounded_budget(self):
         app = self.app(report_mode='argumentative', deep_research=None)
         self.assertTrue(app.checkbox(key='research_deep').value)

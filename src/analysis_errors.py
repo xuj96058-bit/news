@@ -26,9 +26,49 @@ class ProviderConfigurationError(ValueError):
 
 
 class ProviderAPIError(RuntimeError):
-    def __init__(self, status_code=None):
+    def __init__(self, status_code=None, *, reason=None):
         self.status_code = status_code
+        self.reason = reason if reason in {
+            "provider_connection_error", "provider_protocol_error", "provider_stream_error",
+            "provider_or_processing_error", "generation_timeout",
+        } else "provider_or_processing_error"
         super().__init__("Provider request failed")
+
+
+def provider_status_code(error):
+    """OpenRouter can report a provider status in an HTTP-200 SSE error."""
+    status = getattr(error, "status_code", None)
+    if type(status) is int and 400 <= status <= 599:
+        return status
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        detail = body.get("error", body)
+        if isinstance(detail, dict):
+            code = detail.get("code")
+            if type(code) is int and 400 <= code <= 599:
+                return code
+            if isinstance(code, str) and code in {str(number) for number in range(400, 600)}:
+                return int(code)
+    return None
+
+
+def provider_failure_reason(error):
+    """Categorize transport failures without persisting provider bodies or messages."""
+    if isinstance(error, ProviderAPIError):
+        return error.reason
+    status = provider_status_code(error)
+    if status is not None:
+        return f"provider_http_{status}"
+    names = {kind.__name__ for kind in type(error).__mro__}
+    if names.intersection({"APITimeoutError", "TimeoutError", "ReadTimeout", "ConnectTimeout", "TimeoutException"}):
+        return "generation_timeout"
+    if names.intersection({"APIConnectionError", "ConnectError", "ConnectionError", "ReadError", "WriteError"}):
+        return "provider_connection_error"
+    if names.intersection({"RemoteProtocolError", "LocalProtocolError", "ProtocolError"}):
+        return "provider_protocol_error"
+    if "APIError" in names:
+        return "provider_stream_error"
+    return "provider_or_processing_error"
 
 
 def analysis_error_message(error):
@@ -49,7 +89,7 @@ def analysis_error_message(error):
         404: "找不到設定的 API 端點或模型，請確認模型設定。",
         429: "API 請求過於頻繁或受到用量限制，請稍後重試。",
     }
-    status = getattr(error, "status_code", None)
+    status = provider_status_code(error)
     if isinstance(status, int) and status in status_messages:
         return status_messages[status]
     if isinstance(error, TypeError):

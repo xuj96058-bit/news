@@ -385,13 +385,19 @@ def packet_findings(packet):
 def render_packet_appendix(packet):
     from .research import _markdown_text
     text = _markdown_text
+    extraction_incomplete = any(row.get("reason") == "evidence_extraction_incomplete"
+        for row in packet.get("preparation_warnings", []))
     labels = {"full": "研究設計所需證據已具備可追溯紀錄", "limited": "部分問題可回答", "unanswered": "現有證據不足以回答"}
+    if extraction_incomplete:
+        labels["unanswered"] = "證據整理未完成；回答範圍仍待核對"
     lines = ["", "## 研究設計與證據紀錄", "", labels.get(packet["answer_status"], "仍需核對") + "；錨定檢查不等於獨立事實核實。", ""]
     for item in packet["design"]["questions"]:
         lines.append("- " + text(item["question"]))
     lines.extend(["", "| 證據需求 | 狀態 |", "| --- | --- |"])
     for item in packet["evidence"]["requirements"]:
         status = {"fulfilled": "已錨定", "missing": "未取得", "conflicting": "有衝突", "partial": "部分具備"}.get(item.get("status"), "待核對")
+        if extraction_incomplete and item.get("status") == "missing":
+            status = "尚未完成證據核對"
         lines.append(f"| {text(item.get('description', item.get('label', item['id']))).replace('|', '／')} | {status} |")
     if packet["calculations"]:
         lines.extend(["", "## 可重算分析", ""])

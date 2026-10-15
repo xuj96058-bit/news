@@ -168,9 +168,25 @@ class DeepResearchTests(unittest.TestCase):
         self.assertFalse(result["metadata"]["report_has_body"])
         self.assertEqual(result["metadata"]["workflow_stage"], "preparation_failed")
         self.assertEqual(result["metadata"]["review_status"], "preparation_failed")
-        self.assertEqual(result["metadata"]["failure_stage"], "planning")
+        self.assertEqual(result["metadata"]["failure_stage"], "writing")
         self.assertNotIn("synthetic-secret-token", json.dumps(result))
-        self.assertEqual(client.chat.completions.create.call_count, 3)
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+
+    def test_extraction_and_planning_transport_failures_still_reach_body(self):
+        client = self.client()
+        original = client.chat.completions.create.side_effect
+        def two_failures(**kwargs):
+            result = original(**kwargs)
+            if len(self.payloads) in {2, 3}:
+                raise RuntimeError("synthetic-secret-connection")
+            return result
+        client.chat.completions.create.side_effect = two_failures
+        result = self.generate(client)
+        self.assertTrue(result["metadata"]["report_has_body"])
+        self.assertTrue(result["metadata"]["structured_draft"]["arguments"])
+        self.assertTrue(any(row.get("stage") == "planning" for row in result["metadata"]["preparation_warnings"]))
+        self.assertEqual(result["metadata"]["review_status"], "needs_review")
+        self.assertNotIn("synthetic-secret-connection", json.dumps(result))
 
     def test_preparation_call_budget_reserves_plan_writer_and_reviewer(self):
         packet = prepare_research_packet(TOPIC, sources(), as_of=AS_OF,

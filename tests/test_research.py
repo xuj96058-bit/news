@@ -377,7 +377,11 @@ class ResearchReportTests(unittest.TestCase):
 
         class CheckedStream(FakeStream):
             def __iter__(self):
-                test.assertEqual(callbacks, [client.close, self.close])
+                test.assertEqual(len(callbacks), 2)
+                test.assertEqual(callbacks[0], client.close)
+                test.assertTrue(callable(callbacks[1]))
+                test.assertFalse(self.closed)
+                client.close.assert_not_called()
                 yield from super().__iter__()
 
         stream = CheckedStream(json.dumps(payload()))
@@ -389,7 +393,9 @@ class ResearchReportTests(unittest.TestCase):
         client.chat.completions.create.side_effect = create
         with patch("src.research.OpenAI", return_value=client):
             result = self.generate(None, register_cancel=callbacks.append)
-        self.assertEqual(callbacks, [client.close, stream.close])
+        self.assertEqual(len(callbacks), 2)
+        self.assertEqual(callbacks[0], client.close)
+        self.assertTrue(callable(callbacks[1]))
         self.assertEqual(result["title"], payload()["title"])
         self.assertTrue(stream.closed)
         client.close.assert_called_once()
@@ -398,7 +404,25 @@ class ResearchReportTests(unittest.TestCase):
         client, stream = fake_client()
         callbacks = []
         self.generate(client, register_cancel=callbacks.append)
-        self.assertEqual(callbacks, [stream.close])
+        self.assertEqual(len(callbacks), 1)
+        self.assertTrue(callable(callbacks[0]))
+        callbacks[0]()  # Cancellation remains harmless after normal completion.
+        self.assertTrue(stream.closed)
+        client.close.assert_not_called()
+
+    def test_stream_cancellation_hook_closes_before_read_without_client_ownership(self):
+        read = []
+        class CheckedStream(FakeStream):
+            def __iter__(self):
+                read.append(True)
+                yield from super().__iter__()
+        stream = CheckedStream(json.dumps(payload()))
+        client = MagicMock()
+        client.chat.completions.create.return_value = stream
+        with self.assertRaises(ResearchError) as caught:
+            self.generate(client, register_cancel=lambda cancel: cancel())
+        self.assertEqual(caught.exception.reason, "generation_timeout")
+        self.assertEqual(read, [])
         self.assertTrue(stream.closed)
         client.close.assert_not_called()
 
@@ -542,7 +566,9 @@ class ResearchReportTests(unittest.TestCase):
         self.assertEqual(requests[0]["model"], requests[1]["model"])
         self.assertEqual(requests[1]["response_format"], {"type": "json_object"})
         self.assertIn("不得猜測未知來源編號", requests[1]["messages"][0]["content"])
-        self.assertEqual(callbacks, [first.close, second.close])
+        self.assertEqual(len(callbacks), 2)
+        self.assertTrue(all(callable(callback) for callback in callbacks))
+        self.assertIsNot(callbacks[0], callbacks[1])
         self.assertTrue(first.closed and second.closed)
         client.close.assert_not_called()
         repair_start = [stage for stage, _ in events].index("repairing")
@@ -620,7 +646,11 @@ class ResearchReportTests(unittest.TestCase):
         with patch("src.research.OpenAI", return_value=client):
             result = self.generate(None, register_cancel=callbacks.append)
         self.assertTrue(result["metadata"]["citation_repaired"])
-        self.assertEqual(callbacks, [client.close, first.close, second.close])
+        self.assertEqual(len(callbacks), 3)
+        self.assertEqual(callbacks[0], client.close)
+        self.assertTrue(all(callable(callback) for callback in callbacks[1:]))
+        self.assertIsNot(callbacks[1], callbacks[2])
+        self.assertTrue(first.closed and second.closed)
         client.close.assert_called_once()
 
     def test_repair_uses_remaining_shared_deadline_instead_of_resetting_it(self):

@@ -59,6 +59,9 @@ def _preparation_messages(metadata):
               "writing": "正文寫作", "auditing": "逐項核驗", "reviewing": "獨立審稿", "revising": "正文修訂"}
     reasons = {"writing_budget_reserved": "已保留正文寫作所需預算，準備步驟提前停止",
                "generation_timeout": "已達等待時間上限", "provider_configuration": "AI服務設定未能使用",
+               "provider_connection_error": "與AI服務的連線未能完成",
+               "provider_protocol_error": "AI服務回應傳輸異常，未能完整讀取",
+               "provider_stream_error": "AI回覆串流中斷，內容未完整接收",
                "provider_or_processing_error": "AI服務或資料處理未完成", "invalid_json": "AI回覆不是有效JSON",
                "invalid_schema": "AI回覆不符合所需資料格式", "invalid_shape": "AI回覆不符合所需資料格式",
                "truncated": "AI回覆遭截斷", "empty_content": "AI未回傳內容",

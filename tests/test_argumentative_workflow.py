@@ -94,6 +94,39 @@ class ArgumentativeWorkflowTests(unittest.TestCase):
         with self.assertRaises(ModelResponseError): self.generate(c)
         self.assertEqual(c.chat.completions.create.call_count,1)
 
+    def test_planning_transport_failure_still_writes_and_reviews_sources(self):
+        c = self.client(RuntimeError("synthetic-provider-secret"), essay(), review())
+        result = self.generate(c)
+        self.assertEqual(c.chat.completions.create.call_count, 3)
+        self.assertTrue(result["metadata"]["structured_draft"]["arguments"])
+        self.assertEqual(result["metadata"]["argument_plan"]["answer_scope"], "narrowed")
+        self.assertEqual(result["metadata"]["data_preparation"]["planning_failure"],
+            {"stage": "planning", "reason": "provider_or_processing_error"})
+        writer_payload = json.loads(c.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual(writer_payload["planning_fallback"]["stage"], "planning")
+        self.assertNotIn("synthetic-provider-secret", json.dumps(result))
+
+    def test_authentication_failure_does_not_try_writer(self):
+        from src.analysis_errors import ProviderAPIError
+        for status in (401, 402, 403, 404):
+            with self.subTest(status=status):
+                c = self.client(ProviderAPIError(status), essay(), review())
+                with self.assertRaises(ProviderAPIError):
+                    self.generate(c)
+                self.assertEqual(c.chat.completions.create.call_count, 1)
+
+    def test_cancelled_planning_does_not_fallback_to_writer(self):
+        callbacks = []
+        c = self.client()
+        def cancel(**_kwargs):
+            callbacks[0]()
+            raise RuntimeError("closed transport")
+        c.chat.completions.create.side_effect = cancel
+        from src.analysis_errors import ProviderAPIError
+        with self.assertRaises(ProviderAPIError):
+            self.generate(c, register_cancel=callbacks.append)
+        self.assertEqual(c.chat.completions.create.call_count, 1)
+
     def test_numeric_headings_and_title_cannot_bypass_checks(self):
         for location in ("title","heading"):
             d=essay()
