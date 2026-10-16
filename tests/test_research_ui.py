@@ -26,6 +26,10 @@ class ResearchUiHarness:
         self.addCleanup(self.temp.cleanup)
         self.db = Path(self.temp.name) / 'reports.db'
         self.patch('dotenv.load_dotenv')
+        self.patch('src.workbench_ui.render_reader_tab')
+        self.patch('src.workbench_ui.render_source_operations')
+        self.patch('src.chartbook_ui.render_chartbook_tab')
+        self.patch('src.report_gallery_ui.render_report_gallery')
         self.patch('src.research_ui.ResearchStore', side_effect=lambda: ResearchStore(self.db))
         self.start_patch(patch.dict(os.environ, {'LLM_PROVIDER': 'deepseek', 'OPENAI_API_KEY': '',
                          'DEEPSEEK_API_KEY': '', 'INVESTAT_MCP_TOKEN': '', 'OPENAI_BASE_URL': ''}))
@@ -40,6 +44,8 @@ class ResearchUiHarness:
             'published_at': datetime.now(timezone.utc).isoformat(), 'source_id': 'test',
             'source_name': 'Test RSS', 'source_kind': 'media', 'sources': [
                 {'source_id': 'test', 'source_name': 'Test RSS', 'source_kind': 'media'}]}]
+        inbox.search_articles.side_effect = lambda **kwargs: {
+            'items': inbox.export_articles.return_value, 'total': len(inbox.export_articles.return_value)}
         factory = MagicMock()
         factory.return_value.__enter__.return_value = inbox
         self.patch('src.news_store.NewsStore', new=factory)
@@ -628,6 +634,39 @@ class ResearchPreparationUiTests(ResearchUiHarness, unittest.TestCase):
         self.assertTrue(any('Synthetic rejected row' in item.value for item in app.warning))
         self.assertFalse(app.button(key='research_generate').disabled)
         extractor.assert_called_once()
+        self.generator.assert_not_called()
+
+
+class ResearchHistorySelectionTests(ResearchUiHarness, unittest.TestCase):
+    def test_pages_preserve_selected_articles_and_include_old_matches(self):
+        original = self.inbox.export_articles.return_value[0]
+        self.inbox.export_articles.return_value = [
+            {**original, 'id': i, 'title': f'AI earnings {i}',
+             'url': f'https://example.org/articles/{i}'} for i in range(1, 602)]
+        app = self.app()
+        app.text_input(key='research_topic').input('AI earnings').run()
+        self.assertEqual(app.number_input(key='research_candidate_page').max, 4)
+        app.multiselect(key='research_article_ids').set_value(['1']).run()
+        app.number_input(key='research_candidate_page').set_value(4).run()
+        app.multiselect(key='research_article_ids').set_value(['1', '601']).run()
+        app.number_input(key='research_candidate_page').set_value(1).run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, ['1', '601'])
+        self.assertEqual(len(app.exception), 0)
+        self.generator.assert_not_called()
+
+    def test_reader_handoff_keeps_explicit_historical_selection(self):
+        original = self.inbox.export_articles.return_value[0]
+        self.inbox.export_articles.return_value.append({
+            **original, 'id': 2, 'title': 'Historical AI outlook',
+            'published_at': '2024-01-01T00:00:00+00:00', 'url': 'https://example.org/old'})
+        app = self.app()
+        app.session_state['research_pending_article_ids'] = ['2']
+        app.run()
+        self.assertIn('2', app.multiselect(key='research_article_ids').value)
+        self.assertTrue(any('目前篩選範圍外' in item.value for item in app.info))
+        app.button(key='research_clear_articles').click().run()
+        self.assertEqual(app.multiselect(key='research_article_ids').value, [])
+        self.assertEqual(len(app.exception), 0)
         self.generator.assert_not_called()
 
 

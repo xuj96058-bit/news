@@ -21,6 +21,9 @@ from src.research_ui import render_research_tab
 from src.research_ui import _generation_progress
 from src.research_progress import run_generation
 from src.research_store import ResearchStore
+from src.workbench_ui import render_reader_tab, render_investat_filters, render_source_operations, render_article
+from src.chartbook_ui import render_chartbook_tab
+from src.report_gallery_ui import render_report_gallery, show_report
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -31,6 +34,11 @@ def clear_api_key():
 
 def clear_investat_token():
     st.session_state["investat_token"] = ""
+    st.session_state.pop("investat_filter_labels", None)
+
+
+def clear_investat_filters():
+    st.session_state.pop("investat_filter_labels", None)
 
 
 def change_provider():
@@ -89,6 +97,7 @@ with st.sidebar:
     st.subheader("Investat 設定")
     entered_investat_token = st.text_input(
         "Investat MCP token", type="password", key="investat_token",
+        on_change=clear_investat_filters,
         placeholder="貼上 Investat 帳號內產生的 MCP token",
         help="只保留於目前工作階段，僅送往 Investat；不寫入檔案。輸入後按 Enter 套用。",
     ).strip()
@@ -118,7 +127,13 @@ def analyze_for_session(text):
 st.title("金融新聞影響分析")
 st.caption("以新聞為論據，說清楚論點、影響途徑、反證和下一個驗證點")
 
-tab1, tab2, tab3, tab4 = st.tabs(["新聞查詢", "日報", "新聞來源", "研究報告"])
+pending_report_display = st.session_state.pop("pending_report_display", None)
+if pending_report_display:
+    show_report(pending_report_display)
+
+tab1, tab2, tab3, reader_tab, chartbook_tab, tab4, report_gallery_tab = st.tabs(
+    ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"],
+    key="main_navigation", on_change="rerun")
 
 with tab1:
     news_input = st.text_area("貼上新聞內容", height=200, placeholder="輸入中文或英文新聞...")
@@ -153,6 +168,7 @@ with tab2:
                     title=draft["title"], body=draft["body"], sources=draft.get("sources", []),
                     provider=provider_id, model=selected_model, as_of=day, metadata=draft["metadata"])
             st.session_state["daily_essay"] = draft
+            st.session_state["daily_essay_report_id"] = initial_daily["id"]
             return initial_daily["id"]
 
         try:
@@ -169,6 +185,16 @@ with tab2:
         except Exception as exc:
             bar.empty()
             st.error(analysis_error_message(exc))
+    daily_report_id = st.session_state.get("daily_essay_report_id")
+    if daily_report_id:
+        with ResearchStore() as store:
+            saved_daily = store.get_report(daily_report_id)
+        if saved_daily is None:
+            st.session_state.pop("daily_essay", None)
+            st.session_state.pop("daily_essay_report_id", None)
+        else:
+            # Always show the saved version after edits in the report editor.
+            st.session_state["daily_essay"] = saved_daily
     daily = st.session_state.get("daily_essay")
     if daily:
         st.markdown(daily["body"])
@@ -194,12 +220,13 @@ with tab3:
         st.info("請在左側填入 Investat MCP token；其餘來源仍可抓取。")
     investat_limit = st.number_input("每次抓取 Investat 文章數", min_value=1, max_value=50,
                                      value=20, step=1, disabled="investat" not in selected)
+    investat_filters = render_investat_filters(effective_investat_token, "investat" in selected)
     if st.button("抓取最新新聞", disabled=not selected):
         with st.spinner("抓取新聞中…"), NewsStore() as inbox:
             outcome = collect_sources([s for s in available if s.id in selected], inbox)
             if "investat" in selected:
                 investat_outcome = collect_investat(inbox, token=effective_investat_token,
-                                                    limit=int(investat_limit))
+                                                    limit=int(investat_limit), **investat_filters)
                 for counter in ("added", "updated", "duplicates"):
                     outcome[counter] += investat_outcome[counter]
                 outcome["sources"].extend(investat_outcome["sources"])
@@ -233,22 +260,23 @@ with tab3:
                     st.warning(item.get("error") or "；".join(item.get("warnings", [])))
     with NewsStore() as inbox:
         counts = inbox.stats()
-        articles = inbox.export_articles()[:50]
-    st.caption(f"新聞庫 {counts['total']} 則，已分析 {counts['analyzed']} 則。顯示最新 50 則。")
-    scope_labels = {"summary": "摘要", "provided_text": "來源提供的內文（未確認是否全文）",
-                    "partial_text": "部分內文", "title_only": "僅標題", "filing_notice": "申報通知"}
+        articles = inbox.search_articles(limit=10)["items"]
+    render_source_operations(load_sources(), investat_token=effective_investat_token)
+    st.caption(f"新聞庫 {counts['total']} 則，已分析 {counts['analyzed']} 則。以下預覽最新 10 則；完整搜尋與分頁請前往「研究閱讀」。")
     for item in articles:
-        with st.expander(item["title"]):
-            st.write("來源：" + "、".join(dict.fromkeys(s["source_name"] for s in item["sources"])))
-            st.caption(f"{item.get('published_at') or '未提供發布時間'} · {scope_labels.get(item['content_scope'], item['content_scope'])}")
-            st.write(item.get("content") or item.get("summary") or "來源只提供標題，請閱讀原文。")
-            if item.get("url"):
-                st.link_button("閱讀原文", item["url"])
-            elif item.get("source_id") == "investat":
-                st.caption(f"Investat 文章 ID：{item['external_id']}（接口未提供文章連結）")
-                st.link_button("前往 Investat", "https://investat.ai/")
+        render_article(item)
+
+with reader_tab:
+    render_reader_tab(provider=provider_id, model=selected_model, api_key=effective_api_key,
+                      analysis_available=analysis_available)
+
+with chartbook_tab:
+    render_chartbook_tab()
 
 with tab4:
     render_research_tab(provider=provider_id, model=selected_model, api_key=effective_api_key,
                         investat_token=effective_investat_token, analysis_available=analysis_available)
+
+with report_gallery_tab:
+    render_report_gallery()
 

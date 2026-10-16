@@ -259,6 +259,12 @@ def _organize_data(*, topic, sources, as_of, brief, provider, model, api_key, an
 
 def _generate(*, provider, model, api_key, investat_token, analysis_available):
     today = datetime.now(timezone(timedelta(hours=8))).date()
+    pending_articles = st.session_state.pop("research_pending_article_ids", None)
+    if pending_articles is not None:
+        selected = st.session_state.get("research_article_ids", [])
+        st.session_state["research_article_ids"] = list(dict.fromkeys([*selected, *map(str, pending_articles)]))[:30]
+        imported = st.session_state.get("research_imported_article_ids", [])
+        st.session_state["research_imported_article_ids"] = list(dict.fromkeys([*imported, *map(str, pending_articles)]))
     pending = st.session_state.pop("research_pending_evidence_keys", None)
     if pending is not None:
         st.session_state["research_use_evidence"] = True
@@ -280,12 +286,20 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("Investat需要左側的獨立MCP token；已登入瀏覽器不會自動授權本機應用。")
     limit = st.number_input("本次抓取Investat篇數", min_value=1, max_value=50, value=50, step=1,
                             key="research_investat_limit", disabled="investat" not in selected_sources)
+    investat_filters = {}
+    if "investat" in selected_sources:
+        with st.expander("Investat 抓取條件（可留空）"):
+            for field, label in (("search", "Investat 關鍵字"), ("ticker", "Investat 股票代碼"),
+                                 ("institution", "Investat 機構")):
+                value = st.text_input(label, key=f"research_investat_{field}").strip()
+                if value:
+                    investat_filters[field] = value
     if st.button("抓取所選新聞來源", key="research_collect", disabled=not selected_sources):
         with st.spinner("抓取RSS與Investat新聞…"), NewsStore() as inbox:
             outcome = collect_sources([source for source in available if source.id in selected_sources], inbox)
             statuses = outcome["sources"]
             if "investat" in selected_sources:
-                result = collect_investat(inbox, token=investat_token, limit=int(limit))
+                result = collect_investat(inbox, token=investat_token, limit=int(limit), **investat_filters)
                 statuses += result["sources"]
             st.session_state["research_collection_status"] = statuses
         st.session_state.pop("research_article_ids", None)
@@ -294,7 +308,8 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
             st.warning(f"{status['name']}：{status.get('error') or '部分內容只有摘要或片段。'}")
     st.caption("只使用你配置中的新聞來源，不會自動新增RSS。抓取不調用AI；新聞庫與報告庫均保存在本機data目錄。")
     with NewsStore() as inbox:
-        articles = inbox.export_articles()
+        all_articles = inbox.export_articles()
+    articles = all_articles
     articles = [item for item in articles if _origins(item) & set(selected_sources)]
     include_unknown = st.checkbox("包括發布日期未知的新聞", value=False, key="research_unknown_dates")
     try:
@@ -310,13 +325,32 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                            key="research_show_all_articles")
     suggestions = [item for item in ranked if item["score"] > 0]
     visible = ranked if show_all else suggestions
-    usable = [item["article"] for item in visible[:200]]
+    pages = max(1, (len(visible) + 199) // 200)
+    if st.session_state.get("research_candidate_page", 1) > pages:
+        st.session_state["research_candidate_page"] = pages
+    page = int(st.number_input("候選頁碼（每頁200篇）", min_value=1, max_value=pages, value=1,
+                               step=1, key="research_candidate_page"))
+    usable = [item["article"] for item in visible[(page - 1) * 200:page * 200]]
     suggested_ids = [str(item["article"]["id"]) for item in suggestions[:8]]
     st.caption("候選按研究主題與補充關鍵字排序；推薦分數代表內容相關性，不代表證據已足夠。")
     for recommendation in suggestions[:8]:
         reason = "；".join(recommendation.get("reasons", []))
         st.caption(f"推薦｜{recommendation['article']['title']}｜{reason}")
     by_id = {str(item["id"]): item for item in usable}
+    all_candidates = {str(item["article"]["id"]): item["article"] for item in visible}
+    previous = st.session_state.get("research_article_ids", suggested_ids)
+    imported = set(st.session_state.get("research_imported_article_ids", [])) & set(previous)
+    imported_articles = {str(item["id"]): item for item in all_articles if str(item["id"]) in imported
+                         and item.get("content_scope") not in {"title_only", "filing_notice"}
+                         and (item.get("content") or item.get("summary"))}
+    outside = set(imported_articles) - set(all_candidates)
+    all_candidates.update(imported_articles)
+    st.session_state["research_imported_article_ids"] = list(imported_articles)
+    for key in previous:
+        if key in all_candidates:
+            by_id.setdefault(key, all_candidates[key])
+    if outside:
+        st.info(f"另外保留從研究閱讀送來的{len(outside)}篇選材，位於目前篩選範圍外；可在選材清單取消。")
     if "research_article_ids" in st.session_state:
         previous = st.session_state["research_article_ids"]
         valid = [key for key in previous if key in by_id]
@@ -331,7 +365,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                                default=None if "research_article_ids" in st.session_state else suggested_ids,
                                format_func=lambda key: f"{by_id[key].get('published_at') or '日期未知'}｜{by_id[key]['title']}",
                                key="research_article_ids", max_selections=30)
-    st.caption(f"找到{len(usable)}篇可用候選；主題匹配共{len(suggestions)}篇。僅標題及SEC申報通知不作研究正文。沒有結果時可調整日期或關鍵字，或開啟顯示全部。")
+    st.caption(f"找到{len(visible)}篇可用候選，第{page}/{pages}頁顯示{len(usable)}篇；主題匹配共{len(suggestions)}篇。換頁保留已選材料。僅標題及申報通知不作研究正文。沒有結果時可調整日期或關鍵字，或開啟顯示全部。")
 
     st.markdown("**2．檢查必要證據是否齊全**")
     topic_defaults = build_research_brief(topic, [], as_of=today.isoformat())["recommended_catalog_keys"]
@@ -496,6 +530,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 _flash("初稿已保存；獨立審稿未完成，可直接修改與匯出。")
             else:
                 _flash("初稿與審稿版本均已保存；請在「報告庫與編輯」核對、修改和匯出。")
+            st.session_state["pending_report_display"] = saved["id"]
             st.rerun()
         except Exception as error:
             bar.empty()
@@ -536,6 +571,7 @@ def _import_report():
                                                 metadata={"report_scope": "imported"})
                 st.session_state["research_active_report"] = saved["id"]
                 _flash("已匯入為可編輯報告，原始內容會保留。")
+                st.session_state["pending_report_display"] = saved["id"]
                 st.rerun()
             except Exception:
                 st.error("無法匯入；請使用有效UTF-8 Markdown，或含title、body及可選sources的JSON報告。")
@@ -545,6 +581,13 @@ def _library():
     _import_report()
     with ResearchStore() as store:
         reports = store.list_reports()
+        # The gallery searches the complete library. An explicitly opened
+        # historical report must remain editable beyond the latest 100 entries.
+        active = st.session_state.get("research_active_report")
+        if active and not any(report["id"] == active for report in reports):
+            historical = store.get_report(active)
+            if historical is not None:
+                reports.insert(0, historical)
     if not reports:
         st.info("尚未保存研究報告；可先生成草稿或匯入已有報告。")
         return
@@ -673,7 +716,8 @@ def render_research_tab(*, provider, model, api_key, investat_token, analysis_av
     message = st.session_state.pop("research_flash", None)
     if message:
         st.success(message)
-    generate, library = st.tabs(["生成新報告", "報告庫與編輯"])
+    generate, library = st.tabs(["生成新報告", "報告庫與編輯"],
+                               key="research_report_view", on_change="rerun")
     with generate:
         _generate(provider=provider, model=model, api_key=api_key, investat_token=investat_token,
                   analysis_available=analysis_available)

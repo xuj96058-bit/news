@@ -138,7 +138,7 @@ class FeedTests(unittest.TestCase):
 
     def test_catalog_includes_regulators_and_state_street_and_is_cwd_independent(self):
         sources = load_sources()
-        self.assertEqual(len(sources), 26)
+        self.assertEqual(len(sources), 31)
         self.assertTrue(all(source.enabled for source in sources))
         self.assertEqual(next(source for source in sources if source.id == "hkma").format, "hkma_json")
         by_id = {source.id: source for source in sources}

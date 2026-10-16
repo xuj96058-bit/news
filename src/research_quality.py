@@ -7,7 +7,7 @@ period and population. These checks establish traceability, not truthfulness.
 from __future__ import annotations
 
 import calendar
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 import re
@@ -153,7 +153,7 @@ def rank_articles(articles, topic, keywords="", *, include_unrelated=False, dedu
     if any(key in concepts for key in ("crowding", "leverage")):
         concepts = list(dict.fromkeys(concepts + ["positioning", "margin", "borrowing", "concentration"]))
     ranked = []
-    for index, article in enumerate(articles[:MAX_ITEMS]):
+    for index, article in enumerate(articles):
         if not isinstance(article, dict):
             continue
         fields = [(_normal(article.get(field)), weight) for field, weight in (("title", 4), ("summary", 2), ("content", 1))]
@@ -193,15 +193,23 @@ def rank_articles(articles, topic, keywords="", *, include_unrelated=False, dedu
         ranked = unique
     if diversify:
         ordered, counts = [], defaultdict(int)
-        while ranked:
-            ceiling = ranked[0]["score"]
-            candidates = [item for item in ranked if item["score"] >= ceiling * 0.85] if ceiling else [ranked[0]]
-            chosen = max(candidates, key=lambda item: (
-                item["score"] / (1 + 0.2 * counts[_publisher_key(item["article"])])
-                if _publisher_key(item["article"]) else item["score"], -item["_index"]))
+        groups = defaultdict(deque)
+        for item in ranked:
+            groups[_publisher_key(item["article"])].append(item)
+        # Only the highest-ranked remaining item of each publisher can win.
+        # This avoids repeatedly scanning the whole historical library.
+        while groups:
+            ceiling = max(items[0]["score"] for items in groups.values())
+            candidates = [(publisher, items[0]) for publisher, items in groups.items()
+                          if items[0]["score"] >= ceiling * 0.85]
+            publisher, chosen = max(candidates, key=lambda pair: (
+                pair[1]["score"] / (1 + 0.2 * counts[pair[0]]) if pair[0] else pair[1]["score"],
+                -pair[1]["_index"]))
             ordered.append(chosen)
-            counts[_publisher_key(chosen["article"])] += 1
-            ranked.remove(chosen)
+            counts[publisher] += 1
+            groups[publisher].popleft()
+            if not groups[publisher]:
+                del groups[publisher]
         ranked = ordered
     for item in ranked:
         item.pop("_index")

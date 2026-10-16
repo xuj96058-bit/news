@@ -1,7 +1,8 @@
-"""Bounded, read-only collection of RSS/Atom and HKMA press-release metadata.
+"""Bounded, read-only RSS/Atom, HKMA, and public research collection.
 
 Only text supplied in the feed is collected. Article links are never fetched,
 and a feed's ``content`` field is not assumed to be the complete article.
+Verified publisher-page adapters live in public_research and retain their scope.
 """
 
 from dataclasses import asdict, dataclass
@@ -99,7 +100,7 @@ def load_sources(path: str | Path = DEFAULT_SOURCES) -> list[Source]:
         for source in sources:
             if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", source.id)
                     or source.id in seen or not _http_url(source.url)
-                    or source.format not in {"rss", "atom", "hkma_json"}
+                    or source.format not in {"rss", "atom", "hkma_json", "apollo_html", "ubs_html", "blackrock_html", "jpm_html", "hkex_announcements"}
                     or not isinstance(source.enabled, bool)
                     or not all(isinstance(v, str) and v.strip()
                                for v in (source.name, source.kind, source.region))):
@@ -255,7 +256,12 @@ def fetch_source(source: Source, *, timeout: float = 15, session=None) -> list[A
     HTTP 4xx other than 429 are not retried. Errors are deliberately sanitized.
     The caller owns an injected session; sessions created here are closed here.
     """
-    if not _http_url(source.url) or source.format not in {"rss", "atom", "hkma_json"}:
+    if not _http_url(source.url):
+        raise FeedFetchError("Invalid feed source")
+    from .public_research import PUBLIC_FORMATS, fetch_public_research
+    if source.format in PUBLIC_FORMATS:
+        return fetch_public_research(source, timeout=timeout, session=session)
+    if source.format not in {"rss", "atom", "hkma_json"}:
         raise FeedFetchError("Invalid feed source")
     if timeout <= 0:
         raise ValueError("timeout must be positive")

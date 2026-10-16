@@ -26,6 +26,12 @@ def brief(rows, sources=None, topic="Widget sales", **kwargs):
 
 
 class RankingTests(unittest.TestCase):
+    def test_matching_history_beyond_first_500_is_searchable(self):
+        articles = [{"id": str(i), "title": "Local weather"} for i in range(600)]
+        articles.append({"id": "historical", "title": "AI earnings outlook"})
+        ranked = rank_articles(articles, "AI earnings")
+        self.assertEqual([item["article"]["id"] for item in ranked], ["historical"])
+
     def test_unrelated_excluded_and_original_articles_unchanged(self):
         articles = [{"id": "1", "title": "Local weather"}, {"id": "2", "title": "AI earnings report"},
                     {"id": "3", "summary": "Artificial intelligence company profits"}]

@@ -238,6 +238,89 @@ class ResearchStore:
         except sqlite3.Error:
             raise ResearchStoreError("Could not read the research report library.") from None
 
+    def search_reports(self, query: str = "", limit: int = 12, offset: int = 0) -> dict:
+        """Search all saved reports' latest title/body and topic, then paginate.
+
+        ``instr`` treats user input literally, including SQL wildcard characters.
+        The current revision rowid breaks equal timestamp ties in edit order;
+        the report ID supplies a final stable tie-breaker.
+        """
+        query = _text(query, "Report search").strip()
+        if (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+                or isinstance(offset, bool) or not isinstance(offset, int) or offset < 0):
+            raise ResearchStoreError("Report limit and offset must be non-negative integers.")
+        where = ("WHERE instr(lower(r.topic),lower(?))>0 OR instr(lower(v.title),lower(?))>0 "
+                 "OR instr(lower(v.body),lower(?))>0 ")
+        parameters = (query, query, query)
+        try:
+            total = self.connection.execute(
+                "SELECT COUNT(*) FROM research_reports r JOIN research_revisions v "
+                "ON v.report_id=r.id AND v.version=r.current_version " + where, parameters,
+            ).fetchone()[0]
+            rows = self.connection.execute(
+                self._REPORT_QUERY + where + "ORDER BY r.updated_at DESC,v.rowid DESC,r.id LIMIT ? OFFSET ?",
+                (*parameters, limit, offset),
+            ).fetchall()
+            return {"items": [self._record(row) for row in rows], "total": total}
+        except sqlite3.Error:
+            raise ResearchStoreError("Could not search the research report library.") from None
+
+    def delete_reports(self, expected_versions: dict[str, int]) -> int:
+        """Permanently remove selected reports and every revision atomically.
+
+        The caller supplies the versions shown to the user. All IDs and versions
+        must still match before any row is deleted. This affects this report
+        database only; news articles, charts and exported files are untouched.
+        """
+        if not isinstance(expected_versions, dict):
+            raise ResearchStoreError("Report deletion requires a dictionary of IDs and expected versions.")
+        checked = {}
+        for identifier, version in expected_versions.items():
+            identifier = _text(identifier, "Report ID")
+            if not identifier.strip():
+                raise ResearchStoreError("Report ID cannot be empty.")
+            checked[identifier] = _version(version)
+        if not checked:
+            return 0
+        try:
+            with self.connection:
+                # Lock before validating so another connection cannot update a
+                # report between the version check and the hard delete.
+                if not self.connection.in_transaction:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                for identifier, version in checked.items():
+                    row = self.connection.execute(
+                        "SELECT current_version FROM research_reports WHERE id=?", (identifier,),
+                    ).fetchone()
+                    if row is None:
+                        raise ResearchStoreError("A selected research report was not found. Refresh the report list.")
+                    if row["current_version"] != version:
+                        raise ResearchConflictError("A selected report has newer edits. Refresh the report list before deleting.")
+                # Restored revisions point to earlier revisions in the same
+                # report. Clear these links before deleting the complete chain.
+                # Links in unselected reports are never modified; unexpected
+                # cross-report references cause an FK failure and full rollback.
+                for identifier in checked:
+                    self.connection.execute(
+                        "UPDATE research_revisions SET restored_from_revision_id=NULL WHERE report_id=?",
+                        (identifier,),
+                    )
+                for identifier in checked:
+                    self.connection.execute("DELETE FROM research_revisions WHERE report_id=?", (identifier,))
+                for identifier, version in checked.items():
+                    result = self.connection.execute(
+                        "DELETE FROM research_reports WHERE id=? AND current_version=?", (identifier, version),
+                    )
+                    if result.rowcount != 1:
+                        raise ResearchConflictError("A selected report changed during deletion. Refresh the report list.")
+        except sqlite3.Error:
+            raise ResearchStoreError("Could not delete the selected reports. No selected reports were deleted.") from None
+        return len(checked)
+
+    def delete_report(self, report_id: str, *, expected_version: int) -> int:
+        """Delete one report with the same optimistic concurrency check."""
+        return self.delete_reports({_text(report_id, "Report ID"): expected_version})
+
     def get_report(self, report_id: str) -> dict | None:
         report_id = _text(report_id, "Report ID")
         try:
