@@ -23,6 +23,7 @@ from src.research_progress import run_generation
 from src.research_store import ResearchStore
 from src.workbench_ui import render_reader_tab, render_investat_filters, render_source_operations, render_article
 from src.chartbook_ui import render_chartbook_tab
+from src.report_gallery_ui import render_report_gallery, show_report
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -126,8 +127,13 @@ def analyze_for_session(text):
 st.title("金融新聞影響分析")
 st.caption("以新聞為論據，說清楚論點、影響途徑、反證和下一個驗證點")
 
-tab1, tab2, tab3, reader_tab, chartbook_tab, tab4 = st.tabs(
-    ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告"])
+pending_report_display = st.session_state.pop("pending_report_display", None)
+if pending_report_display:
+    show_report(pending_report_display)
+
+tab1, tab2, tab3, reader_tab, chartbook_tab, tab4, report_gallery_tab = st.tabs(
+    ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"],
+    key="main_navigation", on_change="rerun")
 
 with tab1:
     news_input = st.text_area("貼上新聞內容", height=200, placeholder="輸入中文或英文新聞...")
@@ -162,6 +168,7 @@ with tab2:
                     title=draft["title"], body=draft["body"], sources=draft.get("sources", []),
                     provider=provider_id, model=selected_model, as_of=day, metadata=draft["metadata"])
             st.session_state["daily_essay"] = draft
+            st.session_state["daily_essay_report_id"] = initial_daily["id"]
             return initial_daily["id"]
 
         try:
@@ -178,6 +185,16 @@ with tab2:
         except Exception as exc:
             bar.empty()
             st.error(analysis_error_message(exc))
+    daily_report_id = st.session_state.get("daily_essay_report_id")
+    if daily_report_id:
+        with ResearchStore() as store:
+            saved_daily = store.get_report(daily_report_id)
+        if saved_daily is None:
+            st.session_state.pop("daily_essay", None)
+            st.session_state.pop("daily_essay_report_id", None)
+        else:
+            # Always show the saved version after edits in the report editor.
+            st.session_state["daily_essay"] = saved_daily
     daily = st.session_state.get("daily_essay")
     if daily:
         st.markdown(daily["body"])
@@ -259,4 +276,7 @@ with chartbook_tab:
 with tab4:
     render_research_tab(provider=provider_id, model=selected_model, api_key=effective_api_key,
                         investat_token=effective_investat_token, analysis_available=analysis_available)
+
+with report_gallery_tab:
+    render_report_gallery()
 

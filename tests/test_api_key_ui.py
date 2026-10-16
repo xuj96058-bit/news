@@ -55,6 +55,7 @@ class ApiKeyUiTests(unittest.TestCase):
         self.start_patch(patch("src.workbench_ui.render_reader_tab"))
         self.start_patch(patch("src.workbench_ui.render_source_operations"))
         self.start_patch(patch("src.chartbook_ui.render_chartbook_tab"))
+        self.start_patch(patch("src.report_gallery_ui.render_report_gallery"))
         self.start_patch(patch("src.feeds.load_sources", return_value=[
             Source("test", "Synthetic feed", "https://example.org/feed", "official", "us"),
         ]))

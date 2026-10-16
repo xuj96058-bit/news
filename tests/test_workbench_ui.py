@@ -245,6 +245,7 @@ class WorkbenchUiTests(unittest.TestCase):
 
     def test_full_app_opens_empty_and_offline_without_fetch_or_model_calls(self):
         report_path = Path(self.temp.name) / "reports.db"
+        self.patch("src.research_store.DEFAULT_DB_PATH", new=report_path)
         self.patch("src.news_store.NewsStore", side_effect=lambda: NewsStore(self.news_path))
         self.patch("src.research_ui.NewsStore", side_effect=lambda: NewsStore(self.news_path))
         self.patch("src.research_ui.ResearchStore", side_effect=lambda: ResearchStore(report_path))
@@ -259,7 +260,8 @@ class WorkbenchUiTests(unittest.TestCase):
             self.assertFalse(app.exception)
             app.run()
             self.assertFalse(app.exception)
-        self.assertEqual([tab.label for tab in app.tabs][:6], ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告"])
+        self.assertEqual([tab.label for tab in app.get_by_key("main_navigation").children.values()],
+                         ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"])
         client.assert_not_called()
         collect.assert_not_called()
         self.ai.assert_not_called()

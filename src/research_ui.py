@@ -530,6 +530,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 _flash("初稿已保存；獨立審稿未完成，可直接修改與匯出。")
             else:
                 _flash("初稿與審稿版本均已保存；請在「報告庫與編輯」核對、修改和匯出。")
+            st.session_state["pending_report_display"] = saved["id"]
             st.rerun()
         except Exception as error:
             bar.empty()
@@ -570,6 +571,7 @@ def _import_report():
                                                 metadata={"report_scope": "imported"})
                 st.session_state["research_active_report"] = saved["id"]
                 _flash("已匯入為可編輯報告，原始內容會保留。")
+                st.session_state["pending_report_display"] = saved["id"]
                 st.rerun()
             except Exception:
                 st.error("無法匯入；請使用有效UTF-8 Markdown，或含title、body及可選sources的JSON報告。")
@@ -579,6 +581,13 @@ def _library():
     _import_report()
     with ResearchStore() as store:
         reports = store.list_reports()
+        # The gallery searches the complete library. An explicitly opened
+        # historical report must remain editable beyond the latest 100 entries.
+        active = st.session_state.get("research_active_report")
+        if active and not any(report["id"] == active for report in reports):
+            historical = store.get_report(active)
+            if historical is not None:
+                reports.insert(0, historical)
     if not reports:
         st.info("尚未保存研究報告；可先生成草稿或匯入已有報告。")
         return
@@ -707,7 +716,8 @@ def render_research_tab(*, provider, model, api_key, investat_token, analysis_av
     message = st.session_state.pop("research_flash", None)
     if message:
         st.success(message)
-    generate, library = st.tabs(["生成新報告", "報告庫與編輯"])
+    generate, library = st.tabs(["生成新報告", "報告庫與編輯"],
+                               key="research_report_view", on_change="rerun")
     with generate:
         _generate(provider=provider, model=model, api_key=api_key, investat_token=investat_token,
                   analysis_available=analysis_available)

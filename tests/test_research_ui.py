@@ -29,6 +29,7 @@ class ResearchUiHarness:
         self.patch('src.workbench_ui.render_reader_tab')
         self.patch('src.workbench_ui.render_source_operations')
         self.patch('src.chartbook_ui.render_chartbook_tab')
+        self.patch('src.report_gallery_ui.render_report_gallery')
         self.patch('src.research_ui.ResearchStore', side_effect=lambda: ResearchStore(self.db))
         self.start_patch(patch.dict(os.environ, {'LLM_PROVIDER': 'deepseek', 'OPENAI_API_KEY': '',
                          'DEEPSEEK_API_KEY': '', 'INVESTAT_MCP_TOKEN': '', 'OPENAI_BASE_URL': ''}))
