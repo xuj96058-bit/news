@@ -7,6 +7,8 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 from .investat import InvestatClient, InvestatError
+from .entities import normalize_metadata, safe_saved_text
+from .source_health import record_collection, usable_text_count
 
 
 def _text(value) -> str:
@@ -87,7 +89,7 @@ def _normalize(record, article_id, body: str, *, partial=False) -> dict:
     title = _first_text(record, "title", "headline")
     summary = _first_text(record, "summary", "abstract", "excerpt")
     institution = _institution(record)
-    return {
+    article = {
         "source_id": "investat",
         "source_name": "Investat" + (f" / {institution}" if institution else ""),
         "source_kind": "research",
@@ -101,6 +103,8 @@ def _normalize(record, article_id, body: str, *, partial=False) -> dict:
         "content_scope": ("partial_text" if partial else "provided_text") if body
                          else "summary" if summary and summary != title else "title_only",
     }
+    article.update(normalize_metadata({**record, "source_id": "investat", "provider": "Investat"}))
+    return article
 
 
 def _safe_error(exc, fallback="Investat request failed") -> str:
@@ -111,7 +115,7 @@ def _safe_error(exc, fallback="Investat request failed") -> str:
 
 
 def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
-                     timeout=15, client_factory=None):
+                     timeout=15, client_factory=None, search="", ticker="", institution=""):
     """Read summaries and bounded detail chunks, saving partial successes.
 
     Only an explicit nextBodyOffset advances the body cursor. The normalized
@@ -122,26 +126,34 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
             or isinstance(max_body_pages, bool) or not isinstance(max_body_pages, int)
             or max_body_pages < 1 or timeout <= 0):
         raise ValueError("Investat limit must be 1–50; body pages and timeout must be positive")
+    filters = {key: safe_saved_text(value) for key, value in
+               (("search", search), ("ticker", ticker), ("institution", institution)) if value}
     report = {"fetched_at": datetime.now(timezone.utc).isoformat(), "added": 0,
               "updated": 0, "duplicates": 0, "failed_sources": 0, "sources": []}
     outcome = {"id": "investat", "name": "Investat", "kind": "research",
                "fetched": 0, "selected": 0, "body_pages": 0, "partial_articles": 0,
-               "skipped": 0, "details_skipped": 0, "diagnostics": []}
+               "skipped": 0, "details_skipped": 0, "diagnostics": [], "usable_text": 0,
+               "limited": 0, "gap": False}
     report["sources"].append(outcome)
     factory = client_factory or InvestatClient
     try:
         client = factory(token=token, timeout=timeout)
-        items = client.list_articles(limit=limit)
+        items = client.list_articles(limit=limit, **filters)
         if not isinstance(items, list):
             raise InvestatError("payload")
     except Exception as exc:
         outcome.update(status="error", error=_safe_error(exc))
         report["failed_sources"] = 1
+        record_collection(store, outcome, run_at=report["fetched_at"])
         report["database"] = store.stats()
         return report
 
     outcome["fetched"] = len(items)
     outcome["selected"] = min(len(items), limit)
+    # The upstream list API has no verified historical cursor. Reaching the
+    # requested cap is a visible potential gap, never a claim of full coverage.
+    outcome["limited"] = int(len(items) >= limit)
+    outcome["gap"] = bool(outcome["limited"])
     counts = {"added": 0, "updated": 0, "duplicates": 0}
     failures = False
     detail_blocked = False
@@ -186,6 +198,11 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
                     combined.pop("published_at", None)
                 if _institution(detail):
                     combined["institution"] = _institution(detail)
+                # Normalize aliases first so e.g. detail.symbols supersedes
+                # list.tickers, without retaining arbitrary nested objects.
+                for key, value in normalize_metadata(detail).items():
+                    if value and key != "provider":
+                        combined[key] = value
                 chunk = _body(detail)
                 if chunk:
                     chunks.append(chunk)
@@ -227,6 +244,7 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
             continue
         try:
             saved = store.ingest([article])
+            outcome["usable_text"] += usable_text_count([article])
             for key in counts:
                 counts[key] += saved[key]
         except Exception:
@@ -241,5 +259,7 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
         report["failed_sources"] = 1
     else:
         outcome["status"] = "ok" if items else "empty"
+    outcome["gap"] = outcome["gap"] or failures
+    record_collection(store, outcome, run_at=report["fetched_at"])
     report["database"] = store.stats()
     return report

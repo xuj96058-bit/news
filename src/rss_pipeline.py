@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .feeds import DEFAULT_SOURCES, FeedFetchError, fetch_source, load_sources
 from .news_store import DEFAULT_DB_PATH, NewsStore
+from .source_health import record_collection, usable_text_count
 from .investat_pipeline import collect_investat
 from .sec_universe import (DEFAULT_UNIVERSE, SecConfigError, collect_sec_filings,
                            load_universe, refresh_universe)
@@ -45,8 +46,10 @@ def collect_sources(sources, store, *, limit_per_source=50, max_age_days=30,
         for source, job in jobs:
             outcome = {"id": source.id, "name": source.name, "kind": source.kind}
             try:
+                batch = job.result()
+                outcome.update(getattr(batch, "diagnostics", {}))
                 items = [entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
-                         for entry in job.result()]
+                         for entry in batch]
                 # Unknown dates are retained and labelled, not invented.
                 recent = [item for item in items if cutoff is None
                           or _utc_date(item.get("published_at")) is None
@@ -57,7 +60,11 @@ def collect_sources(sources, store, *, limit_per_source=50, max_age_days=30,
                 counts = store.ingest(selected)
                 outcome.update(status="ok" if items else "empty", fetched=len(items),
                                selected=len(selected), older_skipped=len(items) - len(recent),
-                               limited=len(recent) - len(selected), **counts)
+                               limited=len(recent) - len(selected), usable_text=usable_text_count(selected), **counts)
+                if outcome.get("upstream_limited"):
+                    outcome["status"] = "partial"
+                    report["failed_sources"] += 1
+                outcome["newest_published_at"] = selected[0].get("published_at") if selected else None
                 for key in ("added", "updated", "duplicates"):
                     report[key] += counts[key]
             except Exception as exc:
@@ -66,6 +73,7 @@ def collect_sources(sources, store, *, limit_per_source=50, max_age_days=30,
                 outcome.update(status="error", error=message)
                 report["failed_sources"] += 1
             report["sources"].append(outcome)
+            record_collection(store, outcome, run_at=now)
     report["database"] = store.stats()
     return report
 
@@ -75,13 +83,38 @@ def collect_sec(store, *, universe_path=DEFAULT_UNIVERSE, max_pages=10, timeout=
     try:
         universe = load_universe(universe_path)
         articles, diagnostics = collect_sec_filings(universe, max_pages=max_pages, timeout=timeout)
-        counts = store.ingest(article.to_dict() for article in articles)
+        counts = {"added": 0, "updated": 0, "duplicates": 0}
+        # Attribute actual ingest counts to each form, including partial fetches.
+        for diagnostic in diagnostics:
+            selected = [article.to_dict() for article in articles if article.source_id == diagnostic["source_id"]]
+            per_source = store.ingest(selected)
+            for key in counts:
+                counts[key] += per_source[key]
+            diagnostic.update(name="SEC EDGAR", fetched=diagnostic.get("scanned", 0),
+                              selected=len(selected), usable_text=0, **per_source)
+            # The collector may append a 'sec' sentinel when remaining forms
+            # were skipped. Reserve that ID for exactly one aggregate attempt.
+            if diagnostic["source_id"] != "sec":
+                record_collection(store, diagnostic)
+        statuses = {item["status"] for item in diagnostics}
+        status = ("error" if statuses == {"error"} else "partial" if statuses & {"error", "partial"}
+                  else "ok" if articles else "empty")
+        aggregate = {"source_id": "sec", "name": "SEC EDGAR", "status": status, **counts,
+                     "fetched": sum(item.get("scanned", 0) for item in diagnostics),
+                     "selected": len(articles), "usable_text": 0,
+                     "pages": sum(item.get("pages", 0) for item in diagnostics),
+                     "gap": status == "partial", "coverage": "SEC current-feed window only; not a historical backfill"}
+        error = next((item["error"] for item in diagnostics if item.get("error")), None)
+        if error:
+            aggregate["error"] = error
+        record_collection(store, aggregate)
         return {**counts, "universe": universe["counts"],
                 "membership_fetched_at": universe["fetched_at"],
                 "membership_sources": universe["sources"], "sources": diagnostics,
-                "notice_only": True,
+                "notice_only": True, "aggregate": aggregate,
                 "coverage": "SEC current-feed window only; not a historical backfill"}
     except (SecConfigError, FeedFetchError) as exc:
+        record_collection(store, {"source_id": "sec", "name": "SEC EDGAR", "status": "error", "error": str(exc)})
         return {"added": 0, "updated": 0, "duplicates": 0,
                 "sources": [{"source_id": "sec", "status": "error", "error": str(exc)}]}
 
@@ -137,7 +170,7 @@ def export_jsonl(store, path):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="抓取財經 RSS／Atom 與金管局新聞；預設不呼叫 AI")
+    parser = argparse.ArgumentParser(description="抓取財經 RSS／Atom、官方公告與公開機構研究；預設不呼叫 AI")
     parser.add_argument("--config", type=Path, default=DEFAULT_SOURCES)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--source", action="append", help="只抓指定來源 ID，可重複使用")

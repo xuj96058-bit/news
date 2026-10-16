@@ -250,6 +250,49 @@ class InvestatPipelineTests(unittest.TestCase):
         collect_investat(self.store, token=TOKEN, timeout=3, client_factory=factory)
         self.assertEqual(options, [{"token": TOKEN, "timeout": 3}])
 
+    def test_filters_pass_through_only_when_nonempty(self):
+        calls = []
+        client = Client([])
+        client.list_articles = lambda **kwargs: calls.append(kwargs) or []
+        self.collect(client, search="AI", ticker="NVDA", institution="Morgan Stanley", limit=12)
+        self.assertEqual(calls, [{"limit": 12, "search": "AI", "ticker": "NVDA", "institution": "Morgan Stanley"}])
+        # Compatibility with older integrations that accept only limit.
+        client.list_articles = lambda limit: []
+        self.assertEqual(self.collect(client)["sources"][0]["status"], "empty")
+
+    def test_supplied_metadata_has_distinct_author_publisher_provider_and_normalized_entities(self):
+        raw = item(institution={"name": "摩根士丹利", "token": SECRET},
+                   authors=[{"name": "Alice", "sessionId": SECRET}],
+                   publisher={"name": "Original Publisher", "debug": SECRET},
+                   tickers=["AAPL"], assetClasses=["Equities"], topics=["AI"], provider=SECRET)
+        detail = {"id": 7, "body": "Full research text", "symbols": [{"symbol": "700", "exchange": "HKEX", "token": SECRET}],
+                  "authors": ["Bob", "Carol"], "themes": ["China"], "assetClass": "Equities"}
+        self.collect(Client([raw], {(7, 0): detail}))
+        article = self.store.export_articles()[0]
+        self.assertEqual(article["institution"], "Morgan Stanley")
+        self.assertEqual(article["institution_original"], "摩根士丹利")
+        self.assertEqual(article["author"], "Bob; Carol")
+        self.assertEqual(article["publisher"], "Original Publisher")
+        self.assertEqual(article["provider"], "Investat")
+        self.assertEqual(article["tickers"], ["0700.HK"])
+        self.assertEqual(article["topics"], ["China"])
+        self.assertEqual(article["asset_classes"], ["Equities"])
+        self.assertNotIn(SECRET, json.dumps(article))
+        self.assertEqual(self.store.search_articles(institution="摩根士丹利", ticker="HKEX:700")["total"], 1)
+
+    def test_each_attempt_records_health_once_including_auth_failure_and_cap(self):
+        from src.source_health import health_summary
+        self.collect(Client(list_error=InvestatError("authentication", status_code=403)))
+        self.collect(Client(), limit=1)
+        health = health_summary(self.store)[0]
+        self.assertEqual(health["runs"], 2)
+        self.assertEqual(health["errors"], 1)
+        self.assertEqual(health["added"], 1)
+        self.assertEqual(health["usable_text"], 1)
+        self.assertEqual(health["gap_runs"], 1)
+        self.assertEqual(health["limited"], 1)
+        self.assertNotIn(TOKEN, json.dumps(health))
+
     def test_collected_research_uses_shared_analysis_once_and_retains_provenance(self):
         self.collect()
         calls = []

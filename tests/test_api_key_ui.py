@@ -52,12 +52,17 @@ class ApiKeyUiTests(unittest.TestCase):
         self.start_patch(patch("src.report.generate_daily_report", return_value="Synthetic report"))
         # The research workflow has its own integration tests and database boundary.
         self.start_patch(patch("src.research_ui.render_research_tab"))
+        self.start_patch(patch("src.workbench_ui.render_reader_tab"))
+        self.start_patch(patch("src.workbench_ui.render_source_operations"))
+        self.start_patch(patch("src.chartbook_ui.render_chartbook_tab"))
         self.start_patch(patch("src.feeds.load_sources", return_value=[
             Source("test", "Synthetic feed", "https://example.org/feed", "official", "us"),
         ]))
         self.store = MagicMock()
         self.store.stats.return_value = {"total": 0, "analyzed": 0}
         self.store.export_articles.return_value = []
+        self.store.search_articles.side_effect = lambda **kwargs: {
+            "items": self.store.export_articles.return_value, "total": len(self.store.export_articles.return_value)}
         self.store.pending.return_value = [{
             "id": 1, "title": "Synthetic headline", "summary": "Synthetic RSS article body.",
             "content": "", "sources": [{"source_name": "Synthetic feed", "source_kind": "official"}],
@@ -378,6 +383,20 @@ class ApiKeyUiTests(unittest.TestCase):
         self.button(app, "抓取最新新聞").click().run()
         self.investat.assert_called_once_with(self.store, token="", limit=20)
         self.analyze.assert_not_called()
+
+    def test_collection_forwards_explicit_investat_search_filters(self):
+        app = self.app()
+        app.sidebar.text_input(key="investat_token").input(INVESTAT_TOKEN).run()
+        app.multiselect(key="news_sources").set_value(["investat"]).run()
+        app.text_input(key="investat_collect_search").input("AI capex").run()
+        app.text_input(key="investat_collect_ticker").input("NVDA").run()
+        app.text_input(key="investat_collect_institution").input("Morgan Stanley").run()
+        self.investat.assert_not_called()
+        self.button(app, "抓取最新新聞").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.investat.assert_called_once_with(self.store, token=INVESTAT_TOKEN, limit=20,
+            search="AI capex", ticker="NVDA", institution="Morgan Stanley")
+        self.assertNotIn(INVESTAT_TOKEN, self.rendered_text(app))
 
     def test_investat_sessions_are_isolated_and_clear_restores_hidden_environment_fallback(self):
         os.environ["INVESTAT_MCP_TOKEN"] = SERVER_INVESTAT_TOKEN

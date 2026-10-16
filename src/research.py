@@ -147,6 +147,30 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_PROVENANCE_FIELDS = {"chart_id", "source_article_id", "chart_content_hash", "source_content_hash",
+                      "article_content_hash", "image_sha256"}
+
+
+def _provenance_metadata(source: dict) -> dict:
+    """Carry only inert identifiers and SHA-256 digests into report snapshots."""
+    from .entities import safe_saved_text
+    clean = {}
+    for field in _PROVENANCE_FIELDS:
+        value = source.get(field)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if field.endswith("hash") or field == "image_sha256":
+            if re.fullmatch(r"[A-Fa-f0-9]{64}", value):
+                clean[field] = value.lower()
+        elif re.fullmatch(r"[A-Za-z0-9_-]{1,240}", value):
+            try:
+                clean[field] = safe_saved_text(value, max_length=240)
+            except ValueError:
+                pass
+    return clean
+
+
 def _timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
         result = value
@@ -254,6 +278,7 @@ def prepare_sources(articles: list[dict], *, max_articles: int = 30,
         included = body[:shared_limit]
         sources.append({
             "id": f"S{len(sources) + 1}", "article_id": identity or None,
+            **_provenance_metadata({"article_content_hash": article.get("content_hash")}),
             "title": title, "publisher": primary["publisher"], "url": primary["url"],
             "published_at": primary["published_at"],
             "publication_date": _date_label(primary["published_at"]),
@@ -278,7 +303,7 @@ def _validated_sources(sources: list[dict]) -> list[dict]:
         "id", "article_id", "title", "publisher", "url", "published_at", "publication_date",
         "observation_date", "retrieved_at", "retrieved_date", "content_scope", "source_type",
         "origins", "content", "content_truncated", "supplied_character_count", "included_character_count",
-        "verification_status",
+        "verification_status", *_PROVENANCE_FIELDS,
     }
     clean = []
     seen = set()
@@ -299,6 +324,9 @@ def _validated_sources(sources: list[dict]) -> list[dict]:
         if len(content) > MAX_SOURCE_CHARS or total > MAX_TOTAL_SOURCE_CHARS:
             raise ResearchError("source_budget")
         item = {field: source[field] for field in allowed_fields if field in source and field != "origins"}
+        for field in _PROVENANCE_FIELDS:
+            item.pop(field, None)
+        item.update(_provenance_metadata(source))
         for field, limit in (("article_id", 240), ("title", 500), ("publisher", 240),
                              ("published_at", 120), ("publication_date", 120), ("observation_date", 120),
                              ("retrieved_at", 120), ("retrieved_date", 120), ("content_scope", 100)):
@@ -355,6 +383,7 @@ def prepare_evidence(existing_sources: list[dict], evidence: list[dict]) -> list
         included = content[:limit]
         sources.append({
             "id": f"S{next_id}", "article_id": None,
+            **_provenance_metadata(item),
             "title": _text(item["title"], 500),
             "publisher": _text(item.get("publisher"), 240) or "使用者提供",
             "url": _url(item.get("url")), "published_at": publication_date,
@@ -390,6 +419,11 @@ def format_sources_appendix(sources: list[dict]) -> str:
             f"類型：{_markdown_text(source.get('source_type'))}；內容範圍：{_markdown_text(source.get('content_scope'))}；"
             f"報告輸入截斷：{'是' if source.get('content_truncated') else '否'}",
         ])
+        for field, label in (("chart_id", "圖表識別碼"), ("chart_content_hash", "圖表快照 SHA-256"),
+                             ("source_article_id", "關聯文章識別碼"), ("source_content_hash", "關聯文章快照 SHA-256"),
+                             ("article_content_hash", "文章快照 SHA-256"), ("image_sha256", "來源圖片 SHA-256")):
+            if source.get(field):
+                lines.append(f"{label}：{source[field]}")
         if source.get("origins"):
             lines.append("保留的來源歸屬：")
             for origin in source["origins"]:
@@ -678,7 +712,15 @@ def _parse_draft(raw: str, sources: list[dict]) -> tuple[ResearchDraft, list[str
 
 
 def _number_values(text: str) -> set[Decimal]:
-    values = {Decimal(number.replace(",", "")) for number in re.findall(r"(?<![A-Za-z])\d+(?:,\d{3})*(?:\.\d+)?", text)}
+    # Provenance strings are identifiers, not measured observations. Digits in
+    # a URL, UUID or hash must not suppress a warning about an unsupported value.
+    text = _URL.sub("", text)
+    text = re.sub(r"(?im)^\s*(?:(?:圖表|關聯文章|文章)識別碼|(?:圖表|關聯文章|文章)快照\s+SHA-?256|"
+                  r"來源圖片\s+SHA-?256|(?:chart|source_article|article)[_ ]id|"
+                  r"(?:chart|source|article)[_ ]content[_ ]hash|image_sha256)\s*[:：=].*$", "", text)
+    text = re.sub(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "", text)
+    text = re.sub(r"(?i)(?<![A-Za-z0-9])(?=[0-9a-f]{32,128}(?![A-Za-z0-9]))(?=[0-9a-f]*[a-f])[0-9a-f]+", "", text)
+    values = {Decimal(number.replace(",", "")) for number in re.findall(r"(?<![A-Za-z0-9])\d+(?:,\d{3})*(?:\.\d+)?", text)}
     # Translation of a supplied month name is a date label, not new evidence.
     for month, value in enumerate(("january", "february", "march", "april", "may", "june",
                                     "july", "august", "september", "october", "november", "december"), 1):

@@ -36,6 +36,8 @@ PUBLIC_HOSTS = frozenset({
     "news.rthk.hk", "rthk.hk", "www.rthk.hk", "www.ft.com", "nvidianews.nvidia.com",
     "www.apple.com", "www.cboe.com", "ir.aboutamazon.com", "investor.fb.com",
     "investor.atmeta.com", "investor.nvidia.com", "www.microsoft.com",
+    "www.apollo.com", "www.ubs.com", "www.blackrock.com", "am.jpmorgan.com",
+    "www.hkexnews.hk", "www1.hkexnews.hk",
 })
 MAX_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 250000
