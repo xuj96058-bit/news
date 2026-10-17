@@ -296,6 +296,16 @@ class ResearchStore:
                         raise ResearchStoreError("A selected research report was not found. Refresh the report list.")
                     if row["current_version"] != version:
                         raise ResearchConflictError("A selected report has newer edits. Refresh the report list before deleting.")
+                # Older deep-research builds saved per-version snapshots with
+                # a foreign key to research_revisions(report_id, version).
+                # Remove only these known children, inside the same transaction
+                # and after every expected version passed validation. Other
+                # dependent tables still fail closed through normal FK checks.
+                if self.connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_snapshots'",
+                ).fetchone():
+                    for identifier in checked:
+                        self.connection.execute("DELETE FROM research_snapshots WHERE report_id=?", (identifier,))
                 # Restored revisions point to earlier revisions in the same
                 # report. Clear these links before deleting the complete chain.
                 # Links in unselected reports are never modified; unexpected
