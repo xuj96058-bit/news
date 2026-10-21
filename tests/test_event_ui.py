@@ -22,6 +22,12 @@ def event_script():
         analysis_available=bool(st.session_state.get("test_key", "synthetic-analysis-key")))
 
 
+def revision_script():
+    import streamlit as st
+    from src.event_ui import render_event_revision
+    render_event_revision(st.session_state["revision"])
+
+
 def statement(text):
     return {"text": text, "source_ids": ["S1"]}
 
@@ -100,7 +106,7 @@ class EventUiTests(unittest.TestCase):
         self.assertFalse(call.kwargs["search_enabled"])
         self.assertEqual(call.kwargs["search_api_key"], "")
         self.assertEqual(call.args[0][0]["content"], "盈利公告\n收入及指引仍須核對。")
-        self.assertIn("缺少同口徑市場預期", self.rendered(app))
+        self.assertNotIn("缺少同口徑市場預期", self.rendered(app))
         self.assertEqual(self.save.call_args.args, ("盈利公告\n收入及指引仍須核對。", {"summary": "daily brief"}))
         event_id = app.selectbox(key="event_selection").value
         self.assertIsNotNone(event_id)
@@ -175,7 +181,7 @@ class EventUiTests(unittest.TestCase):
         self.assertIn("審稿未完成", self.rendered(app))
         self.assertIn("尚未獨立核對原文", self.rendered(app))
         self.assertEqual({item.url for item in app.link_button}, {"https://example.org/source"})
-        self.assertTrue(any("[injected]" in item.value for item in app.text))
+        self.assertFalse(any("[injected]" in item.value for item in app.text))
         self.assertFalse(any("[injected]" in item.value for item in app.markdown))
 
     def test_source_url_validation_and_keyless_state_never_call_provider(self):
@@ -207,9 +213,87 @@ class EventUiTests(unittest.TestCase):
         # Both are inspectable, but the primary result before the history expander
         # is the exact snapshot returned by the analyzer.
         texts = [item.value for item in app.text]
-        self.assertLess(texts.index("盈利改善但指引仍有不確定性。 [S1]"),
-                        texts.index("LATER UPDATE MUST NOT REPLACE THE CACHED RESULT [S1]"))
+        self.assertLess(texts.index("盈利改善但指引仍有不確定性。"),
+                        texts.index("LATER UPDATE MUST NOT REPLACE THE CACHED RESULT"))
         self.assertIn("沒有重複呼叫模型", self.rendered(app))
+
+    def revision_app(self, *, source=None, status="needs_review", version=None, scores=None):
+        from src.event_analysis import WORKFLOW_VERSION
+        revision = {"id": 1, "created_at": "2026-10-21T15:00:00+00:00", "brief": brief(),
+            "sources": [source or {"id": "S1", "title": "新聞", "content_scope": "provided_text"}],
+            "metadata": {"review_status": status,
+                "workflow_version": WORKFLOW_VERSION if version is None else version,
+                "review_findings": ["尚未確認指引比較口徑。"]}}
+        if scores is not None:
+            revision["brief"]["impact_scores"] = scores
+        app = AppTest.from_function(revision_script)
+        app.session_state["revision"] = revision
+        app.run()
+        self.assertFalse(app.exception)
+        return app
+
+    def test_compact_brief_omits_research_sections_and_keeps_honest_manual_source(self):
+        app = self.revision_app()
+        self.assertEqual([item.label for item in app.expander], ["來源"])
+        self.assertTrue(all(not item.proto.expanded for item in app.expander))
+        self.assertFalse(app.warning)
+        self.assertFalse(app.link_button)
+        self.assertIn("貼上文字（未附原文連結）", self.rendered(app))
+        self.assertIn("有待核對項目", self.rendered(app))
+        for removed in ("本次新增資訊", "事實與來源", "反方因素與成立條件", "下一個驗證點", "尚缺資料",
+                        "尚未確認指引比較口徑", "缺少同口徑市場預期", "下次披露若經常性盈利改善"):
+            self.assertNotIn(removed, self.rendered(app))
+        # The whole summary appears once, outside source provenance.
+        self.assertEqual(sum(item.value == brief()["summary"]["text"] for item in app.text), 1)
+        self.assertFalse(any(item.value == brief()["summary"]["text"]
+                             for section in app.expander for item in section.text))
+
+    def test_source_links_use_snapshot_labels_and_do_not_imply_pasted_link_was_fetched(self):
+        app = self.revision_app(source={"id": "S1", "publisher": "Pretend Official",
+            "url": "https://example.org/release", "content_scope": "provided_text"})
+        self.assertEqual(app.link_button[0].label, "所附原文 · example.org")
+        self.assertEqual(app.link_button[0].url, "https://example.org/release")
+        self.assertIn("不表示已讀取或核實原文", self.rendered(app))
+
+    def test_publisher_markdown_is_inert_and_legacy_snapshot_gets_regeneration_hint(self):
+        app = self.revision_app(source={"id": "S1", "publisher": "[Fake](https://evil.example)",
+            "url": "https://example.org/release", "content_scope": "full_text"}, version=2)
+        self.assertIn("\\[Fake\\]", app.link_button[0].label)
+        self.assertEqual({item.url for item in app.link_button}, {"https://example.org/release"})
+        self.assertIn("這是舊版保存內容", self.rendered(app))
+        self.assertIn("重新生成新版快訊", self.rendered(app))
+
+    def test_scores_and_reasons_are_immediately_visible_and_never_inferred_for_legacy(self):
+        scores = [{"target": "示例晶片公司", "bullish_score": 8, "bearish_score": 3,
+                   "reason": statement("可能擴大晶片需求，但仍受供應約束。")},
+                  {"target": "示例傳統設備商", "bullish_score": 1, "bearish_score": 6,
+                   "reason": statement("新架構可能取代部分傳統設備。")}]
+        app = self.revision_app(scores=scores)
+        rendered = self.rendered(app)
+        for text in ("示例晶片公司", "利好 8/10", "利空 3/10", "利好 1/10", "利空 6/10",
+                     "可能擴大晶片需求", "不是股價漲跌機率"):
+            self.assertIn(text, rendered)
+        for section in app.expander:
+            self.assertFalse(any("8/10" in item.value or "示例晶片公司" in item.value for item in section.text))
+        self.analyze.assert_not_called()
+        legacy = self.revision_app(version=3)
+        self.assertIn("未提供利好／利空評分", self.rendered(legacy))
+        self.assertFalse(any("/10" in item.value for item in legacy.text))
+        self.analyze.assert_not_called()
+
+    def test_scored_target_and_reason_stay_plain_and_reason_sources_are_displayed(self):
+        target = "[fake](https://evil.example)"
+        reason = "<script>alert(1)</script> [injected](https://evil.example)"
+        app = self.revision_app(source={"id": "S2", "publisher": "[Publisher](https://evil.example)",
+            "url": "https://example.org/source2", "content_scope": "full_text"},
+            scores=[{"target": target, "bullish_score": 5, "bearish_score": 2,
+                     "reason": {"text": reason, "source_ids": ["S2"]}}])
+        self.assertIn(target, [item.value for item in app.text])
+        self.assertTrue(any(reason in item.value for item in app.text))
+        self.assertFalse(any("evil.example" in item.value for item in app.markdown))
+        self.assertEqual(app.link_button[0].url, "https://example.org/source2")
+        self.assertIn("\\[Publisher\\]", app.link_button[0].label)
+        self.analyze.assert_not_called()
 
 
 if __name__ == "__main__":
