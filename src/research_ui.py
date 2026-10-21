@@ -12,6 +12,7 @@ import streamlit as st
 from .analysis_errors import analysis_error_message
 from .feeds import load_sources
 from .investat_pipeline import collect_investat
+from .llm_providers import provider_environment_key
 from .news_store import NewsStore
 from .research import ResearchError, filter_articles, prepare_evidence, prepare_sources
 from .research_workflow import ResearchEvidenceError, generate_research_workflow
@@ -42,12 +43,85 @@ def _select_articles(identifiers):
     st.session_state["research_article_ids"] = identifiers
 
 
+def _clear_search_key():
+    st.session_state["research_search_api_key"] = ""
+
+
+def _research_context_options(*, provider, api_key, report_mode):
+    """Read-only options; requests happen only inside the generate button."""
+    options = {"search_enabled": False, "search_api_key": "", "include_x": False,
+               "max_search_rounds": 1, "max_search_turns": 2, "previous_research": None}
+    if report_mode != "argumentative":
+        st.caption("主動補證與延續上次判斷適用於「議論文式研究報告」；切換模式後可設定。")
+        return options, True
+    with st.container(border=True):
+        st.markdown("**研究背景與補證**")
+        try:
+            with ResearchStore() as store:
+                reports = store.list_reports(limit=100)
+                selected_id = st.session_state.get("research_previous_report", "")
+                if selected_id and not any(item["id"] == selected_id for item in reports):
+                    previous = store.get_report(selected_id)
+                    if previous:
+                        reports.append(previous)
+            records = {report["id"]: report for report in reports}
+            if st.session_state.get("research_previous_report", "") not in {"", *records}:
+                st.session_state["research_previous_report"] = ""
+            previous_id = st.selectbox("延續哪一份研究", ["", *records],
+                key="research_previous_report",
+                format_func=lambda identifier: "不延續既有研究" if not identifier else
+                    f"{records[identifier]['title']}｜v{records[identifier]['version']}｜{records[identifier]['as_of']}",
+                help="選擇最近保存的研究，讓新報告比較哪些判斷維持或改變；不會覆蓋原報告。")
+            if previous_id:
+                previous = records[previous_id]
+                body = previous["body"]
+                options["previous_research"] = {
+                    "id": previous["id"], "title": previous["title"], "body": body[:12000],
+                    "version": previous["version"], "as_of": previous["as_of"],
+                    "updated_at": previous["updated_at"], "body_truncated": len(body) > 12000,
+                }
+                st.caption("上次報告只作為待重新檢驗的判斷；本次選材仍是主要證據，舊引用不會自動視為本次來源。")
+                with st.expander("預覽上次保存的判斷"):
+                    st.text(body[:12000])
+                    if len(body) > 12000:
+                        st.caption("僅帶入前 12,000 字；可另選較聚焦的研究作為背景。")
+        except ResearchStoreError as error:
+            st.error(_safe_message(error))
+        enabled = st.checkbox("缺證據時主動搜尋補充資料", value=False, key="research_search_enabled")
+        options["search_enabled"] = enabled
+        if enabled:
+            if provider == "xai":
+                options["search_api_key"] = api_key
+                st.caption("補證使用左側的 xAI / Grok API key。")
+            else:
+                key = st.text_input("補證專用 xAI API key", type="password", key="research_search_api_key",
+                    help="只用於 xAI 搜尋並保留在本頁工作階段；不使用其他服務商的 key，不寫入報告。")
+                st.button("清除補證 key", key="research_clear_search_key", on_click=_clear_search_key,
+                          disabled=not key)
+                options["search_api_key"] = key.strip() or provider_environment_key("xai")
+                if not key.strip() and options["search_api_key"]:
+                    st.caption("補證使用本機設定的 XAI_API_KEY。")
+            options["include_x"] = st.checkbox("同時搜尋 X 快訊", value=False, key="research_search_x")
+            options["max_search_rounds"] = st.number_input("最多補證輪數", min_value=1, max_value=2,
+                value=1, step=1, key="research_search_rounds")
+            options["max_search_turns"] = st.number_input("每輪最多搜尋回合", min_value=1, max_value=2,
+                value=2, step=1, key="research_search_turns")
+            st.caption("只在生成報告時按缺口搜尋；每輪另有一次論點重整。搜尋回合與輸出長度有限制，"
+                       "但不是固定金額上限；推理用量及 X 貼文取回量另計。結果會保存實際回報用量。")
+            st.caption("搜尋內容是附引用的模型整理，不能替代原始公告核對；找不到資料時會保留缺口。")
+            if not options["search_api_key"]:
+                st.info("請提供 xAI API key，或關閉主動補證後生成報告。")
+                return options, False
+    return options, True
+
+
 def _generation_progress(bar, stage, received_chars=0, elapsed=0):
     steps = {
         "preparing": (0.05, "5/5 核對研究資料與寫作範圍"),
         "retrieving": (0.08, "讀取相關原文與公開補證資料"),
         "organizing": (0.15, "整理可追溯數據"),
         "planning": (0.25, "根據證據規劃論點與反證"),
+        "searching": (0.28, "針對缺失證據搜尋原始來源"),
         "writing": (0.45, f"撰寫議論文（已收到{received_chars:,}個字元）"),
         "revising": (0.78, "按審稿意見修正論證"),
         "requesting": (0.15, "5/5 等待AI初稿"),
@@ -73,7 +147,8 @@ def _remember_editor(report_id, title_key, body_key, base_key):
 
 
 def _sources_preview(sources):
-    labels = {"rss": "RSS新聞", "investat": "Investat研究", "official": "公開核對資料", "manual": "手動證據"}
+    labels = {"rss": "RSS新聞", "investat": "Investat研究", "official": "公開核對資料",
+              "manual": "手動證據", "search": "模型搜尋摘要（未獨立核實）"}
     for source in sources:
         with st.expander(f"[{source['id']}] {source['title']}"):
             st.caption(f"來源類型：{labels.get(source.get('source_type'), '補充資料')} · 內容範圍：{source.get('content_scope', '補充資料')} · 發布日：{source.get('publication_date') or source.get('published_at') or '未知'}")
@@ -454,8 +529,10 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("生成時會讀取相關原文及建議公開資料，再決定可支持的論點。缺少直接證據的主張會縮小或列為待驗證假說。")
     instructions = st.text_area("寫作要求（可選）", placeholder="例如：區分持倉與資金流；突出相反證據；列出下一步觀察指標。", height=90,
                                 key="research_instructions")
+    context_options, context_ready = _research_context_options(
+        provider=provider, api_key=api_key, report_mode=report_mode)
     if report_mode == "argumentative":
-        st.caption("議論文模式依序規劃論點、撰稿、實質審稿；需要時整理數據及進行一次修訂，最多5次AI調用。以選材準確、證據充分、判斷有用、讀起來清楚作為審查標準。")
+        st.caption("議論文模式依序規劃論點、撰稿、實質審稿；需要時整理數據及進行一次修訂，基礎流程最多5次AI調用，主動補證與論點重整另計。以選材準確、證據充分、判斷有用、讀起來清楚作為審查標準。")
     else:
         st.caption("數據整理通常調用1次AI；寫作並保存初稿，再獨立實質審稿，通常另調用2次AI。全文仍可修改和匯出。")
     st.caption(f"生成使用左側選定的{provider}／{model}，會調用其API。內容不足時保留資料缺口，不會自動補造數字或圖表。")
@@ -467,7 +544,7 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
         st.info("請先填寫研究主題，才能生成報告。")
     button_label = "生成並保存議論文報告" if report_mode == "argumentative" else ("生成並保存資料缺口簡報" if report_mode == "gap" else "生成並保存完整研究報告")
     if st.button(button_label, type="primary", key="research_generate",
-                 disabled=not analysis_available or not sources or not topic.strip() or (report_mode == "research" and not brief["ready"])):
+                 disabled=not analysis_available or not context_ready or not sources or not topic.strip() or (report_mode == "research" and not brief["ready"])):
         bar = st.progress(0.0, text="5/5 準備寫作與實質審稿")
         wait_limit = 720 if report_mode == "argumentative" else 360
         st.caption(f"本次整體等待上限為{wait_limit}秒。初稿會先保存，審稿失敗仍可繼續編輯。")
@@ -502,7 +579,8 @@ def _generate(*, provider, model, api_key, investat_token, analysis_available):
                 lambda **kwargs: generate_research_workflow(topic, sources, api_key=api_key, provider=provider,
                     model=model, as_of=today.isoformat(), instructions=instructions,
                     research_brief=brief, report_mode=report_mode,
-                    writing_style="argumentative" if report_mode == "argumentative" else "legacy", **kwargs),
+                    writing_style="argumentative" if report_mode == "argumentative" else "legacy",
+                    **context_options, **kwargs),
                 update, on_artifact=save_writer, timeout=wait_limit)
             if initial is None:
                 save_writer(draft)
@@ -649,6 +727,40 @@ def _library():
                 st.text(issue.get("message", "") if isinstance(issue, dict) else str(issue))
     if metadata.get("parent_report_id"):
         st.caption("此稿是另存的審稿建議；原報告中的人工修改已保留。")
+    previous_summary = metadata.get("previous_research_summary")
+    research_change = metadata.get("research_change")
+    evidence_search = metadata.get("evidence_search")
+    if isinstance(previous_summary, dict) and previous_summary:
+        with st.expander("與上次研究的判斷比較", expanded=True):
+            st.caption(f"延續：{previous_summary.get('title', '先前研究')}｜"
+                       f"v{previous_summary.get('version', '未知')}｜{previous_summary.get('as_of', '未知')}")
+            if isinstance(research_change, dict):
+                labels = {"maintain": "維持", "strengthen": "加強", "weaken": "削弱",
+                          "reverse": "推翻", "insufficient": "資料不足，暫不改判"}
+                change_status = research_change.get("status")
+                st.write("本次判斷：" + (labels.get(change_status, "尚未完成比較")
+                                        if isinstance(change_status, str) else "尚未完成比較"))
+                for key, label in (("new_information", "新增資訊"), ("reason", "改判依據")):
+                    item = research_change.get(key)
+                    if isinstance(item, dict):
+                        st.text(label + "：" + str(item.get("text", "")))
+                        identifiers = item.get("source_ids", [])
+                        if isinstance(identifiers, list):
+                            st.caption("本次來源：" + "、".join(str(value) for value in identifiers[:40]))
+            else:
+                st.info("已帶入先前判斷；本次尚未產生有效比較，請核對正文及審稿紀錄。")
+    if isinstance(evidence_search, dict) and evidence_search.get("enabled"):
+        with st.expander("主動補證結果與用量"):
+            st.caption("用量以服務商回傳數值為準；未回傳代表未知。搜尋摘要仍需對照原文。")
+            rounds = evidence_search.get("rounds", [])
+            for row in (rounds[:2] if isinstance(rounds, list) else []):
+                if not isinstance(row, dict):
+                    continue
+                st.text(f"第 {row.get('round', '?')} 輪：{row.get('message') or row.get('status', '未知')}")
+                st.json({"source_ids": row.get("source_ids", []), "usage": row.get("usage", {})})
+            search_warnings = evidence_search.get("warnings", [])
+            for warning in (search_warnings[:10] if isinstance(search_warnings, list) else []):
+                st.text(str(warning))
     if report.get("metadata", {}).get("citation_repaired"):
         st.caption("生成時已經過一次AI引用修正；仍請核對正文與來源是否相符。")
     for warning in report.get("metadata", {}).get("review_warnings", []):

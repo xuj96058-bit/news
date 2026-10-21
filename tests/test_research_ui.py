@@ -15,6 +15,7 @@ with patch('dotenv.load_dotenv'):
     from src.research import ResearchError
     from src.research_progress import run_generation
     from src.research_store import ResearchStore, ResearchStoreError
+    from src.event_store import EventStore
     import src.research_ui as ui
 
 APP = Path(__file__).resolve().parents[1] / 'app.py'
@@ -25,7 +26,9 @@ class ResearchUiHarness:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.db = Path(self.temp.name) / 'reports.db'
+        self.event_db = Path(self.temp.name) / 'news.db'
         self.patch('dotenv.load_dotenv')
+        self.patch('src.event_ui.EventStore', side_effect=lambda _path=None: EventStore(self.event_db))
         self.patch('src.workbench_ui.render_reader_tab')
         self.patch('src.workbench_ui.render_source_operations')
         self.patch('src.chartbook_ui.render_chartbook_tab')

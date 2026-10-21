@@ -31,6 +31,20 @@ class ResearchStoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_research_history_search_and_comparison_metadata_survive_reopen(self):
+        metadata = {
+            "previous_research_summary": {"id": "prior", "body": "Historical hypothesis", "api_key": "PRIVATE"},
+            "research_change": {"status": "weaken", "reason": {"text": "Costs weakened the thesis", "source_ids": ["S1"]}},
+            "evidence_search": {"enabled": True, "rounds": [{"usage": {"total_tokens": 10}, "api_key": "PRIVATE"}]},
+        }
+        saved = self.store.create_report(**report_args(metadata=metadata))
+        with ResearchStore(self.path) as reopened:
+            record = reopened.get_report(saved["id"])
+        self.assertEqual(record["metadata"]["research_change"]["status"], "weaken")
+        self.assertEqual(record["metadata"]["evidence_search"]["rounds"][0]["usage"]["total_tokens"], 10)
+        self.assertEqual(record["metadata"]["previous_research_summary"]["id"], "prior")
+        self.assertNotIn("PRIVATE", json.dumps(record))
+
     def test_quality_brief_and_observation_provenance_survive_save_review_and_edit(self):
         brief = {"ready": False, "requirements": [{"id": "margin", "status": "candidate"}],
                  "observations": [{"source_id": "S1", "metric": "Borrowing", "value": "20",

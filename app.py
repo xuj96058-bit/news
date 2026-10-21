@@ -24,6 +24,7 @@ from src.research_store import ResearchStore
 from src.workbench_ui import render_reader_tab, render_investat_filters, render_source_operations, render_article
 from src.chartbook_ui import render_chartbook_tab
 from src.report_gallery_ui import render_report_gallery, show_report
+from src.event_ui import render_news_analysis_tab
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -136,22 +137,8 @@ tab1, tab2, tab3, reader_tab, chartbook_tab, tab4, report_gallery_tab = st.tabs(
     key="main_navigation", on_change="rerun")
 
 with tab1:
-    news_input = st.text_area("貼上新聞內容", height=200, placeholder="輸入中文或英文新聞...")
-    if st.button("分析", type="primary", disabled=not analysis_available) and news_input.strip():
-        with st.spinner("分析中..."):
-            try:
-                result = analyze_for_session(news_input)
-                st.markdown("### 分析結果")
-                st.text(format_result(result))
-                if st.checkbox("儲存到日報庫", value=True):
-                    saved = save_event(news_input, result.model_dump(), source="web")
-                    if saved:
-                        st.success("已儲存")
-                    else:
-                        st.info("已存在（去重）")
-            except Exception as exc:
-                # Provider exceptions can echo request headers or credentials.
-                st.error(analysis_error_message(exc))
+    render_news_analysis_tab(provider=provider_id, model=selected_model,
+                             api_key=effective_api_key, analysis_available=analysis_available)
 
 with tab2:
     st.subheader("今日市場論說")

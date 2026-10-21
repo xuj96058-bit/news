@@ -23,6 +23,7 @@ METADATA_FIELDS = frozenset({
     "daily_selection", "input_sources", "manually_verified",
     "review_error_reason",
     "data_preparation",
+    "previous_research_summary", "research_change", "evidence_search",
 })
 _PRIVATE_FIELDS = frozenset({
     "key", "apikey", "authorization", "proxyauthorization", "auth", "authkey",
