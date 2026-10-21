@@ -131,7 +131,7 @@ def analyze_for_session(text):
 
 
 st.title("金融新聞影響分析")
-st.caption("以新聞為論據，說清楚論點、影響途徑、反證和下一個驗證點")
+st.caption("簡短分析新聞影響，提供利好與利空評分")
 
 pending_report_display = st.session_state.pop("pending_report_display", None)
 if pending_report_display:
