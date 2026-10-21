@@ -24,6 +24,7 @@ from src.research_store import ResearchStore
 from src.workbench_ui import render_reader_tab, render_investat_filters, render_source_operations, render_article
 from src.chartbook_ui import render_chartbook_tab
 from src.report_gallery_ui import render_report_gallery, show_report
+from src.event_ui import render_news_analysis_tab
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -68,7 +69,7 @@ with st.sidebar:
         st.session_state["ai_model"] = provider.models[0]
     model_choice = st.selectbox("AI 模型", model_options, key="ai_model")
     selected_model = (st.text_input("自訂模型 ID", key="ai_custom_model",
-                                   placeholder="填入此服務商的完整模型 ID").strip()
+                                   placeholder="例如 deepseek/deepseek-v4-pro" if provider_id == "openrouter" else "填入此服務商的完整模型 ID").strip()
                       if model_choice == "自訂模型 ID" else model_choice)
     try:
         validate_provider_model(provider_id, selected_model)
@@ -93,6 +94,11 @@ with st.sidebar:
     else:
         st.info("請先輸入 API key 才能分析；抓取新聞不需要 key。")
     st.caption("模型是否可用取決於你的 API 帳戶權限；選單不會發出付費請求。")
+    if provider_id == "openrouter":
+        st.caption("同一把 OpenRouter key 可選 Grok、GPT、Gemini、Claude 或 DeepSeek；也可填寫完整的「發行者/模型」ID。新聞及報告會透過 OpenRouter 調用此模型，費用由 OpenRouter 帳戶計算。")
+        st.caption("報告流程需要支援 JSON 回覆的模型／端點；自訂 ID 會在實際生成時確認可用。切換到 OpenRouter 後請重新貼上它的 key 並按 Enter。")
+        st.link_button("取得 OpenRouter API key", "https://openrouter.ai/settings/keys")
+        st.link_button("查看 OpenRouter 模型 ID", "https://openrouter.ai/models")
 
     st.subheader("Investat 設定")
     entered_investat_token = st.text_input(
@@ -125,7 +131,7 @@ def analyze_for_session(text):
 
 
 st.title("金融新聞影響分析")
-st.caption("以新聞為論據，說清楚論點、影響途徑、反證和下一個驗證點")
+st.caption("簡短分析新聞影響，提供利好與利空評分")
 
 pending_report_display = st.session_state.pop("pending_report_display", None)
 if pending_report_display:
@@ -136,22 +142,8 @@ tab1, tab2, tab3, reader_tab, chartbook_tab, tab4, report_gallery_tab = st.tabs(
     key="main_navigation", on_change="rerun")
 
 with tab1:
-    news_input = st.text_area("貼上新聞內容", height=200, placeholder="輸入中文或英文新聞...")
-    if st.button("分析", type="primary", disabled=not analysis_available) and news_input.strip():
-        with st.spinner("分析中..."):
-            try:
-                result = analyze_for_session(news_input)
-                st.markdown("### 分析結果")
-                st.text(format_result(result))
-                if st.checkbox("儲存到日報庫", value=True):
-                    saved = save_event(news_input, result.model_dump(), source="web")
-                    if saved:
-                        st.success("已儲存")
-                    else:
-                        st.info("已存在（去重）")
-            except Exception as exc:
-                # Provider exceptions can echo request headers or credentials.
-                st.error(analysis_error_message(exc))
+    render_news_analysis_tab(provider=provider_id, model=selected_model,
+                             api_key=effective_api_key, analysis_available=analysis_available)
 
 with tab2:
     st.subheader("今日市場論說")

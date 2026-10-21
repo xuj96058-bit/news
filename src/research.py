@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from requests.exceptions import Timeout as RequestsTimeout
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 
 
 MAX_ARTICLES = 30
@@ -40,7 +40,7 @@ _SAFE_ERRORS = {
     "empty_sources": "沒有可用的來源正文。請選擇含摘要或正文的新聞，或加入明確的補充證據。",
     "invalid_sources": "來源快照格式不正確，請重新選擇新聞。",
     "source_budget": "來源數量或文字超出報告上限，請減少所選新聞或補充證據。",
-    "invalid_evidence": "補充證據需要標題、正文，以及 official 或 manual 來源類型。",
+    "invalid_evidence": "補充證據需要標題、正文，以及 official、manual 或 search 來源類型。",
     "invalid_dates": "請使用有效日期，並確保起始日期不晚於結束日期。",
     "invalid_topic": "請提供報告主題。",
     "invalid_citations": "AI 報告的來源引用格式無法辨識。請重新生成；來源編號須使用 [S1] 這類格式。",
@@ -203,6 +203,8 @@ def _date_label(value: object) -> str | None:
 
 
 def _source_type(article: dict) -> str:
+    if article.get("source_type") == "search":
+        return "search"
     return "investat" if article.get("source_id") == "investat" else "rss"
 
 
@@ -291,6 +293,9 @@ def prepare_sources(articles: list[dict], *, max_articles: int = 30,
             "supplied_character_count": len(body), "included_character_count": len(included),
             "verification_status": "not_independently_verified",
         })
+        if primary["source_type"] == "search":
+            sources[-1].update(content_scope="search_summary", independent_evidence=False,
+                               independently_verified=False)
     return sources
 
 
@@ -303,7 +308,7 @@ def _validated_sources(sources: list[dict]) -> list[dict]:
         "id", "article_id", "title", "publisher", "url", "published_at", "publication_date",
         "observation_date", "retrieved_at", "retrieved_date", "content_scope", "source_type",
         "origins", "content", "content_truncated", "supplied_character_count", "included_character_count",
-        "verification_status", *_PROVENANCE_FIELDS,
+        "verification_status", "independent_evidence", "independently_verified", *_PROVENANCE_FIELDS,
     }
     clean = []
     seen = set()
@@ -317,7 +322,7 @@ def _validated_sources(sources: list[dict]) -> list[dict]:
             raise ResearchError("invalid_sources")
         if source.get("content_scope") in {"title_only", "filing_notice"}:
             raise ResearchError("invalid_sources")
-        if source.get("source_type") not in {"rss", "investat", "official", "manual"}:
+        if source.get("source_type") not in {"rss", "investat", "official", "manual", "search"}:
             raise ResearchError("invalid_sources")
         content = _text(source["content"])
         total += len(content)
@@ -334,6 +339,13 @@ def _validated_sources(sources: list[dict]) -> list[dict]:
                 item[field] = _text(item[field], limit) or None
         item["content"] = content
         item["verification_status"] = "not_independently_verified"
+        if source.get("source_type") == "search":
+            item["content_scope"] = "search_summary"
+            item["independent_evidence"] = False
+            item["independently_verified"] = False
+        else:
+            item.pop("independent_evidence", None)
+            item.pop("independently_verified", None)
         item["content_truncated"] = source.get("content_truncated") is True
         for field in ("supplied_character_count", "included_character_count"):
             value = item.get(field)
@@ -370,7 +382,7 @@ def prepare_evidence(existing_sources: list[dict], evidence: list[dict]) -> list
     next_id = max((int(source["id"][1:]) for source in sources), default=0) + 1
     now = _now()
     for item in evidence:
-        if (not isinstance(item, dict) or item.get("source_type") not in {"official", "manual"}
+        if (not isinstance(item, dict) or item.get("source_type") not in {"official", "manual", "search"}
                 or not _text(item.get("title")) or not _text(item.get("content"))):
             raise ResearchError("invalid_evidence")
         content = _text(item["content"])
@@ -389,12 +401,15 @@ def prepare_evidence(existing_sources: list[dict], evidence: list[dict]) -> list
             "url": _url(item.get("url")), "published_at": publication_date,
             "publication_date": publication_date, "observation_date": observation_date,
             "retrieved_at": now, "retrieved_date": _date_label(now),
-            "content_scope": "official_evidence" if item["source_type"] == "official" else "manual_evidence",
+            "content_scope": {"official": "official_evidence", "manual": "manual_evidence",
+                              "search": "search_summary"}[item["source_type"]],
             "source_type": item["source_type"], "origins": [], "content": included,
             "content_truncated": len(included) < len(content),
             "supplied_character_count": len(content), "included_character_count": len(included),
             "verification_status": "not_independently_verified",
         })
+        if item["source_type"] == "search":
+            sources[-1].update(independent_evidence=False, independently_verified=False)
         next_id += 1
     return sources
 
@@ -791,7 +806,7 @@ def generate_research_report(topic, sources, *, api_key: str, provider: str = "d
             if remaining <= 0:
                 raise ResearchError("generation_timeout")
             request["timeout"] = min(60.0, remaining)
-        return _stream_content(client.chat.completions.create(**request), on_progress=progress,
+        return _stream_content(client.chat.completions.create(**configure_provider_request(provider, request)), on_progress=progress,
                                register_cancel=register_cancel, deadline=deadline)
 
     try:

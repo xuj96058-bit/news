@@ -176,6 +176,36 @@ class ArgumentationTests(unittest.TestCase):
         findings = essay_findings(parsed, plan())
         self.assertFalse(any(item["section"] in {"watchlist", "arguments.1.condition"} for item in findings))
 
+    def test_credit_ipo_and_relative_return_conditions_are_concrete(self):
+        cases = (
+            "若 CDS 及美元債收益率同步走闊，支持信用壓力擴散；若殖利率收窄則削弱。",
+            "若後續 IPO 定價折扣加深，支持估值壓力延續；若折扣收窄則削弱。",
+            "若應用科技股相對純算力基建股跑贏，支持相對表現出現分化。",
+        )
+        for text in cases:
+            for section in ("watchlist", "arguments.1.condition"):
+                with self.subTest(text=text, section=section):
+                    raw = essay()
+                    if section == "watchlist":
+                        raw["watchlist"] = [paragraph(text)]
+                    else:
+                        raw["arguments"][0]["condition"] = paragraph(text)
+                    parsed, _ = parse_essay(raw, SOURCES)
+                    self.assertFalse(any(item["section"] == section for item in essay_findings(parsed, plan())))
+
+    def test_financial_terms_alone_or_vague_directions_still_need_verification(self):
+        cases = (
+            "持續關注 CDS、收益率及 IPO 折扣。",
+            "科技股相對基建股的表現值得關注。",
+            "若相關情況改善，便支持既有判斷。",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                raw = essay()
+                raw["arguments"][0]["condition"] = paragraph(text)
+                parsed, _ = parse_essay(raw, SOURCES)
+                self.assertTrue(any(item["section"] == "arguments.1.condition" for item in essay_findings(parsed, plan())))
+
     def test_no_arguments_retains_useful_gap_draft_but_not_full_report_approval(self):
         raw = essay()
         raw["arguments"] = []

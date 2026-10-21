@@ -22,10 +22,10 @@ INVESTAT_TOKEN = "synthetic-investat-session-token"
 SERVER_INVESTAT_TOKEN = "synthetic-investat-server-token"
 SERVER_URL = "https://synthetic-provider.example/v1"
 RSS_BUTTON = "AI 分析待處理新聞（最多 5 則）"
-PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini")
+PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini", "openrouter")
 PROVIDER_KEY_VARIABLES = (
     "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
 )
 
 
@@ -47,6 +47,17 @@ class ApiKeyUiTests(unittest.TestCase):
         )
         self.analyze = self.start_patch(patch("src.analyzer.analyze_news", return_value=self.result))
         self.save = self.start_patch(patch("src.collector.save_event", return_value=True))
+        self.event_revision = {"id": "revision-1", "event_id": "event-1", "created_at": "2026-10-21T01:00:00Z",
+            "brief": {"headline": "Synthetic event brief", "summary": {"text": "Synthetic analysis", "source_ids": []}},
+            "sources": [], "metadata": {"review_status": "passed"}}
+        self.event_analyze = self.start_patch(patch("src.event_ui.analyze_event", return_value=self.event_revision))
+        self.start_patch(patch("src.event_ui.brief_to_analysis", return_value=self.result))
+        self.start_patch(patch("src.event_ui.save_event", new=self.save))
+        event_store = MagicMock()
+        event_store.list_events.return_value = [{"id": "event-1", "title": "Synthetic event"}]
+        event_store.get_event.return_value = {"id": "event-1", "title": "Synthetic event"}
+        event_store.list_revisions.return_value = [self.event_revision]
+        self.start_patch(patch("src.event_ui.EventStore")).return_value.__enter__.return_value = event_store
         self.start_patch(patch("src.collector.load_events", return_value=[]))
         self.start_patch(patch("src.report.load_report_events", return_value=[]))
         self.start_patch(patch("src.report.generate_daily_report", return_value="Synthetic report"))
@@ -142,16 +153,20 @@ class ApiKeyUiTests(unittest.TestCase):
         app = self.app()
         for provider in PROVIDERS:
             with self.subTest(provider=provider):
-                self.analyze.reset_mock()
+                self.event_analyze.reset_mock()
                 self.save.reset_mock()
                 model = self.select_provider(app, provider)
                 app.sidebar.text_input(key="ai_api_key").input("  " + SESSION_KEY + "  ").run()
                 app.text_area[0].input("Synthetic manual news").run()
                 self.button(app, "分析").click().run()
                 self.assertEqual(len(app.exception), 0)
-                self.analyze.assert_called_once_with(
-                    "Synthetic manual news", model=model, api_key=SESSION_KEY, provider=provider,
-                )
+                self.event_analyze.assert_called_once()
+                self.assertEqual(self.event_analyze.call_args.args[0][0]["content"], "Synthetic manual news")
+                self.assertEqual(self.event_analyze.call_args.kwargs["model"], model)
+                self.assertEqual(self.event_analyze.call_args.kwargs["api_key"], SESSION_KEY)
+                self.assertEqual(self.event_analyze.call_args.kwargs["provider"], provider)
+                self.assertEqual(self.event_analyze.call_args.kwargs["search_api_key"], "")
+                self.analyze.assert_not_called()
                 self.save.assert_called_once_with("Synthetic manual news", self.result.model_dump(), source="web")
                 self.assertNotIn(SESSION_KEY, self.rendered_text(app))
                 self.assertNotIn(SERVER_KEY, self.rendered_text(app))
@@ -196,9 +211,11 @@ class ApiKeyUiTests(unittest.TestCase):
         self.assert_analysis_disabled(app, False)
         app.text_area[0].input("Synthetic fallback news").run()
         self.button(app, "分析").click().run()
-        self.analyze.assert_called_once_with(
-            "Synthetic fallback news", model=model, api_key=SERVER_KEY, provider="deepseek",
-        )
+        self.event_analyze.assert_called_once()
+        self.assertEqual(self.event_analyze.call_args.args[0][0]["content"], "Synthetic fallback news")
+        self.assertEqual(self.event_analyze.call_args.kwargs["model"], model)
+        self.assertEqual(self.event_analyze.call_args.kwargs["api_key"], SERVER_KEY)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "deepseek")
         self.assertNotIn(SERVER_KEY, self.rendered_text(app))
         self.assertEqual(os.environ["DEEPSEEK_API_KEY"], SERVER_KEY)
 
@@ -254,15 +271,57 @@ class ApiKeyUiTests(unittest.TestCase):
         self.assert_analysis_disabled(app, False)
         app.text_area[0].input("Synthetic custom model news").run()
         self.button(app, "分析").click().run()
-        self.analyze.assert_called_once_with(
-            "Synthetic custom model news", model="deepseek-custom-test", api_key=SESSION_KEY, provider="deepseek",
-        )
+        self.event_analyze.assert_called_once()
+        self.assertEqual(self.event_analyze.call_args.args[0][0]["content"], "Synthetic custom model news")
+        self.assertEqual(self.event_analyze.call_args.kwargs["model"], "deepseek-custom-test")
+        self.assertEqual(self.event_analyze.call_args.kwargs["api_key"], SESSION_KEY)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "deepseek")
 
     def test_valid_environment_provider_can_select_initial_provider(self):
         os.environ["LLM_PROVIDER"] = "anthropic"
         app = self.app()
         self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "anthropic")
         self.assertNotEqual(app.sidebar.selectbox(key="ai_model").value, os.environ["LLM_MODEL"])
+
+    def test_openrouter_environment_key_is_available_only_for_router(self):
+        os.environ.update(LLM_PROVIDER="openrouter", OPENROUTER_API_KEY=SERVER_KEY)
+        app = self.app()
+        self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "openrouter")
+        self.assertIn("OpenRouter", app.sidebar.text_input(key="ai_api_key").proto.placeholder)
+        self.assert_analysis_disabled(app, False)
+        self.assertNotIn(SERVER_KEY, self.rendered_text(app))
+        self.select_provider(app, "deepseek")
+        self.assert_analysis_disabled(app)
+        self.select_provider(app, "openrouter")
+        app.text_area[0].input("Synthetic router news").run()
+        self.button(app, "分析").click().run()
+        self.assertEqual(self.event_analyze.call_args.kwargs["api_key"], SERVER_KEY)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "openrouter")
+
+    def test_openrouter_custom_model_routes_news_and_rss_and_clears_on_switch(self):
+        app = self.app()
+        self.select_provider(app, "openrouter")
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        app.sidebar.selectbox(key="ai_model").select("自訂模型 ID").run()
+        for invalid in ("gpt-custom", "https://example.org/model", "publisher/bad model"):
+            app.sidebar.text_input(key="ai_custom_model").input(invalid).run()
+            self.assert_analysis_disabled(app)
+        model = "anthropic/claude-custom:free"
+        app.sidebar.text_input(key="ai_custom_model").input("  " + model + "  ").run()
+        self.assert_analysis_disabled(app, False)
+        app.text_area[0].input("Synthetic namespaced model news").run()
+        self.button(app, "分析").click().run()
+        self.assertEqual(self.event_analyze.call_args.kwargs["model"], model)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "openrouter")
+        self.button(app, RSS_BUTTON).click().run()
+        self.assertEqual(self.analyze.call_args.kwargs, {
+            "model": model, "api_key": SESSION_KEY, "provider": "openrouter",
+        })
+        self.select_provider(app, "anthropic")
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assertEqual(app.session_state["ai_custom_model"], "")
+        self.assert_analysis_disabled(app)
+        self.assertEqual(len(app.exception), 0)
 
     def test_sessions_are_isolated_and_clear_without_fallback_disables_analysis(self):
         first = self.app()
@@ -283,7 +342,7 @@ class ApiKeyUiTests(unittest.TestCase):
             self.assertEqual(os.environ[name], "")
 
     def test_manual_provider_error_does_not_echo_credentials_or_response(self):
-        self.analyze.side_effect = RuntimeError("Authorization: Bearer " + SESSION_KEY + " raw-provider-body")
+        self.event_analyze.side_effect = RuntimeError("Authorization: Bearer " + SESSION_KEY + " raw-provider-body")
         app = self.app()
         app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
         app.text_area[0].input("Synthetic failing news").run()
@@ -307,16 +366,14 @@ class ApiKeyUiTests(unittest.TestCase):
         self.assertNotIn(SESSION_KEY, self.rendered_text(app))
         self.assertNotIn("raw-provider-body", self.rendered_text(app))
 
-    def test_stale_analyzer_signature_shows_restart_hint_without_calling_provider(self):
+    def test_stale_rss_analyzer_signature_shows_restart_hint_without_calling_provider(self):
         old_analyzer = lambda text, model=None, *, api_key=None, base_url=None: self.analyze(text, model=model)
         with patch("src.analyzer.analyze_news", new=old_analyzer):
             app = self.app()
             app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
-            app.text_area[0].input("Synthetic news with stale analyzer").run()
-            self.button(app, "分析").click().run()
+            self.button(app, RSS_BUTTON).click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(len(app.error), 1)
-        self.assertIn("重新啟動 Streamlit", app.error[0].value)
+        self.store.mark_error.assert_called_once_with(1, "AnalyzerReloadRequired")
         self.assertNotIn(SESSION_KEY, self.rendered_text(app))
         self.analyze.assert_not_called()
         self.save.assert_not_called()

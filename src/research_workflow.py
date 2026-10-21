@@ -17,7 +17,7 @@ from collections.abc import Callable
 from openai import OpenAI
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research_quality import build_research_brief
 from .research import (
     MAX_PROMPT_CHARS, MAX_REPORT_TOKENS, MAX_RESPONSE_CHARS, ResearchError,
@@ -473,7 +473,10 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
                                register_cancel: Callable[[Callable[[], None]], None] | None = None,
                                on_draft: Callable[[dict], None] | None = None, client=None,
                                research_brief: dict | None = None, report_mode: str = "legacy",
-                               writing_style: str = "legacy", retrieve_sources: bool = True) -> dict:
+                               writing_style: str = "legacy", retrieve_sources: bool = True,
+                               search_enabled=False, search_api_key="", include_x=False,
+                               max_search_rounds=1, max_search_turns=2, previous_research=None,
+                               searcher=None) -> dict:
     """Write, acknowledge persistence, then review with at most two AI calls.
 
     Invalid citation evidence never discards generated text. Partial writer
@@ -489,7 +492,12 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
         return generate_argumentative_report(topic, sources, api_key=api_key, provider=provider,
             model=model, as_of=as_of, instructions=instructions, on_progress=on_progress,
             register_cancel=register_cancel, on_draft=on_draft, client=client,
-            research_brief=research_brief, retrieve_sources=retrieve_sources)
+            research_brief=research_brief, retrieve_sources=retrieve_sources,
+            search_enabled=search_enabled, search_api_key=search_api_key, include_x=include_x,
+            max_search_rounds=max_search_rounds, max_search_turns=max_search_turns,
+            previous_research=previous_research, searcher=searcher)
+    if search_enabled or previous_research is not None:
+        raise ValueError("主動補證與前次研究比較目前適用於議論文式研究報告。")
     if writing_style != "legacy":
         raise ValueError("不支援的寫作方式。")
     _progress(on_progress, "preparing")
@@ -570,7 +578,7 @@ def generate_research_workflow(topic, sources, *, api_key: str, provider: str = 
             request.update(temperature=0.2, max_tokens=MAX_REPORT_TOKENS)
         if provider == "deepseek":
             request["extra_body"] = {"thinking": {"type": "disabled"}}
-        captured = _CapturedStream(client.chat.completions.create(**request))
+        captured = _CapturedStream(client.chat.completions.create(**configure_provider_request(provider, request)))
         try:
             return _stream_content(captured, on_progress=progress,
                                    register_cancel=register_cancel, deadline=deadline)
