@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 
 MAX_COMPARISON_ARTICLES = 12
 MAX_ARTICLE_CHARS = 9000
@@ -103,7 +103,7 @@ def _complete(system, user, *, provider, model, api_key):
             kwargs["max_completion_tokens" if provider == "openai" else "max_tokens"] = 5000
             if provider == "deepseek":
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            return _nonstream_content(client.chat.completions.create(**kwargs))
+            return _nonstream_content(client.chat.completions.create(**configure_provider_request(provider, kwargs)))
     except (ModelResponseError, ProviderConfigurationError):
         raise
     except Exception as exc:

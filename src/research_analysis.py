@@ -7,7 +7,7 @@ import time
 from openai import OpenAI
 
 from .analysis_errors import ModelResponseError, ProviderAPIError, ProviderConfigurationError
-from .llm_providers import claude_completion, get_provider, validate_provider_model
+from .llm_providers import claude_completion, configure_provider_request, get_provider, validate_provider_model
 from .research import (
     MAX_PROMPT_CHARS, MAX_REPORT_TOKENS, ResearchError, _date_label,
     _nonstream_content, _progress, _stream_content, _text,
@@ -87,7 +87,7 @@ def extract_research_observations(topic, sources, *, api_key, provider="deepseek
                 request.update(temperature=0.1, max_tokens=MAX_REPORT_TOKENS)
             if provider == "deepseek":
                 request["extra_body"] = {"thinking": {"type": "disabled"}}
-            raw = _stream_content(client.chat.completions.create(**request), on_progress=on_progress,
+            raw = _stream_content(client.chat.completions.create(**configure_provider_request(provider, request)), on_progress=on_progress,
                                   register_cancel=register_cancel, deadline=deadline)
         if time.monotonic() > deadline:
             raise ResearchError("generation_timeout")

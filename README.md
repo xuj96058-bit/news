@@ -223,12 +223,15 @@ python -m src.report
 | xAI / Grok | `grok-4.7` | `XAI_API_KEY` | [JSON 輸出](https://docs.x.ai/developers/model-capabilities/text/structured-outputs) |
 | Anthropic / Claude | `claude-sonnet-5`、`claude-opus-5-5`、`claude-haiku-4-5` | `ANTHROPIC_API_KEY` | [原生 Messages API](https://platform.claude.com/docs/en/api/messages/create) |
 | Google / Gemini | `gemini-3.8-flash` | `GEMINI_API_KEY` | [相容 API](https://ai.google.dev/gemini-api/docs/openai) |
+| OpenRouter | `deepseek/deepseek-v4-pro`、`openai/gpt-6.1-sol`、`x-ai/grok-4.7`、`anthropic/claude-sonnet-5`、`google/gemini-3.8-flash` | `OPENROUTER_API_KEY` | [相容 API](https://openrouter.ai/docs/quickstart) |
+
+選擇 **OpenRouter** 後可使用同一把 OpenRouter key 切換上述模型，或輸入完整的「發行者/模型」ID。新聞查詢的規劃、分析及審稿、RSS 分析、研究閱讀及研究報告都使用所選模型並透過 OpenRouter 計費。請使用支援 JSON 回覆的文字模型；程式要求路由端點支援傳入參數，避免忽略 JSON 格式要求。OpenRouter 只讀取 `OPENROUTER_API_KEY` 或本頁輸入的 key，不借用其他服務商的 key。選單依 2026-10-21 OpenRouter 公開模型清單核對；可用性仍由帳戶與端點決定。
 
 頁面輸入的 key 只保留在目前工作階段，優先於所選服務商的本機設定，僅送往該服務商的官方 API。不寫入 `.env`、新聞資料庫或 Git，也不修改其他使用者的環境設定。**切換服務商會清除輸入的 key 並重設模型**；可隨時按「清除輸入的 key」。清除或未輸入時，只會使用所選服務商對應的本機 key；兩者皆未設定時停用分析按鈕，抓取新聞仍可使用。關閉或重新載入頁面後可能需要重新輸入。
 
-`LLM_PROVIDER` 可設定網頁預設服務商：`deepseek`（預設）、`openai`、`xai`、`anthropic`、`gemini`。舊版把 DeepSeek key 放在 `OPENAI_API_KEY` 的設定，只有在 `OPENAI_BASE_URL` 指向 DeepSeek，或未設定端點且明確指定 `LLM_PROVIDER=deepseek` 時，網頁才會將它用於 DeepSeek；同一環境 key 不會同時提供給 OpenAI 和 DeepSeek。命令列既有流程仍使用 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 與 `LLM_MODEL` 的相容 API 設定。
+`LLM_PROVIDER` 可設定網頁預設服務商：`deepseek`（預設）、`openai`、`xai`、`anthropic`、`gemini`、`openrouter`。舊版把 DeepSeek key 放在 `OPENAI_API_KEY` 的設定，只有在 `OPENAI_BASE_URL` 指向 DeepSeek，或未設定端點且明確指定 `LLM_PROVIDER=deepseek` 時，網頁才會將它用於 DeepSeek；同一環境 key 不會同時提供給 OpenAI 和 DeepSeek。命令列既有流程仍使用 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 與 `LLM_MODEL` 的相容 API 設定。
 
-更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。自動測試使用模擬回應驗證五家服務商的請求及解析。另於 2026-10-21 使用一篇 Investat 實際材料及 DeepSeek `deepseek-v4-pro` 完成新聞分析和議論文研究報告的連線、解析、獨立審稿與保存測試，並確認相同事件輸入會使用快取；單一來源的證據缺口仍標示為待核對。這項測試未涵蓋其他模型或 xAI Web／X 補證，也不代表模型的推論已獨立核實。
+更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。自動測試使用模擬回應驗證六家服務商的請求及解析。另於 2026-10-21 使用一篇 Investat 實際材料及 DeepSeek `deepseek-v4-pro` 完成新聞分析和議論文研究報告的連線、解析、獨立審稿與保存測試，並確認相同事件輸入會使用快取；單一來源的證據缺口仍標示為待核對。這項測試未涵蓋其他模型或 xAI Web／X 補證，也不代表模型的推論已獨立核實。
 
 ### 在網頁抓取 Investat
 

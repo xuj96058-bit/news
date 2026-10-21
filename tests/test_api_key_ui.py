@@ -22,10 +22,10 @@ INVESTAT_TOKEN = "synthetic-investat-session-token"
 SERVER_INVESTAT_TOKEN = "synthetic-investat-server-token"
 SERVER_URL = "https://synthetic-provider.example/v1"
 RSS_BUTTON = "AI 分析待處理新聞（最多 5 則）"
-PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini")
+PROVIDERS = ("deepseek", "openai", "xai", "anthropic", "gemini", "openrouter")
 PROVIDER_KEY_VARIABLES = (
     "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
 )
 
 
@@ -282,6 +282,46 @@ class ApiKeyUiTests(unittest.TestCase):
         app = self.app()
         self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "anthropic")
         self.assertNotEqual(app.sidebar.selectbox(key="ai_model").value, os.environ["LLM_MODEL"])
+
+    def test_openrouter_environment_key_is_available_only_for_router(self):
+        os.environ.update(LLM_PROVIDER="openrouter", OPENROUTER_API_KEY=SERVER_KEY)
+        app = self.app()
+        self.assertEqual(app.sidebar.selectbox(key="ai_provider").value, "openrouter")
+        self.assertIn("OpenRouter", app.sidebar.text_input(key="ai_api_key").proto.placeholder)
+        self.assert_analysis_disabled(app, False)
+        self.assertNotIn(SERVER_KEY, self.rendered_text(app))
+        self.select_provider(app, "deepseek")
+        self.assert_analysis_disabled(app)
+        self.select_provider(app, "openrouter")
+        app.text_area[0].input("Synthetic router news").run()
+        self.button(app, "分析").click().run()
+        self.assertEqual(self.event_analyze.call_args.kwargs["api_key"], SERVER_KEY)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "openrouter")
+
+    def test_openrouter_custom_model_routes_news_and_rss_and_clears_on_switch(self):
+        app = self.app()
+        self.select_provider(app, "openrouter")
+        app.sidebar.text_input(key="ai_api_key").input(SESSION_KEY).run()
+        app.sidebar.selectbox(key="ai_model").select("自訂模型 ID").run()
+        for invalid in ("gpt-custom", "https://example.org/model", "publisher/bad model"):
+            app.sidebar.text_input(key="ai_custom_model").input(invalid).run()
+            self.assert_analysis_disabled(app)
+        model = "anthropic/claude-custom:free"
+        app.sidebar.text_input(key="ai_custom_model").input("  " + model + "  ").run()
+        self.assert_analysis_disabled(app, False)
+        app.text_area[0].input("Synthetic namespaced model news").run()
+        self.button(app, "分析").click().run()
+        self.assertEqual(self.event_analyze.call_args.kwargs["model"], model)
+        self.assertEqual(self.event_analyze.call_args.kwargs["provider"], "openrouter")
+        self.button(app, RSS_BUTTON).click().run()
+        self.assertEqual(self.analyze.call_args.kwargs, {
+            "model": model, "api_key": SESSION_KEY, "provider": "openrouter",
+        })
+        self.select_provider(app, "anthropic")
+        self.assertEqual(app.sidebar.text_input(key="ai_api_key").value, "")
+        self.assertEqual(app.session_state["ai_custom_model"], "")
+        self.assert_analysis_disabled(app)
+        self.assertEqual(len(app.exception), 0)
 
     def test_sessions_are_isolated_and_clear_without_fallback_disables_analysis(self):
         first = self.app()
