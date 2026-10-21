@@ -17,7 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .analysis_errors import ModelResponseError, ProviderConfigurationError
-from .argumentation import PLAN_SYSTEM, _clean_prose, _decode, parse_plan
+from .argumentation import CAUSAL_EVIDENCE_RULES, PLAN_SYSTEM, _clean_prose, _decode, parse_plan
 from .llm_providers import get_provider, validate_provider_model
 from .research import ResearchError, _number_values, _url, prepare_sources
 
@@ -27,7 +27,7 @@ MAX_HISTORY = 3
 MAX_SOURCES = 20
 MAX_SOURCE_CHARS = 6000
 MAX_PROMPT_CHARS = 100000
-WORKFLOW_VERSION = 1
+WORKFLOW_VERSION = 2
 
 
 class Statement(BaseModel):
@@ -38,7 +38,8 @@ class Statement(BaseModel):
 
 class EventImpact(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    ticker: str = Field(min_length=1, max_length=20)
+    ticker: str = Field(min_length=1, max_length=20,
+        description="只使用 sources 明文標示的真實證券代碼，不可填公司名稱或推測代碼；沒有代碼則省略整項 impact。")
     direction: Literal["positive", "negative", "neutral", "mixed", "uncertain"]
     mechanism: Statement
     horizon: str = Field(min_length=1, max_length=100)
@@ -68,14 +69,17 @@ history 是之前的模型判斷，不是證據。history 的來源已重新編�
 每段 source_ids 只引用提供的 ID，引用存在不代表內容已驗證。不得產生 URL、Markdown 或行內引用；程式會顯示來源。
 無法支持的判斷就縮小範圍；不要把模型自評當作投資成功機率。counterarguments 要保留最強反面因素，無反證資料時明示替代假說尚未證實。
 watchlist 必須具體說明哪個後續披露／指標會支持或推翻判斷，不可只寫持續關注。不推薦交易或捏造股票代碼。
-"""
+""" + CAUSAL_EVIDENCE_RULES
 
 _WRITER = _RULES + """
-輸出一個 JSON object，欄位嚴格如下：
+輸出一個 JSON object，必須完全遵守輸入的 writer_schema，欄位嚴格如下：
 headline（短標題，不加數字）；summary、new_information、judgement_reason 為 {"text":"正文","source_ids":["S1"]}。
 facts 是 1–5 個相同格式的段落。counterarguments 為 1–3 段、watchlist 為 1–4 段。
 judgement 為 initial/maintained/strengthened/weakened/reversed/uncertain：history 為空必須 initial；有歷史時說明相較上次維持、加強、削弱、推翻或無法判定。
-impacts 是 0–6 項 {"ticker":"可辨識的代碼","direction":"positive/negative/neutral/mixed/uncertain","mechanism":段落,"horizon":"短期／中期等定性時間跨度"}。
+impacts 是 0–6 項 {"ticker":"來源明文標示的證券代碼","direction":"positive/negative/neutral/mixed/uncertain","mechanism":{"text":"有條件的影響機制","source_ids":["S1"]},"horizon":"短期／中期等定性時間跨度"}。
+mechanism 與所有段落一樣，必須是同時具有 text 和 source_ids 的 object，不能是純文字；source_ids 只能引用 sources 中提供的 ID。
+ticker 只可填 sources 明文標示的真實證券代碼，不可用公司名稱代替，不可憑記憶推測代碼。
+來源沒有明文提供可辨識的證券代碼時，impacts 必須為 []；仍可在 judgement_reason 說明公司或產業的有條件影響。
 missing_evidence 是最多 12 個具體待補資料字串；confidence 為 low/medium/high。資料只有摘要或存在重要缺口時不可 high。
 summary 要有明確但有條件的結論；new_information 只寫本次新增內容並區分歷史材料，不得把舊內容寫成新進展。
 """
@@ -347,7 +351,7 @@ def analyze_event(articles, *, topic, event_id=None, store, provider="deepseek",
                 break
             packet["sources"] = sources
             plan = parse_plan(request(planning_system, packet, "planning"), sources, topic)
-    packet.update(argument_plan=plan)
+    packet.update(argument_plan=plan, writer_schema=EventBrief.model_json_schema())
     brief, warnings = parse_event_brief(request(_WRITER, packet, "writing"), sources, has_history=bool(history))
     # Preserve planner gaps even if the writer omits them without new evidence.
     brief["missing_evidence"] = list(dict.fromkeys(brief["missing_evidence"] + plan["missing_evidence"]))[:12]
@@ -373,7 +377,7 @@ def analyze_event(articles, *, topic, event_id=None, store, provider="deepseek",
     progress("reviewing")
     try:
         result = _decode(request(_REVIEWER, {**packet, "writer_draft": brief,
-            "writer_schema": EventBrief.model_json_schema(), "validation_warnings": warnings}, "reviewing"))
+            "validation_warnings": warnings}, "reviewing"))
         if (set(result) != {"brief", "findings", "verdict"}
                 or result["verdict"] not in {"pass", "needs_review"}
                 or not isinstance(result["findings"], list) or len(result["findings"]) > 12

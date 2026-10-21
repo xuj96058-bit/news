@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.analysis_errors import ModelResponseError
-from src.event_analysis import _context, _current_sources, analyze_event, brief_to_analysis, parse_event_brief
+from src.event_analysis import EventBrief, _context, _current_sources, analyze_event, brief_to_analysis, parse_event_brief
 from src.event_store import EventStore, EventStoreError
 
 
@@ -91,6 +91,35 @@ class EventAnalysisTests(unittest.TestCase):
         self.assertTrue(again["metadata"]["cached"])
         self.assertEqual(len(self.packets), 3)
         self.assertEqual(len(self.store.list_revisions(first["event_id"])), 1)
+
+    def test_writer_and_reviewer_receive_the_same_complete_output_schema(self):
+        self.seed_responses()
+        self.run_analysis()
+        writing = next(packet for stage, packet, _ in self.packets if stage == "writing")
+        reviewing = next(packet for stage, packet, _ in self.packets if stage == "reviewing")
+        self.assertEqual(writing["writer_schema"], EventBrief.model_json_schema())
+        self.assertEqual(reviewing["writer_schema"], writing["writer_schema"])
+        mechanism = writing["writer_schema"]["$defs"]["EventImpact"]["properties"]["mechanism"]
+        self.assertEqual(mechanism, {"$ref": "#/$defs/Statement"})
+        self.assertEqual(writing["writer_schema"]["$defs"]["Statement"]["required"], ["text", "source_ids"])
+
+    def test_plain_text_impact_mechanism_is_rejected_without_retry_or_review(self):
+        bad = brief()
+        bad["impacts"][0]["mechanism"] = "Sales growth can be offset by input costs."
+        self.responses = [plan(), bad]
+        with self.assertRaises(ModelResponseError):
+            self.run_analysis()
+        self.assertEqual(self.store.list_events(), [])
+        self.assertEqual([row[0] for row in self.packets], ["planning", "writing"])
+
+    def test_nested_impact_citation_must_belong_to_supplied_sources(self):
+        bad = brief()
+        bad["impacts"][0]["mechanism"]["source_ids"] = ["S999"]
+        self.responses = [plan(), bad]
+        with self.assertRaises(ModelResponseError):
+            self.run_analysis()
+        self.assertEqual(self.store.list_events(), [])
+        self.assertEqual([row[0] for row in self.packets], ["planning", "writing"])
 
     def test_changed_news_uses_remapped_raw_evidence_and_labels_prior_judgement(self):
         self.seed_responses()

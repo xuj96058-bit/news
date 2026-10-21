@@ -228,7 +228,7 @@ python -m src.report
 
 `LLM_PROVIDER` 可設定網頁預設服務商：`deepseek`（預設）、`openai`、`xai`、`anthropic`、`gemini`。舊版把 DeepSeek key 放在 `OPENAI_API_KEY` 的設定，只有在 `OPENAI_BASE_URL` 指向 DeepSeek，或未設定端點且明確指定 `LLM_PROVIDER=deepseek` 時，網頁才會將它用於 DeepSeek；同一環境 key 不會同時提供給 OpenAI 和 DeepSeek。命令列既有流程仍使用 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 與 `LLM_MODEL` 的相容 API 設定。
 
-更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。測試使用模擬回應驗證五家服務商的請求及解析，未用真實 key 驗證帳戶權限或產生付費分析。
+更新程式後若頁面仍載入舊模組，請重新啟動 Streamlit。手動分析失敗時會分別提示 API 驗證、用量限制、模型空回應或格式錯誤；`TypeError` 本身不表示 key 無效。錯誤提示不顯示服務商的原始回應或密鑰。自動測試使用模擬回應驗證五家服務商的請求及解析。另於 2026-10-21 使用一篇 Investat 實際材料及 DeepSeek `deepseek-v4-pro` 完成新聞分析和議論文研究報告的連線、解析、獨立審稿與保存測試，並確認相同事件輸入會使用快取；單一來源的證據缺口仍標示為待核對。這項測試未涵蓋其他模型或 xAI Web／X 補證，也不代表模型的推論已獨立核實。
 
 ### 在網頁抓取 Investat
 
