@@ -13,7 +13,10 @@ CHAT_ID = -1001234567890
 CONFIG = SimpleNamespace(token="synthetic-token-never-render", chat_id=CHAT_ID)
 
 def feed_script():
-    from src.telegram_ui import render_telegram_feed
+    import streamlit as st
+    from src.telegram_ui import _dismiss_article, render_telegram_feed
+    if st.session_state.pop("_test_dismiss_article", False):
+        _dismiss_article()
     render_telegram_feed()
 
 class FeedStore:
@@ -81,24 +84,44 @@ class TelegramUiTests(unittest.TestCase):
         self.assertNotIn("TELEGRAM_BOT_TOKEN", self.rendered(app))
         self.start.assert_not_called()
         self.open_store.assert_not_called()
-    def test_untrusted_content_is_literal_and_link_is_generated(self):
+    def test_clicked_article_is_literal_and_has_no_original_link(self):
         unsafe = "<script>alert('no')</script>\n![tracking](https://evil.invalid/pixel) :red[no] $x$"
         item = post(4, text=unsafe)
         item["media_type"] = "photo"
         item["edited_at"] = NOW.isoformat()
         self.store.posts = [item, post(5, chat_id=-1009999999999)]
         app = self.app()
-        self.assertEqual(len(app.link_button), 1)
-        self.assertEqual(app.link_button[0].url, "https://t.me/c/1234567890/4")
-        self.assertIn(unsafe.split("\n", 1)[1], [element.value for element in app.text])
+        self.assertFalse(app.link_button)
+        self.assertNotIn(unsafe, [element.value for element in app.text])
+        app.button(key="telegram_open_4").click().run()
+        self.assertFalse(app.exception)
+        self.assertFalse(app.link_button)
+        self.assertEqual([element.value for element in app.text].count(unsafe), 1)
         self.assertIn(r"\<script\>", app.button(key="telegram_open_4").label)
         self.assertNotIn("<script>", "".join(element.value for element in app.html))
         self.assertIn("2026-10-22 18:00", self.rendered(app))
-        self.assertIn("原文附有附件", self.rendered(app))
+        self.assertIn("此則新聞包含附件", self.rendered(app))
         self.assertNotIn(CONFIG.token, self.rendered(app))
         self.assertNotIn("新聞標題第 5 則", self.rendered(app))
         self.assertNotIn("News 測試頻道", self.rendered(app))
         self.assertNotIn("上次成功同步", self.rendered(app))
+        self.assertNotIn("查看原文", self.rendered(app))
+    def test_dialog_opens_only_on_click_and_can_be_dismissed_and_reopened(self):
+        self.store.posts = [post(1), post(2)]
+        app = self.app()
+        self.assertNotIn("telegram_feed_dialog_id", app.session_state)
+        app.button(key="telegram_open_1").click().run()
+        self.assertEqual(app.session_state["telegram_feed_dialog_id"], 1)
+        app.session_state["_test_dismiss_article"] = True
+        app.run()
+        self.assertNotIn("telegram_feed_dialog_id", app.session_state)
+        self.assertNotIn(self.store.posts[0]["text"], [item.value for item in app.text])
+        app.button(key="telegram_open_1").click().run()
+        self.assertEqual(app.session_state["telegram_feed_dialog_id"], 1)
+        app.button(key="telegram_open_2").click().run()
+        self.assertEqual(app.session_state["telegram_feed_dialog_id"], 2)
+        self.assertIn(self.store.posts[1]["text"], [item.value for item in app.text])
+        self.assertFalse(app.exception)
     def test_selection_and_load_more(self):
         self.store.posts = [post(index) for index in range(1, 46)]
         app = self.app()
@@ -121,7 +144,8 @@ class TelegramUiTests(unittest.TestCase):
         app.button(key="telegram_feed_more").click().run()
         app.text_input(key="telegram_feed_search").set_value("abc").run()
         self.assertEqual(app.session_state["telegram_feed_limit"], 20)
-        self.assertEqual(app.session_state["telegram_feed_selected"], 60)
+        self.assertNotIn("telegram_feed_selected", app.session_state)
+        self.assertEqual(app.button(key="telegram_open_60").label, "ABC 公司業績")
         self.assertEqual(self.store.queries[-1]["query"], "abc")
         app.text_input(key="telegram_feed_search").set_value("does not exist").run()
         self.assertIn("沒有符合條件", self.rendered(app))
@@ -134,9 +158,11 @@ class TelegramUiTests(unittest.TestCase):
         app = self.app()
         self.assertEqual(app.button(key="telegram_open_1").label,
                          paragraph[:HEADLINE_LIMIT] + "…")
-        self.assertIn(paragraph + "\n\n來源資料", [item.value for item in app.text])
+        self.assertNotIn(paragraph + "\n\n來源資料", [item.value for item in app.text])
         self.assertTrue(any(item.value.startswith(paragraph[HEADLINE_LIMIT:HEADLINE_LIMIT + 20])
                             for item in app.text))
+        app.button(key="telegram_open_1").click().run()
+        self.assertEqual([item.value for item in app.text].count(paragraph + "\n\n來源資料"), 1)
 
     def test_dates_include_partial_eighth_day_and_scope_reader(self):
         yesterday = NOW.astimezone(ZoneInfo("Asia/Hong_Kong")).date() - timedelta(days=1)
@@ -145,7 +171,9 @@ class TelegramUiTests(unittest.TestCase):
         self.assertEqual(app.selectbox(key="telegram_feed_day").options,
                          ["最近 7 天", "今天", "昨天", "10月20日", "10月19日", "10月18日", "10月17日", "10月16日", "10月15日"])
         app.selectbox(key="telegram_feed_day").select(yesterday).run()
-        self.assertEqual(app.session_state["telegram_feed_selected"], 30)
+        self.assertNotIn("telegram_feed_selected", app.session_state)
+        self.assertNotIn("telegram_feed_dialog_id", app.session_state)
+        self.assertEqual(app.button(key="telegram_open_30").label, "新聞標題第 30 則")
         self.assertEqual(self.store.queries[-1]["day"], yesterday)
         self.assertFalse([b for b in app.button if b.key == "telegram_open_1"])
     def test_new_posts_wait_for_acceptance_and_keep_current_article(self):
@@ -167,7 +195,8 @@ class TelegramUiTests(unittest.TestCase):
         app.button(key="telegram_open_2").click().run()
         self.now.return_value = NOW + timedelta(minutes=1)
         app.run()
-        self.assertEqual(app.session_state["telegram_feed_selected"], 1)
+        self.assertNotIn("telegram_feed_selected", app.session_state)
+        self.assertNotIn("telegram_feed_dialog_id", app.session_state)
         self.assertNotIn("到期不應留在閱讀欄", self.rendered(app))
         self.assertFalse([b for b in app.button if b.key == "telegram_open_2"])
     def test_load_more_beyond_backend_batch_limit(self):

@@ -38,18 +38,6 @@ def _available_dates(now):
     return [latest - timedelta(days=index) for index in range((latest - earliest).days + 1)]
 
 
-def _post_link(post):
-    """Only generate a Telegram permalink from validated numeric identifiers."""
-    try:
-        chat_id, message_id = int(post["chat_id"]), int(post["message_id"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    channel_id = -chat_id - 1_000_000_000_000
-    if not 1 <= channel_id <= 997_852_516_352 or message_id <= 0:
-        return None
-    return f"https://t.me/c/{channel_id}/{message_id}"
-
-
 class ReceiverManager:
     """One receiver per app process; the backend also leases across processes."""
 
@@ -123,6 +111,7 @@ def _reset_feed():
     st.session_state["telegram_feed_limit"] = PAGE_SIZE
     st.session_state.pop("telegram_feed_anchor", None)
     st.session_state.pop("telegram_feed_selected", None)
+    _dismiss_article()
 
 
 def _show_latest():
@@ -137,6 +126,11 @@ def _load_more():
 
 def _select_post(message_id):
     st.session_state["telegram_feed_selected"] = message_id
+    st.session_state["telegram_feed_dialog_id"] = message_id
+
+
+def _dismiss_article():
+    st.session_state.pop("telegram_feed_dialog_id", None)
 
 
 def _headline(post):
@@ -149,16 +143,6 @@ def _preview(post):
     lines = [line.strip() for line in str(post.get("text") or "").splitlines() if line.strip()]
     text = " ".join([lines[0][HEADLINE_LIMIT:], *lines[1:]]).strip() if lines else ""
     return text[:150] + ("…" if len(text) > 150 else "")
-
-
-def _article_body(post):
-    content = str(post.get("text") or "").strip()
-    if not content:
-        return "此則新聞沒有文字內容，請查看原文。"
-    first, separator, rest = content.partition("\n")
-    # The complete first line already appears in the headline. If it had to be
-    # shortened, retain the complete original in the body instead.
-    return rest.lstrip() if len(first.strip()) <= HEADLINE_LIMIT else content
 
 
 def _escape_label(text):
@@ -184,7 +168,6 @@ def _day_label(day, now):
 
 
 _FEED_STYLE = """<style>
-.st-key-realtime_news_list {padding-right: 1.1rem; border-right: 1px solid color-mix(in srgb, currentColor 14%, transparent);}
 .st-key-realtime_news_list [class*="st-key-news_row_"] {padding: .8rem .8rem .85rem; border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); gap:.2rem;}
 .st-key-realtime_news_list [class*="st-key-news_row_selected_"] {background:color-mix(in srgb, #c43b50 7%, transparent); border-left:2px solid #c43b50; padding-left:calc(.8rem - 2px);}
 .st-key-realtime_news_list [class*="st-key-telegram_open_"] button {padding:0; min-height:0; border:0; border-radius:0; justify-content:flex-start; text-align:left; background:transparent;}
@@ -195,15 +178,28 @@ _FEED_STYLE = """<style>
 .st-key-realtime_news_list [data-testid="stText"]>span {display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
 .st-key-realtime_news_list [data-testid="stCaptionContainer"] {margin:0;}
 .st-key-realtime_news_list [data-testid="stCaptionContainer"] p {font-size:.78rem; margin:0;}
-.st-key-realtime_news_reader {padding:.8rem .5rem .8rem .5rem;}
-.st-key-realtime_news_reader [data-testid="stText"] {font-family:inherit; line-height:1.85; overflow-wrap:anywhere; white-space:pre-wrap;}
-.st-key-realtime_news_reader h3 {font-size:1.2rem; line-height:1.5; padding-top:.25rem; padding-bottom:.5rem;}
-@media(max-width:640px) {.st-key-realtime_news_list {border-right:0; padding-right:0;} .st-key-realtime_news_reader {padding:.4rem .8rem;}}
+.st-key-realtime_news_dialog [data-testid="stText"] {font-family:inherit; font-size:1.15rem; line-height:1.9; overflow-wrap:anywhere; white-space:pre-wrap;}
+.st-key-realtime_news_dialog [data-testid="stText"]>span {font-size:inherit; line-height:inherit;}
 </style>"""
+
+
+@st.dialog("新聞全文", width="large", on_dismiss=_dismiss_article)
+def _show_article(post):
+    with st.container(key="realtime_news_dialog"):
+        stamp = _local_time(post.get("published_at"))
+        st.caption(f"{stamp[:16]} · 香港時間")
+        # Show the complete original once, without parsing source markup or
+        # repeating the truncated list headline above it.
+        st.text(str(post.get("text") or "此則新聞沒有文字內容。"), width="stretch")
+        if post.get("edited_at"):
+            st.caption(f"更新於 {_local_time(post['edited_at'])[:16]}")
+        if post.get("media_type"):
+            st.caption("此則新聞包含附件。")
 
 
 @st.fragment(run_every="30s")
 def render_telegram_feed(db_path=DEFAULT_DB_PATH):
+    had_open_dialog = st.session_state.get("telegram_feed_dialog_id") is not None
     try:
         config = load_config()
     except ValueError:
@@ -258,8 +254,7 @@ def render_telegram_feed(db_path=DEFAULT_DB_PATH):
         st.warning("暫時無法讀取新聞，稍後會自動重試。")
         return
 
-    # Keep the reading panes at stable Streamlit element paths. Inserting a new
-    # sibling above the columns would remount their scroll containers on refresh.
+    # Keep the list at a stable element path so notices don't reset its scroll.
     connection_notice = st.empty()
     latest_notice = st.empty()
     if receiver_notice or status.get("last_error"):
@@ -270,17 +265,26 @@ def render_telegram_feed(db_path=DEFAULT_DB_PATH):
     if pending:
         latest_notice.button(f"有 {pending} 則新消息 · 點此更新", key="telegram_feed_latest",
                              on_click=_show_latest, type="tertiary", icon=":material/arrow_upward:")
+    dialog_id = st.session_state.get("telegram_feed_dialog_id")
+    if had_open_dialog and not any(post["message_id"] == dialog_id for post in posts):
+        _dismiss_article()
+        # Dialogs survive their opening fragment's rerun. A full rerun also
+        # unmounts an article that has expired while somebody is reading it.
+        st.rerun()
     if not posts:
         st.session_state.pop("telegram_feed_selected", None)
+        _dismiss_article()
         st.caption("沒有符合條件的新聞。" if query or selected_day else "最近 7 天暫無新聞。新消息會自動出現。")
         return
 
     selected_id = st.session_state.get("telegram_feed_selected")
-    selected = next((post for post in posts if post["message_id"] == selected_id), posts[0])
-    st.session_state["telegram_feed_selected"] = selected["message_id"]
+    if not any(post["message_id"] == selected_id for post in posts):
+        st.session_state.pop("telegram_feed_selected", None)
+        selected_id = None
+    dialog_post = next((post for post in posts
+                        if post["message_id"] == dialog_id), None)
     st.html(_FEED_STYLE)
-    left, right = st.columns([1.05, 1], gap="large")
-    with left, st.container(key="realtime_news_list", gap=None, height=620, border=False):
+    with st.container(key="realtime_news_list", gap=None, height=620, border=False):
         previous_day = None
         for post in posts:
             stamp = _local_time(post.get("published_at"))
@@ -288,7 +292,7 @@ def render_telegram_feed(db_path=DEFAULT_DB_PATH):
             if day != previous_day:
                 st.caption(day)
                 previous_day = day
-            selected_marker = "selected_" if post["message_id"] == selected["message_id"] else ""
+            selected_marker = "selected_" if post["message_id"] == selected_id else ""
             with st.container(key=f"news_row_{selected_marker}{post['message_id']}", gap=None):
                 st.caption(stamp[11:16])
                 st.button(_escape_label(_headline(post)), key=f"telegram_open_{post['message_id']}",
@@ -300,18 +304,5 @@ def render_telegram_feed(db_path=DEFAULT_DB_PATH):
         if len(posts) < visible_total:
             st.button("載入更多", key="telegram_feed_more", on_click=_load_more,
                       type="tertiary", width="stretch")
-    with right, st.container(key="realtime_news_reader", height=620, border=False):
-        stamp = _local_time(selected.get("published_at"))
-        st.caption(f"{stamp[:16]} · 香港時間")
-        st.subheader(_escape_label(_headline(selected)), anchor=False)
-        # Never interpret source content as Markdown, HTML or instructions.
-        body = _article_body(selected)
-        if body:
-            st.text(body)
-        if selected.get("edited_at"):
-            st.caption(f"更新於 {_local_time(selected['edited_at'])[:16]}")
-        if selected.get("media_type"):
-            st.caption("原文附有附件。")
-        link = _post_link(selected)
-        if link:
-            st.link_button("查看原文", link, type="tertiary", icon=":material/open_in_new:")
+    if dialog_post is not None:
+        _show_article(dialog_post)
