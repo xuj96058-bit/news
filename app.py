@@ -25,6 +25,7 @@ from src.workbench_ui import render_reader_tab, render_investat_filters, render_
 from src.chartbook_ui import render_chartbook_tab
 from src.report_gallery_ui import render_report_gallery, show_report
 from src.event_ui import render_news_analysis_tab
+from src.telegram_ui import ensure_telegram_receiver, render_telegram_feed
 
 st.set_page_config(page_title="News Impact Analyzer", layout="wide")
 
@@ -132,6 +133,7 @@ def analyze_for_session(text):
 
 st.title("金融新聞影響分析")
 st.caption("簡短分析新聞影響，提供利好與利空評分")
+ensure_telegram_receiver()
 
 pending_report_display = st.session_state.pop("pending_report_display", None)
 if pending_report_display:
@@ -146,6 +148,9 @@ with tab1:
                              api_key=effective_api_key, analysis_available=analysis_available)
 
 with tab2:
+    if tab2.open:
+        render_telegram_feed()
+        st.divider()
     st.subheader("今日市場論說")
     st.caption("按香港日期選材，合併重複事件，以新聞為論據形成論點、反證及可驗證的觀察。")
     if st.button("生成議論文日報", disabled=not analysis_available, key="daily_essay_generate"):
