@@ -126,6 +126,18 @@ class TelegramUiTests(unittest.TestCase):
         app.text_input(key="telegram_feed_search").set_value("does not exist").run()
         self.assertIn("沒有符合條件", self.rendered(app))
         self.assertFalse(app.link_button)
+
+    def test_long_first_paragraph_has_compact_heading_without_losing_content(self):
+        from src.telegram_ui import HEADLINE_LIMIT
+        paragraph = "公司發布市場消息，補充供應鏈與業務安排。" * 8
+        self.store.posts = [post(1, text=paragraph + "\n\n來源資料")]
+        app = self.app()
+        self.assertEqual(app.button(key="telegram_open_1").label,
+                         paragraph[:HEADLINE_LIMIT] + "…")
+        self.assertIn(paragraph + "\n\n來源資料", [item.value for item in app.text])
+        self.assertTrue(any(item.value.startswith(paragraph[HEADLINE_LIMIT:HEADLINE_LIMIT + 20])
+                            for item in app.text))
+
     def test_dates_include_partial_eighth_day_and_scope_reader(self):
         yesterday = NOW.astimezone(ZoneInfo("Asia/Hong_Kong")).date() - timedelta(days=1)
         self.store.posts = [post(1), post(30, stamp=NOW - timedelta(days=1))]

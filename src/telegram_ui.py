@@ -14,6 +14,7 @@ from .telegram_source import DEFAULT_DB_PATH, RETENTION, TelegramStore, load_con
 
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 PAGE_SIZE = 20
+HEADLINE_LIMIT = 52
 
 
 def _utc_now():
@@ -141,12 +142,12 @@ def _select_post(message_id):
 def _headline(post):
     content = str(post.get("text") or "").strip()
     first = next((line.strip() for line in content.splitlines() if line.strip()), "沒有文字內容")
-    return first[:80] + ("…" if len(first) > 80 else "")
+    return first[:HEADLINE_LIMIT] + ("…" if len(first) > HEADLINE_LIMIT else "")
 
 
 def _preview(post):
     lines = [line.strip() for line in str(post.get("text") or "").splitlines() if line.strip()]
-    text = " ".join(lines[1:]) if len(lines) > 1 else (lines[0][80:] if lines else "")
+    text = " ".join([lines[0][HEADLINE_LIMIT:], *lines[1:]]).strip() if lines else ""
     return text[:150] + ("…" if len(text) > 150 else "")
 
 
@@ -157,7 +158,7 @@ def _article_body(post):
     first, separator, rest = content.partition("\n")
     # The complete first line already appears in the headline. If it had to be
     # shortened, retain the complete original in the body instead.
-    return rest.lstrip() if len(first.strip()) <= 80 else content
+    return rest.lstrip() if len(first.strip()) <= HEADLINE_LIMIT else content
 
 
 def _escape_label(text):
@@ -189,14 +190,14 @@ _FEED_STYLE = """<style>
 .st-key-realtime_news_list [class*="st-key-telegram_open_"] button {padding:0; min-height:0; border:0; border-radius:0; justify-content:flex-start; text-align:left; background:transparent;}
 .st-key-realtime_news_list [class*="st-key-telegram_open_"] button:hover {color:#c43b50; background:transparent;}
 .st-key-realtime_news_list [class*="st-key-telegram_open_"] button>div {justify-content:flex-start; width:100%; text-align:left;}
-.st-key-realtime_news_list [class*="st-key-telegram_open_"] button p {font-weight:600; font-size:1rem; line-height:1.6;}
+.st-key-realtime_news_list [class*="st-key-telegram_open_"] button p {font-weight:600; font-size:1rem; line-height:1.6; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
 .st-key-realtime_news_list [data-testid="stText"] {font-size:.875rem; line-height:1.65; opacity:.72;}
 .st-key-realtime_news_list [data-testid="stText"]>span {display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
 .st-key-realtime_news_list [data-testid="stCaptionContainer"] {margin:0;}
 .st-key-realtime_news_list [data-testid="stCaptionContainer"] p {font-size:.78rem; margin:0;}
 .st-key-realtime_news_reader {padding:.8rem .5rem .8rem .5rem;}
 .st-key-realtime_news_reader [data-testid="stText"] {font-family:inherit; line-height:1.85; overflow-wrap:anywhere; white-space:pre-wrap;}
-.st-key-realtime_news_reader h3 {font-size:1.4rem; line-height:1.5; padding-top:.25rem; padding-bottom:.5rem;}
+.st-key-realtime_news_reader h3 {font-size:1.2rem; line-height:1.5; padding-top:.25rem; padding-bottom:.5rem;}
 @media(max-width:640px) {.st-key-realtime_news_list {border-right:0; padding-right:0;} .st-key-realtime_news_reader {padding:.4rem .8rem;}}
 </style>"""
 
