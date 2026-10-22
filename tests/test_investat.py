@@ -1,5 +1,7 @@
 import json
 import os
+from datetime import datetime, timezone
+from email.utils import format_datetime
 import unittest
 from unittest.mock import patch
 
@@ -45,6 +47,37 @@ def tool(value):
 
 
 class InvestatClientTests(unittest.TestCase):
+    def test_retry_after_parses_bounded_seconds_and_http_dates(self):
+        now = datetime(2026, 10, 22, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(investat._retry_after("120", now=now), 120)
+        self.assertEqual(investat._retry_after("1.5", now=now), 2)
+        self.assertEqual(investat._retry_after("999999999", now=now), 86400)
+        date = format_datetime(datetime.fromtimestamp(now + 1800, timezone.utc), usegmt=True)
+        self.assertEqual(investat._retry_after(date, now=now), 1800)
+        past = format_datetime(datetime.fromtimestamp(now - 60, timezone.utc), usegmt=True)
+        self.assertEqual(investat._retry_after(past, now=now), 0)
+        for value in (None, "", "nan", "inf", "-10", SECRET, "x" * 129):
+            with self.subTest(value=value):
+                self.assertIsNone(investat._retry_after(value, now=now))
+
+    def test_429_carries_only_safe_retry_seconds_and_closes_unread_response(self):
+        response = Response(status=429, headers={"Retry-After": "3600", "X-Secret": SECRET}, text=SECRET)
+        client = InvestatClient(TOKEN, post=lambda *_a, **_kw: response)
+        with self.assertRaises(InvestatError) as caught:
+            client._request("tools/list")
+        self.assertEqual(caught.exception.retry_after, 3600)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.category, "rate_limit")
+        self.assertNotIn(SECRET, str(caught.exception))
+        self.assertNotIn(TOKEN, str(caught.exception))
+        self.assertTrue(response.closed)
+        self.assertEqual(response.read_count, 0)
+
+    def test_retry_duration_constructor_rejects_nonfinite_or_nonnumeric_values(self):
+        for value in ("3600", True, -1, float("nan"), float("inf")):
+            self.assertIsNone(InvestatError("rate_limit", retry_after=value).retry_after)
+        self.assertEqual(InvestatError("rate_limit", retry_after=100000).retry_after, 86400)
+
     def post(self, result, *, protocol="2025-06-18", session="synthetic-session"):
         calls = []
         responses = []

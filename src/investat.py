@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 import requests
@@ -16,6 +19,7 @@ from . import env as _env  # Load the project's .env through the existing loader
 MCP_URL = "https://investat.ai/api/mcp/feed"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_RETRY_AFTER_SECONDS = 86400
 _PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-03-26", "2025-06-18"}
 _ERROR_MESSAGES = {
     "missing_token": "Investat MCP token is required (INVESTAT_MCP_TOKEN)",
@@ -37,16 +41,38 @@ _ERROR_MESSAGES = {
 class InvestatError(RuntimeError):
     """A deliberately safe error: no response body, headers, or credentials."""
 
-    def __init__(self, category: str, *, status_code=None, rpc_code=None):
+    def __init__(self, category: str, *, status_code=None, rpc_code=None, retry_after=None):
         self.category = category if category in _ERROR_MESSAGES else "protocol"
         self.status_code = status_code if isinstance(status_code, int) and 100 <= status_code <= 599 else None
         self.rpc_code = rpc_code if isinstance(rpc_code, int) and not isinstance(rpc_code, bool) else None
+        self.retry_after = (min(MAX_RETRY_AFTER_SECONDS, math.ceil(retry_after))
+                            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+                            and math.isfinite(retry_after) and retry_after >= 0 else None)
         message = _ERROR_MESSAGES[self.category]
         if self.status_code is not None:
             message += f" (HTTP {self.status_code})"
         elif self.rpc_code is not None:
             message += f" (code {self.rpc_code})"
         super().__init__(message)
+
+
+def _retry_after(value, *, now=None):
+    """Parse only a bounded duration; never retain a raw provider header."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = max(0, date.timestamp() - (time.time() if now is None else now))
+        except (ValueError, TypeError, OverflowError):
+            return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(MAX_RETRY_AFTER_SECONDS, math.ceil(seconds))
 
 
 def get_token(token: Optional[str] = None) -> str:
@@ -219,7 +245,8 @@ class InvestatClient:
             if status in {401, 403}:
                 raise InvestatError("authentication", status_code=status)
             if status == 429:
-                raise InvestatError("rate_limit", status_code=status)
+                raise InvestatError("rate_limit", status_code=status,
+                                    retry_after=_retry_after(response.headers.get("Retry-After")))
             if 300 <= status <= 399:
                 raise InvestatError("redirect", status_code=status)
             if not 200 <= status <= 299:

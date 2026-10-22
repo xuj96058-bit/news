@@ -4,6 +4,39 @@
 
 RSS 抓取不需要 LLM API key。先保存新聞，只有明確啟動分析時才呼叫你設定的模型。
 
+## 目前功能
+
+- **RSS／SEC 抓取**：全球宏觀、美股、港股／中國新聞與機構研究 RSS，以及標普 500＋納斯達克 100 公司的 SEC 公告。
+- **Telegram 頻道接收與推送**：接收指定頻道新聞並保留 72 小時，納入實時新聞與日報；另可用獨立的發送 Bot 推送到另一個頻道（兩個頻道不能相同）。
+- **Investat 整合**：背景服務每 5 分鐘增量抓取 Investat，新內容可自動推送。
+- **事件分析**：新聞研判、證據搜尋、利好／利空評分與判斷歷史。
+- **研究報告／圖表庫**：可編輯研究報告、補證與前後比較，以及圖表證據庫。
+- **簡繁轉換**：推送與顯示內容可轉換為繁體中文（OpenCC）。
+
+## 最新變更
+
+- Investat 推送會去除 Markdown 符號，以純文字顯示。
+- 推送內容超過 250 字時改為發送 TXT 檔案。
+- Telegram 轉發時不顯示 `t.me` 連結，但保留「來源」可點擊連結（以 HTML 格式發送）。
+
+## 啟動方式
+
+```bash
+# 啟動網頁（http://127.0.0.1:8502/）與背景服務
+python scripts/start_news.py
+
+# 只執行背景抓取與 Telegram 推送服務
+python -m src.news_service --worker
+
+# 查看／停止背景服務
+python -m src.news_service --status
+python -m src.news_service --stop
+```
+
+Windows 可直接雙擊 **`Start-News.cmd`**。
+
+> 所有密鑰（Telegram Bot token、頻道 ID、Investat、DeepSeek、OpenRouter 等）只填入本機 `.env`（由 `.env.example` 複製），切勿提交到 Git。
+
 ## 安裝
 
 使用 Python 3.10 或以上版本，在專案根目錄執行：

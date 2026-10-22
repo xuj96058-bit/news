@@ -1,21 +1,21 @@
 {
   "schema_version": 1,
-  "fetched_at": "2026-10-13T02:32:03.319584+00:00",
+  "fetched_at": "2026-10-17T12:26:20.331924+00:00",
   "membership_note": "Retrieved public tables; this is not an index-provider-verified effective-date list. Refresh before use and after index changes.",
   "sources": [
     {
       "index": "sp500",
       "url": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
       "label": "Wikipedia public constituent table (unofficial)",
-      "retrieved_at": "2026-10-13T02:32:03.319584+00:00",
-      "sha256": "77dcb0685ba27d7fd35cb35eb73a2de4a0b3a2db5a1decbe962b6c9b84441b7a"
+      "retrieved_at": "2026-10-17T12:26:20.331924+00:00",
+      "sha256": "19141699f6e008e3e16d69f3267efaa920c1cfa453edc75a7605d90d746f56e0"
     },
     {
       "index": "nasdaq100",
       "url": "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
       "label": "Wikipedia public constituent table (unofficial)",
-      "retrieved_at": "2026-10-13T02:32:03.319584+00:00",
-      "sha256": "f6115b9c6ce5496592f7343f8717971851e55b2a720ed480dac0b306ad9180b0"
+      "retrieved_at": "2026-10-17T12:26:20.331924+00:00",
+      "sha256": "4aa41cd2e7129800f878e99c179c227d4a10ed713109ebb4751d64ee79dd5387"
     }
   ],
   "mapping_source": "https://www.sec.gov/files/company_tickers.json",
@@ -2519,7 +2519,7 @@
     },
     {
       "symbol": "MCK",
-      "name": "McKesson Corporation",
+      "name": "McKesson",
       "cik": "0000927653",
       "indices": [
         "sp500"

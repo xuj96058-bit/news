@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from .notifications import initialize_notifications, enqueue_notification, prune_notifications
+
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "telegram.sqlite3"
 RETENTION = timedelta(days=7)
@@ -139,7 +141,11 @@ class TelegramStore:
                 last_error TEXT, last_poll_at TEXT, lease_owner TEXT, lease_until REAL);
             INSERT OR IGNORE INTO telegram_state(id) VALUES(1);
         """)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(telegram_posts)")}
+        if "links_json" not in columns:
+            self.connection.execute("ALTER TABLE telegram_posts ADD COLUMN links_json TEXT NOT NULL DEFAULT '[]'")
         self.connection.commit()
+        initialize_notifications(self.connection)
 
     def __enter__(self):
         return self
@@ -149,6 +155,9 @@ class TelegramStore:
 
     def prune(self, now=None):
         cutoff = (_now(now) - RETENTION).timestamp()
+        # Delivery snapshots obey the same retention window as the inbox.
+        # This helper owns its transaction; keep it outside the post deletion.
+        prune_notifications(self.connection, now=now)
         with self.connection:
             return self.connection.execute("DELETE FROM telegram_posts WHERE published_ts<=?", (cutoff,)).rowcount
 
@@ -261,17 +270,33 @@ class TelegramStore:
                 post = _normalize_post(update, config, current)
                 if post:
                     old = self.connection.execute("SELECT * FROM telegram_posts WHERE chat_id=? AND message_id=?", (post["chat_id"], post["message_id"])).fetchone()
+                    notify = False
                     if old is None:
-                        self.connection.execute("""INSERT INTO telegram_posts(chat_id,message_id,title,text,published_ts,edited_ts,media_type,url)
-                            VALUES(:chat_id,:message_id,:title,:text,:published_ts,:edited_ts,:media_type,:url)""", post)
+                        self.connection.execute("""INSERT INTO telegram_posts(chat_id,message_id,title,text,published_ts,edited_ts,media_type,url,links_json)
+                            VALUES(:chat_id,:message_id,:title,:text,:published_ts,:edited_ts,:media_type,:url,:links_json)""", post)
                         counts["added"] += 1
+                        notify = True
                     elif (post["edited_ts"] or post["published_ts"]) >= (old["edited_ts"] or old["published_ts"]):
-                        changed = any(old[key] != post[key] for key in ("title", "text", "edited_ts", "media_type", "url"))
+                        changed = any(old[key] != post[key] for key in ("title", "text", "edited_ts", "media_type", "url", "links_json"))
                         if changed:
                             # Original publication time is immutable on edits.
-                            self.connection.execute("""UPDATE telegram_posts SET title=:title,text=:text,edited_ts=:edited_ts,media_type=:media_type,url=:url
+                            self.connection.execute("""UPDATE telegram_posts SET title=:title,text=:text,edited_ts=:edited_ts,media_type=:media_type,url=:url,links_json=:links_json
                                 WHERE chat_id=:chat_id AND message_id=:message_id""", post)
                             counts["updated"] += 1
+                            notify = any(old[key] != post[key] for key in ("title", "text", "media_type", "url", "links_json"))
+                    if notify:
+                        # Keep the original timestamp on edits, and save the
+                        # delivery record atomically with both post and offset.
+                        published_ts = old["published_ts"] if old is not None else post["published_ts"]
+                        enqueue_notification(self.connection, "telegram", f"{post['chat_id']}:{post['message_id']}", {
+                            "title": post["text"].strip().splitlines()[0],
+                            "text": post["text"],
+                            "summary": "",
+                            "published_at": _iso(published_ts),
+                            "url": post["url"],
+                            "links": json.loads(post["links_json"]),
+                            "content_scope": "provided_text",
+                        }, is_new=old is None)
                 else:
                     counts["ignored"] += 1
                 cursor = update_id + 1
@@ -293,12 +318,17 @@ def _normalize_post(update, config, now):
         return None
     if isinstance(published, bool) or not isinstance(published, (int, float)) or not (now - RETENTION).timestamp() < published <= (now + timedelta(minutes=5)).timestamp():
         return None
-    text = message.get("text") if isinstance(message.get("text"), str) else message.get("caption")
+    if isinstance(message.get("text"), str):
+        text, entities = message.get("text"), message.get("entities")
+    else:
+        text, entities = message.get("caption"), message.get("caption_entities")
+    links = _text_links(text, entities)
     media = next((name for name in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "poll", "location") if name in message), None)
     if not isinstance(text, str) or not text.strip():
         if media is None:
             return None
         text = "附件（沒有文字說明）"
+        links = []
     edited = message.get("edit_date")
     if isinstance(edited, bool) or not isinstance(edited, (int, float)) or edited < published or edited > (now + timedelta(minutes=5)).timestamp():
         edited = None
@@ -306,7 +336,32 @@ def _normalize_post(update, config, now):
     return {"chat_id": config.chat_id, "message_id": message_id,
             "title": title if isinstance(title, str) else "Telegram", "text": text,
             "published_ts": published, "edited_ts": edited, "media_type": media,
-            "url": f"https://t.me/c/{-config.chat_id - 1000000000000}/{message_id}"}
+            "url": f"https://t.me/c/{-config.chat_id - 1000000000000}/{message_id}",
+            "links_json": json.dumps(links, ensure_ascii=False, separators=(",", ":"))}
+
+
+def _text_links(text, entities):
+    """Keep only named hyperlinks: [offset, length, url] in UTF-16 units."""
+    if not isinstance(text, str) or not isinstance(entities, list):
+        return []
+    total = len(text.encode("utf-16-le")) // 2
+    links = []
+    for entity in entities:
+        if not isinstance(entity, dict) or entity.get("type") != "text_link":
+            continue
+        offset, length, url = entity.get("offset"), entity.get("length"), entity.get("url")
+        if (isinstance(offset, int) and isinstance(length, int) and not isinstance(offset, bool)
+                and not isinstance(length, bool) and offset >= 0 and length > 0
+                and offset + length <= total and isinstance(url, str)
+                and re.match(r"(?i)^(https?|tg)://", url)):
+            links.append([offset, length, url])
+    links.sort()
+    result, end = [], 0
+    for link in links:  # drop overlapping links
+        if link[0] >= end:
+            result.append(link)
+            end = link[0] + link[1]
+    return result
 
 
 def sync_once(config, db_path=DEFAULT_DB_PATH, now=None, client=None, max_batches=10):

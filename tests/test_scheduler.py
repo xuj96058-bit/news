@@ -110,6 +110,41 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(run_due(store, sources=[], now=self.now, runner=lambda *a: self.fail()), [])
             self.assertEqual(list_schedules(store)[0]["options"], {"institution": "UBS"})
 
+    def test_incremental_option_is_boolean_and_only_allowed_for_investat(self):
+        with NewsStore(self.path) as store:
+            for value in (True, False):
+                configure_schedule(store, "investat", 5, options={"incremental": value})
+                self.assertIs(list_schedules(store)[0]["options"]["incremental"], value)
+            for value in ("true", "false", 1, 0, None, [], {}):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    configure_schedule(store, "investat", 5, options={"incremental": value})
+            for source in ("rss_example", "sec"):
+                with self.subTest(source=source), self.assertRaises(ValueError):
+                    configure_schedule(store, source, 5, options={"incremental": True})
+
+    def test_investat_list_429_honors_retry_after_without_shortening_generic_backoff(self):
+        with NewsStore(self.path) as store:
+            configure_schedule(store, "investat", 5)
+            def limited(seconds):
+                return {"sources": [{"id": "investat", "status": "error", "error": "Rate limited",
+                                     "provider_status_code": 429, "retry_after": seconds}]}
+            result = run_due(store, sources=[], now=self.now, runner=lambda *_a: limited(3600))[0]
+            self.assertEqual(result["next_run_at"], (self.now + timedelta(hours=1)).isoformat())
+            later = self.now + timedelta(hours=2)
+            result = run_due(store, sources=[], now=later, runner=lambda *_a: limited(1))[0]
+            self.assertEqual(result["next_run_at"], (later + timedelta(minutes=5)).isoformat())
+
+    def test_retry_after_ignores_unvalidated_values_and_other_sources(self):
+        for source, value, expected in (("investat", "3600", 300), ("investat", float("inf"), 300),
+                                        ("investat", True, 300), ("investat", -10, 300),
+                                        ("investat", 999999, 86400), ("rss_example", 3600, 300)):
+            with self.subTest(source=source, value=value), NewsStore(":memory:") as store:
+                configure_schedule(store, source, 5)
+                result = run_due(store, sources=[], now=self.now, runner=lambda *_a: {
+                    "sources": [{"id": source, "status": "error", "error": "Rate limited",
+                                 "provider_status_code": 429, "retry_after": value}]})[0]
+                self.assertEqual(result["next_run_at"], (self.now + timedelta(seconds=expected)).isoformat())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,3 +7,4 @@ feedparser>=6.0.11
 tzdata>=2025.1
 reportlab>=4.2.0
 pypdf>=5.0.0
+opencc-python-reimplemented==0.1.7

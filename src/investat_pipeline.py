@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import hashlib
+import json
+import math
 from urllib.parse import urlsplit
 
 from .investat import InvestatClient, InvestatError
 from .entities import normalize_metadata, safe_saved_text
 from .source_health import record_collection, usable_text_count
+
+
+DETAIL_RETRY_SECONDS = 30 * 60
+DETAIL_REFRESH_SECONDS = 24 * 60 * 60
 
 
 def _text(value) -> str:
@@ -114,17 +121,94 @@ def _safe_error(exc, fallback="Investat request failed") -> str:
     return fallback
 
 
+def _incremental_now():
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _incremental_schema(store):
+    # Only hashes, identifiers and scheduling state are stored here. In
+    # particular, do not serialize the list tool's raw provider metadata.
+    with store.connection:
+        store.connection.execute("""CREATE TABLE IF NOT EXISTS investat_incremental_cache (
+            external_id TEXT PRIMARY KEY, list_signature TEXT NOT NULL,
+            next_detail_at REAL NOT NULL, detail_state TEXT NOT NULL,
+            last_seen_at REAL NOT NULL)""")
+        store.connection.execute("""CREATE TABLE IF NOT EXISTS investat_incremental_state (
+            id INTEGER PRIMARY KEY CHECK(id=1), details_not_before REAL NOT NULL DEFAULT 0)""")
+        store.connection.execute("INSERT OR IGNORE INTO investat_incremental_state(id) VALUES(1)")
+
+
+def _list_signature(item, article_id):
+    value = _normalize(item, article_id, _body(item))
+    # A supplied revision may signal a body edit without a changed headline.
+    # Accept only named primitive fields, never arbitrary nested tool metadata.
+    for name in ("updatedAt", "updated_at", "modifiedAt", "modified_at", "version", "revision"):
+        supplied = item.get(name)
+        if isinstance(supplied, str):
+            try:
+                value[name] = safe_saved_text(supplied)
+            except ValueError:
+                pass
+        elif isinstance(supplied, (bool, int)) or isinstance(supplied, float) and math.isfinite(supplied):
+            value[name] = supplied
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _baseline_matches(item, article_id, existing):
+    """Missing list fields cannot erase detail fields during cache adoption."""
+    listed = _normalize(item, article_id, _body(item))
+    for field in ("title", "summary", "content", "url", "published_at", "institution",
+                  "author", "publisher", "tickers", "asset_classes", "topics"):
+        value = listed.get(field)
+        if not value:
+            continue
+        previous = existing.get(field)
+        if field == "published_at" and previous:
+            try:
+                def parsed(text):
+                    try:
+                        result = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    except ValueError:
+                        result = parsedate_to_datetime(text)
+                    return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result
+                if parsed(value) == parsed(previous):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                pass
+        if field == "content" and previous and str(previous).startswith(value):
+            continue
+        if value != previous:
+            return False
+    return True
+
+
+def _cache_list(store, article_id, signature, now, next_detail_at, state):
+    # This follows successful source ingestion. A cache-write failure may
+    # cause an extra request next time, but cannot hide an unsaved article.
+    with store.connection:
+        store.connection.execute("""INSERT INTO investat_incremental_cache
+            (external_id,list_signature,next_detail_at,detail_state,last_seen_at) VALUES(?,?,?,?,?)
+            ON CONFLICT(external_id) DO UPDATE SET list_signature=excluded.list_signature,
+            next_detail_at=excluded.next_detail_at,detail_state=excluded.detail_state,
+            last_seen_at=excluded.last_seen_at""",
+            (article_id, signature, next_detail_at, state, now))
+
+
 def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
-                     timeout=15, client_factory=None, search="", ticker="", institution=""):
+                     timeout=15, client_factory=None, search="", ticker="", institution="",
+                     incremental=False):
     """Read summaries and bounded detail chunks, saving partial successes.
 
     Only an explicit nextBodyOffset advances the body cursor. The normalized
     allowlist passed to NewsStore excludes provider debug, session, and tool
     metadata. Missing article URLs remain empty; the store supplies identity.
+    Scheduled incremental collection checks the list every run but retrieves
+    details only for new/changed items, incomplete retries, or a daily refresh.
     """
     if (isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50
             or isinstance(max_body_pages, bool) or not isinstance(max_body_pages, int)
-            or max_body_pages < 1 or timeout <= 0):
+            or max_body_pages < 1 or timeout <= 0 or not isinstance(incremental, bool)):
         raise ValueError("Investat limit must be 1–50; body pages and timeout must be positive")
     filters = {key: safe_saved_text(value) for key, value in
                (("search", search), ("ticker", ticker), ("institution", institution)) if value}
@@ -143,6 +227,10 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
             raise InvestatError("payload")
     except Exception as exc:
         outcome.update(status="error", error=_safe_error(exc))
+        if isinstance(exc, InvestatError) and exc.status_code in {401, 403, 429}:
+            outcome["provider_status_code"] = exc.status_code
+            if exc.status_code == 429 and getattr(exc, "retry_after", None) is not None:
+                outcome["retry_after"] = exc.retry_after
         report["failed_sources"] = 1
         record_collection(store, outcome, run_at=report["fetched_at"])
         report["database"] = store.stats()
@@ -156,7 +244,13 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
     outcome["gap"] = bool(outcome["limited"])
     counts = {"added": 0, "updated": 0, "duplicates": 0}
     failures = False
-    detail_blocked = False
+    current = _incremental_now() if incremental else 0
+    details_not_before = 0
+    if incremental:
+        _incremental_schema(store)
+        details_not_before = store.connection.execute(
+            "SELECT details_not_before FROM investat_incremental_state WHERE id=1").fetchone()[0]
+    detail_blocked = details_not_before > current
     for item in items[:limit]:
         if not isinstance(item, dict):
             outcome["skipped"] += 1
@@ -170,14 +264,48 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
             failures = True
             outcome["diagnostics"].append({"stage": "article", "error": "Investat article ID is missing"})
             continue
+        key, signature, cached, existing = str(article_id).strip(), None, None, None
+        if incremental:
+            signature = _list_signature(item, key)
+            source = store.connection.execute("""SELECT metadata_json FROM article_sources
+                WHERE source_id='investat' AND canonical_url=?""", ("investat:" + key,)).fetchone()
+            existing = json.loads(source["metadata_json"]) if source is not None else None
+            cached = store.connection.execute(
+                "SELECT * FROM investat_incremental_cache WHERE external_id=?", (key,)).fetchone()
+            if (existing is not None and cached is None
+                    and _baseline_matches(item, key, existing)):
+                # Adopt a pre-existing source as the initial list baseline.
+                # Do not re-download all historical bodies when enabling this.
+                incomplete = existing.get("content_scope") != "provided_text" or not existing.get("content")
+                due = current + (DETAIL_RETRY_SECONDS if incomplete else DETAIL_REFRESH_SECONDS)
+                _cache_list(store, key, signature, current, due, "partial" if incomplete else "complete")
+                counts["duplicates"] += 1
+                outcome["details_skipped"] += 1
+                outcome["usable_text"] += usable_text_count([existing])
+                if incomplete:
+                    failures = True
+                    outcome["partial_articles"] += 1
+                continue
+            if (existing is not None and cached is not None
+                    and cached["list_signature"] == signature and current < cached["next_detail_at"]):
+                counts["duplicates"] += 1
+                outcome["details_skipped"] += 1
+                outcome["usable_text"] += usable_text_count([existing])
+                if cached["detail_state"] == "partial":
+                    failures = True
+                    outcome["partial_articles"] += 1
+                continue
         combined = dict(item)
         chunks = []
-        partial = detail_blocked
-        if detail_blocked:
+        deferred = bool(incremental and cached is not None and cached["detail_state"] == "partial"
+                        and current < cached["next_detail_at"])
+        skip_details = detail_blocked or deferred
+        partial = skip_details
+        if skip_details:
             outcome["details_skipped"] += 1
         offset = 0
         seen_offsets = {offset}
-        for page in range(0 if detail_blocked else max_body_pages):
+        for page in range(0 if skip_details else max_body_pages):
             try:
                 detail = client.get_article(article_id, body_offset=offset)
                 if not isinstance(detail, dict) or not detail:
@@ -230,6 +358,15 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
                 outcome["diagnostics"].append({"stage": "detail", "error": _safe_error(exc)})
                 if isinstance(exc, InvestatError) and exc.status_code in {401, 403, 429}:
                     detail_blocked = True
+                    if incremental and exc.status_code == 429:
+                        # One provider throttle applies to subsequent new IDs
+                        # too. Continue discovering/saving their summaries.
+                        details_not_before = _incremental_now() + max(
+                            DETAIL_RETRY_SECONDS, getattr(exc, "retry_after", None) or 0)
+                        with store.connection:
+                            store.connection.execute(
+                                "UPDATE investat_incremental_state SET details_not_before=? WHERE id=1",
+                                (details_not_before,))
                 break
         body = "".join(chunks) if chunks else _body(item)
         article = _normalize(combined, article_id, body, partial=partial)
@@ -247,11 +384,23 @@ def collect_investat(store, *, token=None, limit=20, max_body_pages=5,
             outcome["usable_text"] += usable_text_count([article])
             for key in counts:
                 counts[key] += saved[key]
+            if incremental:
+                saved_at = _incremental_now()
+                incomplete = partial or not body
+                due = saved_at + (DETAIL_RETRY_SECONDS if incomplete else DETAIL_REFRESH_SECONDS)
+                if deferred:
+                    due = cached["next_detail_at"]
+                if details_not_before > current:
+                    due = max(due if not incomplete else 0, details_not_before)
+                _cache_list(store, str(article_id).strip(), signature, saved_at, due,
+                            "partial" if incomplete else "complete")
         except Exception:
             failures = True
             outcome["skipped"] += 1
             outcome["diagnostics"].append({"stage": "save", "error": "Investat article could not be saved"})
     outcome.update(counts)
+    if incremental and details_not_before > current:
+        outcome["detail_retry_after_seconds"] = math.ceil(details_not_before - current)
     report.update(counts)
     if failures:
         outcome.update(status="partial" if sum(counts.values()) else "error",

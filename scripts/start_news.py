@@ -60,6 +60,62 @@ def matching_server() -> bool:
         return False
 
 
+def ensure_background_service() -> bool:
+    """Start the independent worker even when the web server already exists."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    try:
+        from src.news_service import read_status, service_running
+        from src.notifications import load_notification_config
+        config = load_notification_config()
+    except (ImportError, ValueError, TypeError):
+        print("News delivery settings are invalid. Check the local .env file.")
+        return False
+    if config is None:
+        return True
+    try:
+        from src.notification_language import traditional_text
+        traditional_text("新聞")
+    except Exception:
+        print("Traditional Chinese conversion is unavailable. Install the project requirements:")
+        print(f'"{sys.executable}" -m pip install -r "{ROOT / "requirements.txt"}"')
+        return False
+    if service_running(ROOT):
+        status = read_status(ROOT)
+        if (status.get("sender_bot_id") != config.bot_id
+                or status.get("destination_chat_id") != config.destination_chat_id):
+            print("A news service with different settings is running. Stop it with: python -m src.news_service --stop")
+            return False
+        print("News collection and Telegram delivery service is running.")
+        return True
+    data = ROOT / "data"
+    data.mkdir(exist_ok=True)
+    command = [sys.executable, "-m", "src.news_service", "--worker"]
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+             | subprocess.CREATE_NO_WINDOW) if sys.platform == "win32" else 0
+    try:
+        with (data / "news-service.stdout.log").open("ab") as stdout, \
+                (data / "news-service.stderr.log").open("ab") as stderr:
+            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                                       stdout=stdout, stderr=stderr, close_fds=True,
+                                       creationflags=flags)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            status = read_status(ROOT)
+            if (service_running(ROOT) and time.time() - status.get("heartbeat_at", 0) < 15
+                    and status.get("sender_bot_id") == config.bot_id
+                    and status.get("destination_chat_id") == config.destination_chat_id):
+                print("News collection and Telegram delivery service is ready.")
+                return True
+            if process.poll() is not None:
+                break
+            time.sleep(0.2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    print("News delivery service could not start. See data/news-service.stdout.log.")
+    return False
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Open the local News inbox")
     parser.add_argument("--no-browser", action="store_true", help="Check/start without opening a browser")
@@ -113,6 +169,8 @@ def main(argv=None) -> int:
         else:
             print("News is still starting. Retry shortly or see data/news-server.stderr.log.")
             return 1
+    if not ensure_background_service():
+        return 1
     print("News is ready: " + URL)
     if not args.no_browser:
         webbrowser.open(URL)

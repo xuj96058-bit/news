@@ -261,3 +261,14 @@ class TelegramSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextLinkCaptureTests(unittest.TestCase):
+    def test_text_link_entities_captured_in_utf16_units(self):
+        from src.telegram_source import _normalize_post
+        config = TelegramConfig(TOKEN, CHANNEL)
+        update = post(1, text="😀來源 x", entities=[
+            {"type": "text_link", "offset": 2, "length": 2, "url": "https://example.test/a"},
+            {"type": "bold", "offset": 0, "length": 2}])
+        result = _normalize_post(update, config, NOW)
+        self.assertEqual(result["links_json"], '[[2,2,"https://example.test/a"]]')

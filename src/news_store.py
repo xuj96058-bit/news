@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .entities import (METADATA_FIELDS, canonical_institution, institution_aliases,
                        normalize_metadata, normalize_ticker, safe_saved_text)
+from .notifications import initialize_notifications, enqueue_notification
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "news.sqlite3"
@@ -173,6 +174,7 @@ class NewsStore:
             CREATE INDEX IF NOT EXISTS sources_article ON article_sources(article_id);
         """)
         self._initialize_search()
+        initialize_notifications(self.connection)
 
     def _initialize_search(self) -> None:
         """Additive migration; old IDs, analysis and timestamps are untouched."""
@@ -365,6 +367,19 @@ class NewsStore:
                     (article["source_id"], canonical, article_id, _json(article), _json(raw), signature, now, now),
                 )
                 self._index_article(article_id)
+                if article["source_id"] == "investat":
+                    # Use this provider's version, never the merged article's
+                    # current metadata, which a later RSS observation may own.
+                    # Queueing shares the save transaction: a failed batch
+                    # cannot publish an article which was never committed.
+                    enqueue_notification(self.connection, "investat", canonical.removeprefix("investat:"), {
+                        "title": article.get("title") or "",
+                        "text": article.get("content") or "",
+                        "summary": article.get("summary") or "",
+                        "published_at": article.get("published_at"),
+                        "url": article.get("url") or "",
+                        "content_scope": article.get("content_scope") or "",
+                    }, is_new=source is None)
         return counts
 
     def _record(self, row: sqlite3.Row) -> dict:

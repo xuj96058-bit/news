@@ -41,7 +41,7 @@ def _schema(store):
 
 def _options(source_id, options):
     options = dict(options or {})
-    allowed = ({"limit", "max_body_pages", "timeout", "search", "ticker", "institution"} if source_id == "investat"
+    allowed = ({"limit", "max_body_pages", "timeout", "search", "ticker", "institution", "incremental"} if source_id == "investat"
                else {"max_pages", "timeout"} if source_id == "sec"
                else {"limit_per_source", "max_age_days", "timeout"})
     if set(options) - allowed:
@@ -49,7 +49,10 @@ def _options(source_id, options):
     ranges = {"limit": (1, 50), "max_body_pages": (1, 20), "timeout": (1, 120),
               "max_pages": (1, 100), "limit_per_source": (1, 1000), "max_age_days": (0, 3650)}
     for key, value in options.items():
-        if key in ranges:
+        if key == "incremental":
+            if not isinstance(value, bool):
+                raise ValueError("Investat incremental must be a boolean")
+        elif key in ranges:
             low, high = ranges[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
                 raise ValueError("Invalid numeric schedule option")
@@ -202,6 +205,16 @@ def run_due(store, *, sources=None, investat_token=None, now=None, max_jobs=10,
             # Backoff never grows beyond 24 hours or the configured interval for
             # infrequent jobs. Partial responses retain their committed content.
             delay = max(claimed["interval_minutes"] * 60, min(86400, 60 * 2 ** min(failures, 10))) if failures else claimed["interval_minutes"] * 60
+            if source_id == "investat" and retry_failure:
+                # Only normalized list/init 429 outcomes carry this field;
+                # detail-only throttling has its own persistent detail timer.
+                retry_after = [item.get("retry_after") for item in report.get("sources", [])
+                               if item.get("provider_status_code") == 429]
+                waits = [min(86400, math.ceil(value)) for value in retry_after
+                         if isinstance(value, (int, float)) and not isinstance(value, bool)
+                         and math.isfinite(value) and value >= 0]
+                if waits:
+                    delay = max(delay, max(waits))
             next_run = finished + timedelta(seconds=delay)
             checkpoint = json.loads(claimed["checkpoint_json"])
             checkpoint.update(last_attempt_at=finished.isoformat(), status=status,
