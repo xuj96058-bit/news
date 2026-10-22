@@ -1,4 +1,4 @@
-"""A small, restart-safe Telegram channel inbox with a rolling 72-hour TTL.
+"""A small, restart-safe Telegram channel inbox with a rolling seven-day TTL.
 
 This database is deliberately separate from the permanent research/news store.
 Only normalized channel text is retained; credentials and raw updates are never
@@ -10,6 +10,7 @@ import argparse
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,7 +24,7 @@ import requests
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "telegram.sqlite3"
-RETENTION = timedelta(hours=72)
+RETENTION = timedelta(days=7)
 LEASE_SECONDS = 120
 
 
@@ -151,7 +152,7 @@ class TelegramStore:
         with self.connection:
             return self.connection.execute("DELETE FROM telegram_posts WHERE published_ts<=?", (cutoff,)).rowcount
 
-    def _filters(self, day=None, now=None, chat_id=None, timezone_name="Asia/Hong_Kong"):
+    def _filters(self, day=None, now=None, chat_id=None, timezone_name="Asia/Hong_Kong", query="", before=None):
         self.prune(now)
         clauses, values = [], []
         if chat_id is not None:
@@ -166,12 +167,28 @@ class TelegramStore:
             end = start + timedelta(days=1)
             clauses.append("published_ts>=? AND published_ts<?")
             values.extend((start.timestamp(), end.timestamp()))
+        if not isinstance(query, str):
+            raise ValueError("Invalid Telegram search query")
+        if query:
+            # User input is a literal substring, including SQL wildcard characters.
+            clauses.append("text LIKE ? ESCAPE '\\'")
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            values.append(f"%{escaped}%")
+        if before is not None:
+            if (not isinstance(before, (tuple, list)) or len(before) != 2
+                    or isinstance(before[0], bool) or not isinstance(before[0], (int, float))
+                    or not math.isfinite(before[0]) or isinstance(before[1], bool)
+                    or not isinstance(before[1], int) or before[1] <= 0):
+                raise ValueError("Invalid Telegram news anchor")
+            # Include the anchor, with message_id as the deterministic tie breaker.
+            clauses.append("(published_ts<? OR (published_ts=? AND message_id<=?))")
+            values.extend((before[0], before[0], before[1]))
         return (" WHERE " + " AND ".join(clauses) if clauses else ""), values
 
-    def list_posts(self, day=None, now=None, limit=100, offset=0, timezone_name="Asia/Hong_Kong", chat_id=None):
+    def list_posts(self, day=None, now=None, limit=100, offset=0, timezone_name="Asia/Hong_Kong", chat_id=None, query="", before=None):
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000 or not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             raise ValueError("Invalid Telegram pagination")
-        where, values = self._filters(day, now, chat_id, timezone_name)
+        where, values = self._filters(day, now, chat_id, timezone_name, query, before)
         rows = self.connection.execute("SELECT * FROM telegram_posts" + where + " ORDER BY published_ts DESC,message_id DESC LIMIT ? OFFSET ?", (*values, limit, offset)).fetchall()
         result = []
         for row in rows:
@@ -182,8 +199,8 @@ class TelegramStore:
             result.append(item)
         return result
 
-    def count_posts(self, day=None, now=None, chat_id=None, timezone_name="Asia/Hong_Kong"):
-        where, values = self._filters(day, now, chat_id, timezone_name)
+    def count_posts(self, day=None, now=None, chat_id=None, timezone_name="Asia/Hong_Kong", query="", before=None):
+        where, values = self._filters(day, now, chat_id, timezone_name, query, before)
         return self.connection.execute("SELECT COUNT(*) FROM telegram_posts" + where, values).fetchone()[0]
 
     def get_status(self):
@@ -344,7 +361,7 @@ def run_worker(config, db_path=DEFAULT_DB_PATH, stop_event=None, poll_seconds=30
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Receive a Telegram channel into a 72-hour local inbox")
+    parser = argparse.ArgumentParser(description="Receive a Telegram channel into a seven-day local inbox")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")

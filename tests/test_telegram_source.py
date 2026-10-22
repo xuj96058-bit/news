@@ -81,9 +81,10 @@ class TelegramSourceTests(unittest.TestCase):
         self.assertEqual(item["edited_at"], NOW.isoformat())
 
     def test_retention_exact_boundary_and_edit_does_not_extend(self):
-        original = NOW - timedelta(hours=71, minutes=59)
+        original = NOW - timedelta(days=6, hours=23, minutes=59)
         self.sync(FakeClient([post(1, when=original)]))
         self.sync(FakeClient([post(2, text="edited", when=original, edited=NOW)]))
+        self.assertEqual(self.rows()[0]["text"], "edited")
         self.assertEqual(len(self.rows(now=NOW + timedelta(seconds=59))), 1)
         self.assertEqual(self.rows(now=NOW + timedelta(minutes=1)), [])
         # A late edit does not resurrect an expired original message.
@@ -91,12 +92,12 @@ class TelegramSourceTests(unittest.TestCase):
         self.assertEqual(self.rows(now=NOW + timedelta(minutes=2)), [])
 
     def test_stale_pending_updates_are_acknowledged_without_being_saved(self):
-        result = self.sync(FakeClient([post(5, when=NOW - timedelta(days=3)), post(6, 2, when=NOW - timedelta(days=4))]))
+        result = self.sync(FakeClient([post(5, when=NOW - timedelta(days=7)), post(6, 2, when=NOW - timedelta(days=8))]))
         self.assertEqual((result["added"], result["ignored"]), (0, 2))
         self.assertEqual(self.status()["next_update_id"], 7)
 
     def test_prune_runs_even_when_network_fails(self):
-        self.sync(FakeClient([post(1, when=NOW - timedelta(hours=71))]))
+        self.sync(FakeClient([post(1, when=NOW - timedelta(days=6, hours=23))]))
         result = self.sync(FakeClient(error=RuntimeError("https://api.telegram.org/bot" + TOKEN)), now=NOW + timedelta(hours=1))
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["pruned"], 1)
@@ -178,6 +179,40 @@ class TelegramSourceTests(unittest.TestCase):
         with TelegramStore(self.path) as store:
             self.assertEqual(store.count_posts(now=NOW, day=date(2026, 10, 22), chat_id=CHANNEL), 1)
 
+    def test_week_keeps_previous_three_day_boundary_and_older_local_date(self):
+        self.sync(FakeClient([post(1, 1, when=NOW - timedelta(days=3)),
+                              post(2, 2, when=NOW - timedelta(days=6))]))
+        self.assertEqual([row["message_id"] for row in self.rows()], [1, 2])
+        self.assertEqual([row["message_id"] for row in self.rows(day=date(2026, 10, 16))], [2])
+
+    def test_search_is_case_insensitive_literal_text_and_combines_with_date(self):
+        self.sync(FakeClient([post(1, 1, text=r"Revenue 25%_growth\annual Alpha"),
+                              post(2, 2, text="Revenue 25xZgrowth annual ALPHA"),
+                              post(3, 3, text="Alpha", when=NOW - timedelta(days=1))]))
+        self.assertEqual([row["message_id"] for row in self.rows(query=r"25%_growth\annual")], [1])
+        self.assertEqual([row["message_id"] for row in self.rows(query="aLpHa")], [2, 1, 3])
+        self.assertEqual(self.rows(query="News"), [])  # Channel title is not article text.
+        self.assertEqual(self.rows(query="' OR 1=1 --"), [])
+        with TelegramStore(self.path) as store:
+            self.assertEqual(store.count_posts(now=NOW, query="alpha", day=date(2026, 10, 22), chat_id=CHANNEL), 2)
+            self.assertEqual(store.count_posts(now=NOW, query="alpha", chat_id=-1009999999999), 0)
+
+    def test_anchor_stabilizes_pagination_and_counts_new_matching_posts(self):
+        self.sync(FakeClient([post(1, 1, text="Alpha"), post(2, 2, text="Alpha"),
+                              post(3, 3, text="Beta", when=NOW - timedelta(minutes=1))]))
+        anchor = (NOW.timestamp(), 2)
+        before_rows = self.rows(before=anchor, query="alpha")
+        self.sync(FakeClient([post(4, 4, text="Alpha"),
+                              post(5, 5, text="Alpha", when=NOW + timedelta(seconds=1))]))
+        self.assertEqual(self.rows(before=anchor, query="alpha"), before_rows)
+        self.assertEqual([row["message_id"] for row in self.rows(before=anchor, query="alpha", limit=1, offset=1)], [1])
+        with TelegramStore(self.path) as store:
+            self.assertEqual(store.count_posts(now=NOW, query="alpha", before=anchor), 2)
+            self.assertEqual(store.count_posts(now=NOW, query="alpha"), 4)
+            for invalid in ((float("nan"), 2), (NOW.timestamp(), True), (NOW.timestamp(), -1), (NOW.timestamp(),)):
+                with self.subTest(anchor=invalid), self.assertRaises(ValueError):
+                    store.list_posts(now=NOW, before=invalid)
+
     def test_config_errors_and_repr_never_contain_token(self):
         self.assertNotIn(TOKEN, repr(self.config))
         with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": "not-a-number"}):
@@ -200,7 +235,7 @@ class TelegramSourceTests(unittest.TestCase):
         marker = "EXPIRED_PRIVATE_BODY_very_specific_marker"
         self.sync(FakeClient([post(1, text=marker)]))
         self.assertIn(marker.encode(), self.path.read_bytes())
-        self.assertEqual(self.rows(now=NOW + timedelta(days=3)), [])
+        self.assertEqual(self.rows(now=NOW + timedelta(days=7)), [])
         self.assertNotIn(marker.encode(), self.path.read_bytes())
 
     def test_transport_redacts_url_and_does_not_follow_redirects(self):

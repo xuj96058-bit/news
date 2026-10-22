@@ -261,7 +261,7 @@ class WorkbenchUiTests(unittest.TestCase):
             app.run()
             self.assertFalse(app.exception)
         self.assertEqual([tab.label for tab in app.get_by_key("main_navigation").children.values()],
-                         ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"])
+                         ["實時新聞", "新聞查詢", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"])
         client.assert_not_called()
         collect.assert_not_called()
         self.ai.assert_not_called()

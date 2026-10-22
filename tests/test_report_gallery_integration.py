@@ -47,6 +47,8 @@ class ReportGalleryIntegrationTests(unittest.TestCase):
         self.patch("src.workbench_ui.render_reader_tab")
         self.patch("src.workbench_ui.render_source_operations")
         self.patch("src.chartbook_ui.render_chartbook_tab")
+        self.patch("src.telegram_ui.ensure_telegram_receiver")
+        self.patch("src.telegram_ui.load_config", return_value=None)
         self.patch("src.research_ui.export_pdf", return_value=b"synthetic-pdf-bytes")
         self.patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected network call"))
         self.patch("openai.OpenAI", side_effect=AssertionError("Unexpected provider call"))
@@ -97,11 +99,31 @@ class ReportGalleryIntegrationTests(unittest.TestCase):
         report = self.create_report("Existing gallery report", "Unique saved gallery body")
         app = self.app()
         labels = [tab.label for tab in app.get_by_key("main_navigation").children.values()]
-        self.assertEqual(labels, ["新聞查詢", "日報", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"])
+        self.assertEqual(labels, ["實時新聞", "新聞查詢", "新聞來源", "研究閱讀", "圖表庫", "研究報告", "報告展示"])
         self.read_report(app, report["id"])
         self.assertIn("Unique saved gallery body", self.gallery_text(app))
         self.generator.assert_not_called()
         self.collect.assert_not_called()
+
+    def test_realtime_is_default_and_daily_tools_live_under_research(self):
+        app = self.app()
+        self.assertEqual(app.session_state["main_navigation"], "實時新聞")
+        self.assertFalse(any(item.key == "daily_essay_generate" for item in app.button))
+        self.navigate(app, "研究報告")
+        app.session_state["daily_overview"] = True
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertTrue(app.button(key="daily_essay_generate").disabled)
+        self.assertIn("今日市場論說", [item.value for item in app.subheader])
+        self.navigate(app, "實時新聞")
+        self.assertNotIn("今日市場論說", [item.value for item in app.subheader])
+        self.generator.assert_not_called()
+        self.collect.assert_not_called()
+
+    def test_existing_daily_tab_session_moves_to_realtime(self):
+        app = self.app()
+        self.navigate(app, "日報")
+        self.assertEqual(app.session_state["main_navigation"], "實時新聞")
 
     def test_generation_opens_new_saved_report_in_gallery(self):
         self.create_report("Older report", "An older saved body")

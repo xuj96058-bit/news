@@ -1,0 +1,21 @@
+[theme]
+paddingTop = "1rem"
+paddingBottom = "2rem"
+headingFontSizes = ["24px", "22px", "20px", "18px", "16px", "14px"]
+headingFontWeights = [650, 650, 600, 600, 600, 600]
+baseRadius = "6px"
+buttonRadius = "6px"
+
+[theme.light]
+primaryColor = "#bd3c51"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f6f8"
+textColor = "#23262f"
+borderColor = "#e5e7eb"
+
+[theme.dark]
+primaryColor = "#bd3c51"
+backgroundColor = "#14161b"
+secondaryBackgroundColor = "#1d2027"
+textColor = "#e8e9ed"
+borderColor = "#343842"
