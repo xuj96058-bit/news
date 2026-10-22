@@ -257,14 +257,18 @@ def render_telegram_feed(db_path=DEFAULT_DB_PATH):
         st.warning("暫時無法讀取新聞，稍後會自動重試。")
         return
 
+    # Keep the reading panes at stable Streamlit element paths. Inserting a new
+    # sibling above the columns would remount their scroll containers on refresh.
+    connection_notice = st.empty()
+    latest_notice = st.empty()
     if receiver_notice or status.get("last_error"):
         # Credentials, technical diagnostics and receiver internals never become
         # part of the reading interface. Existing items remain readable.
-        st.caption("新聞更新暫時中斷，正在重試。")
+        connection_notice.caption("新聞更新暫時中斷，正在重試。")
     pending = max(0, total - visible_total)
     if pending:
-        st.button(f"有 {pending} 則新消息 · 點此更新", key="telegram_feed_latest",
-                  on_click=_show_latest, type="tertiary", icon=":material/arrow_upward:")
+        latest_notice.button(f"有 {pending} 則新消息 · 點此更新", key="telegram_feed_latest",
+                             on_click=_show_latest, type="tertiary", icon=":material/arrow_upward:")
     if not posts:
         st.session_state.pop("telegram_feed_selected", None)
         st.caption("沒有符合條件的新聞。" if query or selected_day else "最近 7 天暫無新聞。新消息會自動出現。")
