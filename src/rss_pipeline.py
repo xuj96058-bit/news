@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from .feeds import DEFAULT_SOURCES, FeedFetchError, fetch_source, load_sources
+from .fulltext import enrich_item
 from .news_store import DEFAULT_DB_PATH, NewsStore
 from .source_health import record_collection, usable_text_count
 from .investat_pipeline import collect_investat
@@ -30,8 +31,9 @@ def collect_sources(sources, store, *, limit_per_source=50, max_age_days=30,
                     timeout=15, workers=4, fetcher=None, now=None):
     """Fetch independently, then ingest on the calling thread.
 
-    One failed source does not prevent the other feeds from being saved. Feed
-    summaries remain summaries; the collector never fetches article pages.
+    One failed source does not prevent the other feeds from being saved.
+    By default only feed-supplied text is kept. Set NEWS_FETCH_FULLTEXT=1
+    (and install trafilatura) to optionally extract full article text from the URL.
     """
     if limit_per_source < 1 or max_age_days < 0 or workers < 1 or timeout <= 0:
         raise ValueError("Invalid collection limits")
@@ -57,6 +59,8 @@ def collect_sources(sources, store, *, limit_per_source=50, max_age_days=30,
                 recent.sort(key=lambda item: _utc_date(item.get("published_at"))
                             or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
                 selected = recent[:limit_per_source]
+                # Optional full-text enrichment (no-op unless NEWS_FETCH_FULLTEXT=1).
+                selected = [enrich_item(item, timeout=timeout) for item in selected]
                 counts = store.ingest(selected)
                 outcome.update(status="ok" if items else "empty", fetched=len(items),
                                selected=len(selected), older_skipped=len(items) - len(recent),
@@ -272,4 +276,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
