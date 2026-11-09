@@ -25,10 +25,17 @@
 3. **目標網站限制**：很多網站會擋爬蟲（IP 封鎖、驗證碼、robots.txt）。這不是官方額度，而是對方網站的限制。
 4. **合法與服務條款**：爬取時請遵守各網站的使用條款與相關法規。
 
-## 與本專案的關係
+## 與本專案的整合狀況
 
-目前 `news` 專案主要使用 RSS / Atom / 官方 JSON API 與 Telegram 來源。若需要更深入的網頁正文抽取或自定爬取，可參考上面這些工具作為補充。
+- **Trafilatura**：已整合進 RSS 爬取流程（`src/fulltext.py` + `collect_sources`）。  
+  預設關閉。啟用方式：
+  1. `pip install trafilatura`
+  2. 在 `.env` 設 `NEWS_FETCH_FULLTEXT=1`
+  3. 再跑 `python -m src.rss_pipeline`
+  
+  當 feed 只有標題／摘要而有 URL 時，會嘗試抽取正文，並把 `content_scope` 設為 `fulltext_trafilatura`。
 
-- Trafilatura：適合從已有 URL 抽取清潔正文。
-- Crawl4AI / Scrapy：適合需要洋情渲染或自定爬取規則的場景。
-- SearXNG：適合自建元搜尋來補充新聞搜尋。
+- **Crawl4AI / Scrapy / SearXNG**：目前作為可選補充工具記錄，尚未預設接入主流程。  
+  若需要動態渲染或自定爬蟲規則，可單獨安裝後手動使用，或再告訴我幫你加入可選入口。
+
+目前專案主要仍使用 RSS / Atom / 官方 JSON API 與 Telegram 來源。
