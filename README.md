@@ -1,1 +1,1 @@
-PLACEHOLDER
+See docs/local_open_source_crawlers.md for crawler details. Trafilatura is now optionally integrated.
